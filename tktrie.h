@@ -792,11 +792,44 @@ public:
 
     // Insert or update, returns reference to stored value
     T& operator[](const std::string& key) {
-        node<T>* n = find(key);
-        if (n) return n->get_data();
-
-        insert(key, T{});
-        return find(key)->get_data();
+        // First try a read-only find
+        {
+            std::shared_lock lock(mtx);
+            key_tp cp(key);
+            node<T>* run = &head;
+            
+            if (key.empty()) {
+                if (head.has_value()) return head.get_data();
+            } else {
+                while (run) {
+                    node<T>* nxt = run->find_internal(cp);
+                    if (!nxt) break;
+                    if (nxt == run) return run->get_data();
+                    run = nxt;
+                    
+                    if (cp.is_empty()) {
+                        if (run->get_skip().empty() && run->has_value()) {
+                            return run->get_data();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Not found - need to insert with exclusive access
+        std::unique_lock wlock(write_mtx);
+        std::unique_lock lock(mtx);
+        
+        // Double-check after acquiring write lock (another thread may have inserted)
+        key_tp cp(key);
+        auto [result_node, was_new] = head.insert_internal(cp, T{});
+        
+        if (was_new) {
+            ++count;
+        }
+        
+        return result_node->get_data();
     }
 
     // Remove a key, returns true if found and removed
