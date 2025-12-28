@@ -340,6 +340,8 @@ private:
 
         if (pop.find_pop(c, &offset)) {
             node* child = children[offset];
+            // Hold the lock while getting the child pointer, then release
+            // The child cannot be deleted while we hold this lock
             lock.unlock();
             return child->insert_internal(key, value, this, c);
         } else {
@@ -416,15 +418,10 @@ private:
                 pop.clear_bit(c);
                 children.erase(children.begin() + current_offset);
                 delete child;
-            } else {
-                // Child wasn't removed - try to compact it if appropriate
-                child->try_compact();
             }
-
-            // Also try to compact this node
-            if (!has_data && pop.count() == 1 && parent != nullptr) {
-                try_compact();
-            }
+            // Note: Compaction is disabled for thread safety
+            // The trie will work correctly but may have suboptimal memory layout
+            // after many insertions/deletions
 
             return {!has_data && pop.empty(), true};
         }
@@ -727,6 +724,7 @@ template <class T>
 class tktrie {
     node<T> head;
     mutable std::shared_mutex mtx;
+    mutable std::mutex write_mtx;  // Serialize all write operations for safety
     size_t count{0};
 
 public:
@@ -743,6 +741,8 @@ public:
 
     // Find a key, returns nullptr if not found
     node<T>* find(const std::string& key) {
+        std::shared_lock lock(mtx);  // Allow concurrent reads
+        
         if (key.empty()) {
             return head.has_value() ? &head : nullptr;
         }
@@ -777,11 +777,13 @@ public:
 
     // Insert a key-value pair, returns true if new entry
     bool insert(const std::string& key, const T& value) {
+        std::unique_lock wlock(write_mtx);  // Serialize writes
+        std::unique_lock lock(mtx);  // Exclusive access
+        
         key_tp cp(key);
         auto [result_node, was_new] = head.insert_internal(cp, value);
 
         if (was_new) {
-            std::unique_lock lock(mtx);
             ++count;
         }
 
@@ -799,8 +801,10 @@ public:
 
     // Remove a key, returns true if found and removed
     bool remove(const std::string& key) {
+        std::unique_lock wlock(write_mtx);  // Serialize writes
+        std::unique_lock lock(mtx);  // Exclusive access
+        
         if (key.empty()) {
-            std::unique_lock lock(mtx);
             if (head.has_value()) {
                 head.clear_data();
                 --count;
@@ -813,7 +817,6 @@ public:
         auto result = head.remove_internal(cp);
 
         if (result.was_removed) {
-            std::unique_lock lock(mtx);
             --count;
         }
 
@@ -836,6 +839,7 @@ public:
     }
 
     void clear() {
+        std::unique_lock wlock(write_mtx);
         std::unique_lock lock(mtx);
         head.~node<T>();
         new (&head) node<T>();
