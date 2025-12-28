@@ -22,18 +22,15 @@ public:
             return false;
         }
 
-            // Base offset: 4 (skip bitmap) + bits in this word
-        const int w0 = 4 + std::popcount(bits[word] & (mask - 1));
+        // Count bits before this one in the same word
+        int idx = std::popcount(bits[word] & (mask - 1));
 
-        // Cumulative offsets for each word
-        const int w1 = w0 + std::popcount(bits[0]); // add bits in word 0
-        const int w2 = w1 + std::popcount(bits[1]); // add bits in word 1
-        const int w3 = w2 + std::popcount(bits[2]); // add bits in word 2
+        // Add counts from previous words
+        for (int i = 0; i < word; ++i) {
+            idx += std::popcount(bits[i]);
+        }
 
-        // Select correct offset based on word index
-        const std::array<int, 4> before{w0, w1, w2, w3};
-        *cnt = before[word];
-
+        *cnt = idx;
         return true;
     }
 
@@ -97,6 +94,9 @@ public:
 
     // Get current character and advance
     char cur() {
+        if (offset >= key.size()) {
+            return '\0';  // Safety check
+        }
         return key[offset++];
     }
 
@@ -120,11 +120,11 @@ public:
 template <class T>
 class node {
     std::shared_mutex shared{};
-    pop_tp pop{};
+    pop_tp pop{};  
     node* parent{nullptr};
     std::string skip{};        // Path compression
     std::vector<node*> nxt{};
-    bool has_data{false};
+    bool has_data{false};    
     T data{};
 
 public:
