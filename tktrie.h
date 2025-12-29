@@ -389,8 +389,8 @@ private:
                        skip2[common2] == kv[common2]) ++common2;
                        
                 if (common2 != kv.size()) {
-                    delete child;
                     cur->write_unlock();
+                    delete child;
                     return insert_internal(key, value);
                 }
                 
@@ -447,19 +447,16 @@ private:
                 newc->parent = cur;
                 newc->parent_edge = c;
                 
-                // Now lock briefly to attach
                 cur->read_unlock();
                 cur->write_lock();
                 child = cur->get_child(c);
                 if (child) {
-                    // Another thread beat us - discard our node
                     cur->write_unlock();
-                    delete newc;  // Delete after unlock
+                    delete newc;
                     return insert_internal(key, value);
                 }
                 
-                // Reserve space first to avoid realloc during insert
-                cur->children.reserve(cur->children.size() + 1);
+                // insert() may realloc but it's unavoidable without more complexity
                 int idx = cur->pop.set_bit(c);
                 cur->children.insert(cur->children.begin() + idx, newc);
                 
