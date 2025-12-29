@@ -77,23 +77,7 @@ const std::vector<std::string> STRING_KEYS = {
     "perspective", "consequence", "version", "framework", "revolution", "protection", "resolution", "characteristic", "interpretation", "dimension",
     "representation", "contribution", "recognition", "acquisition", "investigation", "recommendation", "implementation", "consideration", "administration", "participation",
     "determination", "demonstration", "discrimination", "accommodation", "authentication", "authorization", "certification", "classification", "configuration", "consolidation",
-    "construction", "consultation", "consumption", "contamination", "continuation", "conversation", "cooperation", "coordination", "corporation", "correlation",
-    "customization", "deactivation", "decomposition", "decompression", "decentralization", "declaration", "decommission", "decoration", "dedication", "deformation",
-    "degradation", "deliberation", "delineation", "denomination", "departmental", "depreciation", "deprivation", "derivation", "description",
-    "desegregation", "desensitization", "designation", "desperation", "destination", "destruction", "deterioration", "detoxification", "devaluation",
-    "devastation", "differentiation", "digitalization", "dimensionality", "disadvantageous", "disappointment", "disassociation", "discontinuation", "discouragement",
-    "disenchantment", "disengagement", "disfigurement", "disillusionment", "disintegration", "dismemberment", "disorientation", "displacement", "disproportionate", "disqualification",
-    "dissatisfaction", "dissemination", "dissertation", "distillation", "diversification", "documentation", "domestication", "dramatization", "duplication",
-    "ecclesiastical", "economization", "editorialization", "effectuation", "effortlessness", "egalitarianism", "electrification", "electromagnetic", "electronically", "elementarily",
-    "emancipation", "embellishment", "embodiment", "emotionalism", "empowerment", "encapsulation", "encouragement", "endangerment", "enlightenment", "entertainment",
-    "enthusiastically", "entrepreneurial", "epistemological", "equalization", "equilibrium", "establishment", "evangelization", "evaporation", "exacerbation",
-    "exaggeration", "examination", "exasperation", "excommunication", "exemplification", "exhaustiveness", "exhilaration", "existentialism", "experiential", "experimentation",
-    "exploitation", "exploration", "exportation", "expropriation", "externalization", "extermination", "extraordinarily", "extraterrestrial", "extravagance", "fabrication",
-    "facilitation", "falsification", "familiarization", "fantastically", "fascination", "featherweight", "federalization", "fertilization", "fictionalization", "fingerprinting",
-    "firefighting", "flashforward", "flawlessness", "flexibilities", "flourishing", "fluctuation", "fluorescence", "forgetfulness", "formalization", "fortification",
-    "fossilization", "fragmentation", "franchising", "fraternization", "freestanding", "friendliness", "frontrunners", "fruitfulness", "frustration", "fulfillment",
-    "functionality", "fundamentalism", "fundraising", "galvanization", "generalization", "gentrification", "globalization", "glorification", "governmental", "gracelessness",
-    "gradualness", "grandchildren", "grandparents", "gratification", "gravitational", "greenhouse", "groundbreaking", "groundskeeper", "guardianship", "habituation"
+    "construction", "consultation", "consumption", "contamination", "continuation", "conversation", "cooperation", "coordination", "corporation", "correlation"
 };
 
 inline void uint64_to_key(uint64_t v, char* buf) {
@@ -105,10 +89,9 @@ std::vector<std::string> generate_int_keys(size_t count) {
     std::vector<std::string> keys;
     keys.reserve(count);
     std::mt19937_64 rng(42);
-    std::uniform_int_distribution<uint64_t> dist(0, UINT64_MAX);
     char buf[8];
     for (size_t i = 0; i < count; i++) {
-        uint64_to_key(dist(rng), buf);
+        uint64_to_key(rng(), buf);
         keys.emplace_back(buf, 8);
     }
     return keys;
@@ -227,95 +210,79 @@ double bench_mixed_find(const Keys& keys, int find_threads, int write_threads, i
 
 template<typename Keys>
 void run_benchmark(const std::string& name, const Keys& keys, int ms) {
-    using namespace gteitelbaum;
-    
     std::cout << "## " << name << "\n\n";
     std::cout << "Keys: " << keys.size() << "\n\n";
     
     std::cout << "### FIND\n\n";
-    std::cout << "| Threads | tktrie<READ> | tktrie<WRITE> | std::map | std::unordered_map | READ/map | WRITE/map |\n";
-    std::cout << "|---------|--------------|---------------|----------|-------------------|----------|----------|\n";
+    std::cout << "| Threads | tktrie | std::map | std::unordered_map | tktrie/map | tktrie/umap |\n";
+    std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        tktrie<std::string, int, Sync::READ> tr;
-        tktrie<std::string, int, Sync::WRITE> tw;
+        gteitelbaum::tktrie<std::string, int> trie;
         locked_map<std::string, int> lm;
         locked_umap<std::string, int> lu;
         for (size_t i = 0; i < keys.size(); i++) {
-            tr.insert({keys[i], (int)i});
-            tw.insert({keys[i], (int)i});
+            trie.insert({keys[i], (int)i});
             lm.insert({keys[i], (int)i});
             lu.insert({keys[i], (int)i});
         }
-        double r = bench_find(tr, keys, threads, ms);
-        double w = bench_find(tw, keys, threads, ms);
+        double tr = bench_find(trie, keys, threads, ms);
         double m = bench_find(lm, keys, threads, ms);
         double u = bench_find(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n",
-               threads, r/1e6, w/1e6, m/1e6, u/1e6, r/m, w/m);
+        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
     std::cout << "\n### INSERT\n\n";
-    std::cout << "| Threads | tktrie<READ> | tktrie<WRITE> | std::map | std::unordered_map | READ/map | WRITE/map |\n";
-    std::cout << "|---------|--------------|---------------|----------|-------------------|----------|----------|\n";
+    std::cout << "| Threads | tktrie | std::map | std::unordered_map | tktrie/map | tktrie/umap |\n";
+    std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        tktrie<std::string, int, Sync::READ> tr;
-        tktrie<std::string, int, Sync::WRITE> tw;
+        gteitelbaum::tktrie<std::string, int> trie;
         locked_map<std::string, int> lm;
         locked_umap<std::string, int> lu;
-        double r = bench_insert<decltype(tr), Keys, int>(tr, keys, threads, ms);
-        double w = bench_insert<decltype(tw), Keys, int>(tw, keys, threads, ms);
+        double tr = bench_insert<decltype(trie), Keys, int>(trie, keys, threads, ms);
         double m = bench_insert<decltype(lm), Keys, int>(lm, keys, threads, ms);
         double u = bench_insert<decltype(lu), Keys, int>(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n",
-               threads, r/1e6, w/1e6, m/1e6, u/1e6, r/m, w/m);
+        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
     std::cout << "\n### ERASE\n\n";
-    std::cout << "| Threads | tktrie<READ> | tktrie<WRITE> | std::map | std::unordered_map | READ/map | WRITE/map |\n";
-    std::cout << "|---------|--------------|---------------|----------|-------------------|----------|----------|\n";
+    std::cout << "| Threads | tktrie | std::map | std::unordered_map | tktrie/map | tktrie/umap |\n";
+    std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        tktrie<std::string, int, Sync::READ> tr;
-        tktrie<std::string, int, Sync::WRITE> tw;
+        gteitelbaum::tktrie<std::string, int> trie;
         locked_map<std::string, int> lm;
         locked_umap<std::string, int> lu;
         for (size_t i = 0; i < keys.size(); i++) {
-            tr.insert({keys[i], (int)i});
-            tw.insert({keys[i], (int)i});
+            trie.insert({keys[i], (int)i});
             lm.insert({keys[i], (int)i});
             lu.insert({keys[i], (int)i});
         }
-        double r = bench_erase(tr, keys, threads, ms);
-        double w = bench_erase(tw, keys, threads, ms);
+        double tr = bench_erase(trie, keys, threads, ms);
         double m = bench_erase(lm, keys, threads, ms);
         double u = bench_erase(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n",
-               threads, r/1e6, w/1e6, m/1e6, u/1e6, r/m, w/m);
+        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
     std::cout << "\n### FIND with Concurrent Writers\n\n";
-    std::cout << "| Readers | Writers | tktrie<READ> | tktrie<WRITE> | std::map | std::unordered_map | READ/map | WRITE/map |\n";
-    std::cout << "|---------|---------|--------------|---------------|----------|-------------------|----------|----------|\n";
+    std::cout << "| Readers | Writers | tktrie | std::map | std::unordered_map | tktrie/map | tktrie/umap |\n";
+    std::cout << "|---------|---------|--------|----------|-------------------|------------|-------------|\n";
     
-    for (auto [f, wr] : std::vector<std::pair<int,int>>{{4,0}, {4,2}, {4,4}, {8,0}, {8,4}}) {
-        double r = bench_mixed_find<tktrie<std::string, int, Sync::READ>, Keys, int>(keys, f, wr, ms);
-        double w = bench_mixed_find<tktrie<std::string, int, Sync::WRITE>, Keys, int>(keys, f, wr, ms);
-        double m = bench_mixed_find<locked_map<std::string, int>, Keys, int>(keys, f, wr, ms);
-        double u = bench_mixed_find<locked_umap<std::string, int>, Keys, int>(keys, f, wr, ms);
-        printf("| %d | %d | %.1fM | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n",
-               f, wr, r/1e6, w/1e6, m/1e6, u/1e6, r/m, w/m);
+    for (auto [f, w] : std::vector<std::pair<int,int>>{{4,0}, {4,2}, {4,4}, {8,0}, {8,4}}) {
+        double tr = bench_mixed_find<gteitelbaum::tktrie<std::string, int>, Keys, int>(keys, f, w, ms);
+        double m = bench_mixed_find<locked_map<std::string, int>, Keys, int>(keys, f, w, ms);
+        double u = bench_mixed_find<locked_umap<std::string, int>, Keys, int>(keys, f, w, ms);
+        printf("| %d | %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", f, w, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     std::cout << "\n";
 }
 
 int main() {
     constexpr int MS = 500;
-    std::cout << "# tktrie Benchmark: READ vs WRITE Synchronization\n\n";
-    std::cout << "- **READ**: RCU-style lock-free reads, global mutex + COW for writes\n";
-    std::cout << "- **WRITE**: Per-node spinlocks with hand-over-hand locking\n";
-    std::cout << "- Duration: " << MS << "ms per test\n\n";
+    std::cout << "# tktrie Benchmark Results\n\n";
+    std::cout << "Lock-free reads, global mutex for writes, in-place mutation\n\n";
+    std::cout << "Duration: " << MS << "ms per test\n\n";
     run_benchmark("uint64 Keys (10,000 random)", INT_KEYS, MS);
     run_benchmark("String Keys (1,000 words)", STRING_KEYS, MS);
     return 0;
