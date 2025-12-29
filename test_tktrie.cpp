@@ -1,15 +1,17 @@
-#include "tktrie.h"
-#include <map>
-#include <unordered_map>
-#include <shared_mutex>
-#include <thread>
-#include <vector>
-#include <random>
-#include <chrono>
-#include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <random>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "tktrie.h"
 
 // 1000 common English words (from original test)
 const std::vector<std::string> WORDS = {
