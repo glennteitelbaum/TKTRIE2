@@ -370,6 +370,15 @@ private:
                 std::string child_skip = std::string(skip.substr(common + 1));
                 char edge_char = skip[common];
                 
+                // Create child node BEFORE locking
+                auto* child = new node_type();
+                child->skip = std::move(child_skip);
+                child->parent_edge = edge_char;
+                
+                // Prepare a vector with one slot
+                std::vector<node_type*> new_children;
+                new_children.reserve(1);
+                
                 cur->read_unlock();
                 cur->write_lock();
                 
@@ -380,31 +389,37 @@ private:
                        skip2[common2] == kv[common2]) ++common2;
                        
                 if (common2 != kv.size()) {
+                    delete child;
                     cur->write_unlock();
                     return insert_internal(key, value);
                 }
                 
-                // Split: create child with remainder of skip
-                auto* child = new node_type();
-                child->skip = std::move(child_skip);
+                // Complete child setup with cur's data (moves, no alloc)
                 child->has_data = cur->has_data;
                 child->data = std::move(cur->data);
                 child->children = std::move(cur->children);
                 child->pop = cur->pop;
                 child->parent = cur;
-                child->parent_edge = edge_char;
                 for (auto* gc : child->children) if (gc) gc->parent = child;
                 
+                // Swap skip - defer old string destruction
+                std::string old_skip;
+                old_skip.swap(cur->skip);
                 cur->skip = std::move(new_skip);
+                
                 cur->has_data = true;
                 cur->data = value;
-                cur->children.clear();
+                
+                // cur->children is already empty from the move above
                 cur->pop = pop_tp{};
                 int idx = cur->pop.set_bit(child->parent_edge);
-                cur->children.insert(cur->children.begin() + idx, child);
+                new_children.push_back(child);
+                cur->children = std::move(new_children);
                 
                 elem_count.fetch_add(1, std::memory_order_relaxed);
                 cur->write_unlock();
+                
+                // old_skip destroyed here, outside lock
                 return {iterator(cur, key), true};
             }
 
@@ -438,11 +453,13 @@ private:
                 child = cur->get_child(c);
                 if (child) {
                     // Another thread beat us - discard our node
-                    delete newc;
                     cur->write_unlock();
+                    delete newc;  // Delete after unlock
                     return insert_internal(key, value);
                 }
                 
+                // Reserve space first to avoid realloc during insert
+                cur->children.reserve(cur->children.size() + 1);
                 int idx = cur->pop.set_bit(c);
                 cur->children.insert(cur->children.begin() + idx, newc);
                 
@@ -469,6 +486,10 @@ private:
             new_child->data = value;
             new_child->parent_edge = new_edge;
             
+            // Pre-allocate vector for 2 children
+            std::vector<node_type*> new_children;
+            new_children.reserve(2);
+            
             cur->read_unlock();
             cur->write_lock();
             
@@ -479,14 +500,14 @@ private:
                    skip2[common2] == kv[common2]) ++common2;
                    
             if (common2 == skip2.size()) {
-                // State changed - discard prepared nodes
+                // State changed - discard prepared nodes after unlock
+                cur->write_unlock();
                 delete old_child;
                 delete new_child;
-                cur->write_unlock();
                 return insert_internal(key, value);
             }
             
-            // Complete old_child setup with cur's data
+            // Complete old_child setup with cur's data (moves, no alloc)
             old_child->has_data = cur->has_data;
             old_child->data = std::move(cur->data);
             old_child->children = std::move(cur->children);
@@ -497,19 +518,32 @@ private:
             // Complete new_child setup
             new_child->parent = cur;
             
-            // Update cur
+            // Swap skip - defer old string destruction
+            std::string old_skip;
+            old_skip.swap(cur->skip);
             cur->skip = std::move(new_cur_skip);
+            
             cur->has_data = false;
-            cur->data = T{};
-            cur->children.clear();
+            // Don't assign T{} - just leave moved-from state
+            
+            // Build new children vector (cur->children already moved out)
             cur->pop = pop_tp{};
             int i1 = cur->pop.set_bit(old_child->parent_edge);
-            cur->children.insert(cur->children.begin() + i1, old_child);
             int i2 = cur->pop.set_bit(new_child->parent_edge);
-            cur->children.insert(cur->children.begin() + i2, new_child);
+            // Insert in correct order
+            if (i1 <= i2) {
+                new_children.push_back(old_child);
+                new_children.push_back(new_child);
+            } else {
+                new_children.push_back(new_child);
+                new_children.push_back(old_child);
+            }
+            cur->children = std::move(new_children);
             
             elem_count.fetch_add(1, std::memory_order_relaxed);
             cur->write_unlock();
+            
+            // old_skip destroyed here, outside lock
             return {iterator(new_child, key), true};
         }
     }
@@ -535,10 +569,14 @@ private:
                     cur->write_lock();
                     if (!cur->has_data) { cur->write_unlock(); return false; }
                 }
+                
+                // Move data out to defer destruction until after unlock
+                T old_data = std::move(cur->data);
                 cur->has_data = false;
-                cur->data = T{};
                 elem_count.fetch_sub(1, std::memory_order_relaxed);
                 cur->write_unlock();
+                
+                // old_data destroyed here, outside lock
                 return true;
             }
             
