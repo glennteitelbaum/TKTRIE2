@@ -1,20 +1,19 @@
 #pragma once
-// Optimized tktrie with:
-// 1. Spinlocks instead of shared_mutex
-// 2. Cache-line aligned nodes  
-// 3. Optimistic lock-free reads with version validation
+// Thread-safe optimized trie v2:
+// 1. Spinlocks with exponential backoff  
+// 2. Read-lock for traversal, upgrade to write only when modifying
+// 3. Hand-over-hand locking
 
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <iterator>
 #include <string>
 #include <vector>
 #include <utility>
 #include <initializer_list>
-#include <stdexcept>
+#include <thread>
 
-class alignas(64) pop_tp2 {
+class alignas(64) pop_tp {
     using bits_t = uint64_t;
     std::array<bits_t, 4> bits{};
 
@@ -61,20 +60,6 @@ public:
 
     bool empty() const { return (bits[0] | bits[1] | bits[2] | bits[3]) == 0; }
 
-    char char_at_index(int target_idx) const {
-        int current_idx = 0;
-        for (int word = 0; word < 4; ++word) {
-            bits_t w = bits[word];
-            while (w != 0) {
-                int bit = std::countr_zero(w);
-                if (current_idx == target_idx) return static_cast<char>((word << 6) | bit);
-                ++current_idx;
-                w &= w - 1;
-            }
-        }
-        return '\0';
-    }
-
     char first_char() const {
         for (int word = 0; word < 4; ++word) {
             if (bits[word] != 0) return static_cast<char>((word << 6) | std::countr_zero(bits[word]));
@@ -96,41 +81,99 @@ public:
     }
 };
 
-template <class Key, class T> class tktrie2;
+template <class Key, class T> class tktrie;
+
+// Optimized reader-writer spinlock with try_upgrade
+class rw_spinlock {
+    std::atomic<int> state_{0};  // 0=free, -1=write, >0=readers
+    
+    void backoff(int spins) {
+        if (spins < 4) {
+            #if defined(__x86_64__)
+            __builtin_ia32_pause();
+            #endif
+        } else if (spins < 16) {
+            for (int i = 0; i < spins; i++) {
+                #if defined(__x86_64__)
+                __builtin_ia32_pause();
+                #endif
+            }
+        } else if (spins < 32) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        }
+    }
+    
+public:
+    void read_lock() {
+        int spins = 0;
+        while (true) {
+            int expected = state_.load(std::memory_order_relaxed);
+            if (expected >= 0 && state_.compare_exchange_weak(expected, expected + 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) return;
+            backoff(++spins);
+        }
+    }
+    
+    void read_unlock() {
+        state_.fetch_sub(1, std::memory_order_release);
+    }
+    
+    void write_lock() {
+        int spins = 0;
+        while (true) {
+            int expected = 0;
+            if (state_.compare_exchange_weak(expected, -1,
+                std::memory_order_acquire, std::memory_order_relaxed)) return;
+            backoff(++spins);
+        }
+    }
+    
+    void write_unlock() {
+        state_.store(0, std::memory_order_release);
+    }
+    
+    // Try to upgrade from read lock to write lock (must hold exactly one read lock)
+    bool try_upgrade() {
+        int expected = 1;  // We are the only reader
+        return state_.compare_exchange_strong(expected, -1,
+            std::memory_order_acquire, std::memory_order_relaxed);
+    }
+    
+    // Downgrade from write to read lock
+    void downgrade() {
+        state_.store(1, std::memory_order_release);  // -1 -> 1 (one reader)
+    }
+};
 
 template <class Key, class T>
-class alignas(64) tktrie_node2 {
-    friend class tktrie2<Key, T>;
+class alignas(64) tktrie_node {
+    friend class tktrie<Key, T>;
 
-    pop_tp2 pop{};
-    std::vector<tktrie_node2*> children{};
-    std::atomic<uint64_t> version{0};
-    
-    // Simple spinlock
-    mutable std::atomic<int> lock_{0};  // 0=free, -1=write, >0=readers
-    
-    tktrie_node2* parent{nullptr};
+    mutable rw_spinlock lock_;
+    pop_tp pop{};
+    std::vector<tktrie_node*> children{};
+    tktrie_node* parent{nullptr};
     std::string skip{};
     T data{};
     char parent_edge{'\0'};
     bool has_data{false};
 
 public:
-    tktrie_node2() = default;
-    ~tktrie_node2() { for (auto* c : children) delete c; }
-    tktrie_node2(const tktrie_node2&) = delete;
-    tktrie_node2& operator=(const tktrie_node2&) = delete;
+    tktrie_node() = default;
+    ~tktrie_node() { for (auto* c : children) delete c; }
+    tktrie_node(const tktrie_node&) = delete;
+    tktrie_node& operator=(const tktrie_node&) = delete;
 
     bool has_value() const { return has_data; }
     T& get_data() { return data; }
     const T& get_data() const { return data; }
     const std::string& get_skip() const { return skip; }
-    int child_count() const { return pop.count(); }
-    tktrie_node2* get_parent() const { return parent; }
+    tktrie_node* get_parent() const { return parent; }
     char get_parent_edge() const { return parent_edge; }
-    uint64_t get_version() const { return version.load(std::memory_order_acquire); }
 
-    tktrie_node2* get_child(char c) const {
+    tktrie_node* get_child(char c) const {
         int idx;
         if (pop.find_pop(c, &idx)) return children[idx];
         return nullptr;
@@ -139,49 +182,24 @@ public:
     char first_child_char() const { return pop.first_char(); }
     char next_child_char(char c) const { return pop.next_char(c); }
 
-    void read_lock() const {
-        while (true) {
-            int expected = lock_.load(std::memory_order_relaxed);
-            if (expected >= 0 && lock_.compare_exchange_weak(expected, expected + 1,
-                std::memory_order_acquire, std::memory_order_relaxed)) return;
-            #if defined(__x86_64__)
-            __builtin_ia32_pause();
-            #endif
-        }
-    }
-
-    void read_unlock() const {
-        lock_.fetch_sub(1, std::memory_order_release);
-    }
-
-    void write_lock() {
-        while (true) {
-            int expected = 0;
-            if (lock_.compare_exchange_weak(expected, -1,
-                std::memory_order_acquire, std::memory_order_relaxed)) return;
-            #if defined(__x86_64__)
-            __builtin_ia32_pause();
-            #endif
-        }
-    }
-
-    void write_unlock() {
-        lock_.store(0, std::memory_order_release);
-    }
-
-    void bump_version() { version.fetch_add(1, std::memory_order_release); }
+    void read_lock() const { lock_.read_lock(); }
+    void read_unlock() const { lock_.read_unlock(); }
+    void write_lock() { lock_.write_lock(); }
+    void write_unlock() { lock_.write_unlock(); }
+    bool try_upgrade() { return lock_.try_upgrade(); }
+    void downgrade() { lock_.downgrade(); }
 };
 
 template <class Key, class T>
-class tktrie_iterator2 {
+class tktrie_iterator {
 public:
-    using node_type = tktrie_node2<Key, T>;
+    using node_type = tktrie_node<Key, T>;
     using reference = std::pair<const Key&, T&>;
 private:
     node_type* current{nullptr};
     Key current_key;
 
-    void find_next_data(node_type* n, Key prefix) {
+    void find_next(node_type* n, Key prefix) {
         while (n) {
             current_key = prefix + n->get_skip();
             if (n->has_value()) { current = n; return; }
@@ -200,59 +218,57 @@ private:
         current = nullptr;
     }
 
-    void advance() {
-        if (!current) return;
+public:
+    tktrie_iterator() = default;
+    tktrie_iterator(node_type* root, bool is_end = false) {
+        if (is_end || !root) { current = nullptr; return; }
+        find_next(root, "");
+    }
+    tktrie_iterator(node_type* n, const Key& key) : current(n), current_key(key) {}
+    
+    reference operator*() const { return {current_key, current->get_data()}; }
+    tktrie_iterator& operator++() {
+        if (!current) return *this;
         node_type* n = current;
         char fc = n->first_child_char();
-        if (fc != '\0') { find_next_data(n->get_child(fc), current_key + fc); return; }
+        if (fc != '\0') { find_next(n->get_child(fc), current_key + fc); return *this; }
         while (n) {
             node_type* p = n->get_parent();
-            if (!p) { current = nullptr; return; }
+            if (!p) { current = nullptr; return *this; }
             char edge = n->get_parent_edge();
             Key pk = current_key.substr(0, current_key.length() - n->get_skip().length() - 1);
             char next = p->next_child_char(edge);
-            if (next != '\0') { find_next_data(p->get_child(next), pk + next); return; }
+            if (next != '\0') { find_next(p->get_child(next), pk + next); return *this; }
             current_key = pk; n = p;
         }
         current = nullptr;
+        return *this;
     }
-
-public:
-    tktrie_iterator2() = default;
-    tktrie_iterator2(node_type* root, bool is_end = false) {
-        if (is_end || !root) { current = nullptr; return; }
-        find_next_data(root, "");
-    }
-    tktrie_iterator2(node_type* n, const Key& key) : current(n), current_key(key) {}
-    
-    reference operator*() const { return {current_key, current->get_data()}; }
-    tktrie_iterator2& operator++() { advance(); return *this; }
-    bool operator==(const tktrie_iterator2& o) const { return current == o.current; }
-    bool operator!=(const tktrie_iterator2& o) const { return current != o.current; }
+    bool operator==(const tktrie_iterator& o) const { return current == o.current; }
+    bool operator!=(const tktrie_iterator& o) const { return current != o.current; }
     node_type* get_node() const { return current; }
     const Key& key() const { return current_key; }
 };
 
 template <class Key, class T>
-class tktrie2 {
+class tktrie {
 public:
-    using iterator = tktrie_iterator2<Key, T>;
-    using node_type = tktrie_node2<Key, T>;
+    using iterator = tktrie_iterator<Key, T>;
+    using node_type = tktrie_node<Key, T>;
     using size_type = std::size_t;
 
 private:
     node_type head;
     std::atomic<size_type> elem_count{0};
-    static constexpr int MAX_RETRIES = 100;
 
 public:
-    tktrie2() = default;
-    tktrie2(std::initializer_list<std::pair<const Key, T>> init) {
+    tktrie() = default;
+    tktrie(std::initializer_list<std::pair<const Key, T>> init) {
         for (const auto& p : init) insert(p);
     }
-    ~tktrie2() = default;
-    tktrie2(const tktrie2&) = delete;
-    tktrie2& operator=(const tktrie2&) = delete;
+    ~tktrie() = default;
+    tktrie(const tktrie&) = delete;
+    tktrie& operator=(const tktrie&) = delete;
 
     iterator begin() noexcept { return iterator(&head); }
     iterator end() noexcept { return iterator(nullptr, true); }
@@ -260,62 +276,23 @@ public:
     size_type size() const noexcept { return elem_count.load(std::memory_order_relaxed); }
 
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& value) {
-        return insert_impl(value.first, value.second);
+        return insert_internal(value.first, value.second);
     }
 
     size_type erase(const Key& key) {
-        for (int retry = 0; retry < MAX_RETRIES; ++retry) {
-            auto [success, removed] = try_remove(key);
-            if (success) {
-                if (removed) { elem_count.fetch_sub(1); return 1; }
-                return 0;
-            }
-        }
-        return remove_fallback(key) ? 1 : 0;
+        return remove_internal(key) ? 1 : 0;
     }
 
     iterator find(const Key& key) {
-        // Optimistic lock-free read first
-        for (int i = 0; i < 3; ++i) {
-            auto [ok, node] = try_find_lockfree(key);
-            if (ok) return node ? iterator(node, key) : end();
-        }
-        // Fallback to locked read
-        node_type* n = find_locked(key);
+        node_type* n = find_internal(key);
         return n ? iterator(n, key) : end();
     }
 
-    bool contains(const Key& key) { return find(key) != end(); }
+    bool contains(const Key& key) { return find_internal(key) != nullptr; }
     size_type count(const Key& key) { return contains(key) ? 1 : 0; }
 
 private:
-    std::pair<bool, node_type*> try_find_lockfree(const Key& key) {
-        node_type* cur = &head;
-        size_t kpos = 0;
-        uint64_t ver = cur->get_version();
-
-        while (true) {
-            const std::string& skip = cur->skip;
-            if (!skip.empty()) {
-                if (key.size() - kpos < skip.size()) return {cur->get_version() == ver, nullptr};
-                for (size_t i = 0; i < skip.size(); ++i)
-                    if (key[kpos + i] != skip[i]) return {cur->get_version() == ver, nullptr};
-                kpos += skip.size();
-            }
-            if (kpos == key.size()) {
-                bool has = cur->has_data;
-                return {cur->get_version() == ver, has ? cur : nullptr};
-            }
-            char c = key[kpos++];
-            node_type* child = cur->get_child(c);
-            if (!child) return {cur->get_version() == ver, nullptr};
-            if (cur->get_version() != ver) return {false, nullptr};
-            cur = child;
-            ver = cur->get_version();
-        }
-    }
-
-    node_type* find_locked(const Key& key) {
+    node_type* find_internal(const Key& key) {
         node_type* cur = &head;
         cur->read_lock();
         size_t kpos = 0;
@@ -324,40 +301,34 @@ private:
             const std::string& skip = cur->skip;
             if (!skip.empty()) {
                 if (key.size() - kpos < skip.size()) { cur->read_unlock(); return nullptr; }
-                for (size_t i = 0; i < skip.size(); ++i)
-                    if (key[kpos + i] != skip[i]) { cur->read_unlock(); return nullptr; }
+                bool mismatch = false;
+                for (size_t i = 0; i < skip.size(); ++i) {
+                    if (key[kpos + i] != skip[i]) { mismatch = true; break; }
+                }
+                if (mismatch) { cur->read_unlock(); return nullptr; }
                 kpos += skip.size();
             }
+            
             if (kpos == key.size()) {
-                bool has = cur->has_data;
+                node_type* result = cur->has_data ? cur : nullptr;
                 cur->read_unlock();
-                return has ? cur : nullptr;
+                return result;
             }
+            
             char c = key[kpos++];
             node_type* child = cur->get_child(c);
             if (!child) { cur->read_unlock(); return nullptr; }
+            
             child->read_lock();
             cur->read_unlock();
             cur = child;
         }
     }
 
-    std::pair<iterator, bool> insert_impl(const Key& key, const T& value) {
-        for (int retry = 0; retry < MAX_RETRIES; ++retry) {
-            auto [success, was_new, node] = try_insert(key, value);
-            if (success) {
-                if (was_new) elem_count.fetch_add(1);
-                return {iterator(node, key), was_new};
-            }
-        }
-        return insert_fallback(key, value);
-    }
-
-    std::tuple<bool, bool, node_type*> try_insert(const Key& key, const T& value) {
+    std::pair<iterator, bool> insert_internal(const Key& key, const T& value) {
         node_type* cur = &head;
+        cur->read_lock();  // Start with read lock
         size_t kpos = 0;
-        cur->read_lock();
-        uint64_t ver = cur->get_version();
 
         while (true) {
             const std::string& skip = cur->skip;
@@ -365,59 +336,92 @@ private:
             while (common < skip.size() && kpos + common < key.size() &&
                    skip[common] == key[kpos + common]) ++common;
 
+            // Case 1: Exact match
             if (kpos + common == key.size() && common == skip.size()) {
-                cur->read_unlock();
-                cur->write_lock();
-                if (cur->get_version() != ver) { cur->write_unlock(); return {false, false, nullptr}; }
+                // Try to upgrade to write
+                if (!cur->try_upgrade()) {
+                    cur->read_unlock();
+                    cur->write_lock();
+                    // Re-verify state after acquiring write lock
+                    if (cur->skip != skip) {
+                        // Structure changed, restart
+                        cur->write_unlock();
+                        return insert_internal(key, value);
+                    }
+                }
                 bool was_new = !cur->has_data;
                 cur->has_data = true;
-                if (was_new) cur->data = value;
-                cur->bump_version();
+                if (was_new) {
+                    cur->data = value;
+                    elem_count.fetch_add(1, std::memory_order_relaxed);
+                }
                 cur->write_unlock();
-                return {true, was_new, cur};
+                return {iterator(cur, key), was_new};
             }
 
+            // Case 2: Key is prefix - need write lock for split
             if (kpos + common == key.size()) {
                 cur->read_unlock();
                 cur->write_lock();
-                if (cur->get_version() != ver) { cur->write_unlock(); return {false, false, nullptr}; }
+                // Re-verify after acquiring write lock
+                const std::string& skip2 = cur->skip;
+                size_t common2 = 0;
+                while (common2 < skip2.size() && kpos + common2 < key.size() &&
+                       skip2[common2] == key[kpos + common2]) ++common2;
+                if (kpos + common2 != key.size()) {
+                    // State changed, restart
+                    cur->write_unlock();
+                    return insert_internal(key, value);
+                }
+                
                 auto* child = new node_type();
-                child->skip = skip.substr(common + 1);
+                child->skip = skip2.substr(common2 + 1);
                 child->has_data = cur->has_data;
                 child->data = std::move(cur->data);
                 child->children = std::move(cur->children);
                 child->pop = cur->pop;
                 child->parent = cur;
-                child->parent_edge = skip[common];
+                child->parent_edge = skip2[common2];
                 for (auto* gc : child->children) if (gc) gc->parent = child;
-                cur->skip = skip.substr(0, common);
+                
+                cur->skip = skip2.substr(0, common2);
                 cur->has_data = true;
                 cur->data = value;
                 cur->children.clear();
-                cur->pop = pop_tp2{};
+                cur->pop = pop_tp{};
                 int idx = cur->pop.set_bit(child->parent_edge);
                 cur->children.insert(cur->children.begin() + idx, child);
-                cur->bump_version();
+                
+                elem_count.fetch_add(1, std::memory_order_relaxed);
                 cur->write_unlock();
-                return {true, true, cur};
+                return {iterator(cur, key), true};
             }
 
+            // Case 3: Skip fully matched, continue
             if (common == skip.size()) {
                 kpos += common;
                 char c = key[kpos];
                 node_type* child = cur->get_child(c);
+                
                 if (child) {
                     child->read_lock();
                     cur->read_unlock();
                     cur = child;
-                    ver = cur->get_version();
                     kpos++;
                     continue;
                 }
+                
+                // Need write lock to add child
                 cur->read_unlock();
                 cur->write_lock();
-                if (cur->get_version() != ver) { cur->write_unlock(); return {false, false, nullptr}; }
-                if (cur->get_child(c)) { cur->write_unlock(); return {false, false, nullptr}; }
+                // Re-check child existence
+                child = cur->get_child(c);
+                if (child) {
+                    // Another thread added it, retry
+                    cur->write_unlock();
+                    return insert_internal(key, value);
+                }
+                
                 auto* newc = new node_type();
                 newc->skip = key.substr(kpos + 1);
                 newc->has_data = true;
@@ -426,141 +430,98 @@ private:
                 newc->parent_edge = c;
                 int idx = cur->pop.set_bit(c);
                 cur->children.insert(cur->children.begin() + idx, newc);
-                cur->bump_version();
+                
+                elem_count.fetch_add(1, std::memory_order_relaxed);
                 cur->write_unlock();
-                return {true, true, newc};
+                return {iterator(newc, key), true};
             }
 
+            // Case 4: Mismatch - need write lock for split
             cur->read_unlock();
             cur->write_lock();
-            if (cur->get_version() != ver) { cur->write_unlock(); return {false, false, nullptr}; }
+            // Re-verify
+            const std::string& skip2 = cur->skip;
+            size_t common2 = 0;
+            while (common2 < skip2.size() && kpos + common2 < key.size() &&
+                   skip2[common2] == key[kpos + common2]) ++common2;
+            if (common2 == skip2.size()) {
+                // State changed, restart
+                cur->write_unlock();
+                return insert_internal(key, value);
+            }
+            
             auto* old_child = new node_type();
-            old_child->skip = skip.substr(common + 1);
+            old_child->skip = skip2.substr(common2 + 1);
             old_child->has_data = cur->has_data;
             old_child->data = std::move(cur->data);
             old_child->children = std::move(cur->children);
             old_child->pop = cur->pop;
             old_child->parent = cur;
-            old_child->parent_edge = skip[common];
+            old_child->parent_edge = skip2[common2];
             for (auto* gc : old_child->children) if (gc) gc->parent = old_child;
+            
             auto* new_child = new node_type();
-            new_child->skip = key.substr(kpos + common + 1);
+            new_child->skip = key.substr(kpos + common2 + 1);
             new_child->has_data = true;
             new_child->data = value;
             new_child->parent = cur;
-            new_child->parent_edge = key[kpos + common];
-            cur->skip = skip.substr(0, common);
+            new_child->parent_edge = key[kpos + common2];
+            
+            cur->skip = skip2.substr(0, common2);
             cur->has_data = false;
             cur->data = T{};
             cur->children.clear();
-            cur->pop = pop_tp2{};
+            cur->pop = pop_tp{};
             int i1 = cur->pop.set_bit(old_child->parent_edge);
             cur->children.insert(cur->children.begin() + i1, old_child);
             int i2 = cur->pop.set_bit(new_child->parent_edge);
             cur->children.insert(cur->children.begin() + i2, new_child);
-            cur->bump_version();
+            
+            elem_count.fetch_add(1, std::memory_order_relaxed);
             cur->write_unlock();
-            return {true, true, new_child};
+            return {iterator(new_child, key), true};
         }
     }
 
-    std::pair<bool, bool> try_remove(const Key& key) {
+    bool remove_internal(const Key& key) {
         node_type* cur = &head;
-        size_t kpos = 0;
         cur->read_lock();
-        uint64_t ver = cur->get_version();
+        size_t kpos = 0;
 
         while (true) {
             const std::string& skip = cur->skip;
             if (!skip.empty()) {
-                if (key.size() - kpos < skip.size()) { cur->read_unlock(); return {true, false}; }
-                for (size_t i = 0; i < skip.size(); ++i)
-                    if (key[kpos + i] != skip[i]) { cur->read_unlock(); return {true, false}; }
+                if (key.size() - kpos < skip.size()) { cur->read_unlock(); return false; }
+                bool mismatch = false;
+                for (size_t i = 0; i < skip.size(); ++i) {
+                    if (key[kpos + i] != skip[i]) { mismatch = true; break; }
+                }
+                if (mismatch) { cur->read_unlock(); return false; }
                 kpos += skip.size();
             }
+            
             if (kpos == key.size()) {
-                if (!cur->has_data) { cur->read_unlock(); return {true, false}; }
-                cur->read_unlock();
-                cur->write_lock();
-                if (cur->get_version() != ver) { cur->write_unlock(); return {false, false}; }
-                if (!cur->has_data) { cur->write_unlock(); return {true, false}; }
+                if (!cur->has_data) { cur->read_unlock(); return false; }
+                // Upgrade to write
+                if (!cur->try_upgrade()) {
+                    cur->read_unlock();
+                    cur->write_lock();
+                    if (!cur->has_data) { cur->write_unlock(); return false; }
+                }
                 cur->has_data = false;
                 cur->data = T{};
-                cur->bump_version();
-                cur->write_unlock();
-                return {true, true};
-            }
-            char c = key[kpos];
-            node_type* child = cur->get_child(c);
-            if (!child) { cur->read_unlock(); return {true, false}; }
-            child->read_lock();
-            cur->read_unlock();
-            cur = child;
-            ver = cur->get_version();
-            kpos++;
-        }
-    }
-
-    std::pair<iterator, bool> insert_fallback(const Key& key, const T& value) {
-        node_type* cur = &head;
-        size_t kpos = 0;
-
-        while (true) {
-            cur->write_lock();
-            const std::string& skip = cur->skip;
-            size_t common = 0;
-            while (common < skip.size() && kpos + common < key.size() &&
-                   skip[common] == key[kpos + common]) ++common;
-
-            if (kpos + common == key.size() && common == skip.size()) {
-                bool was_new = !cur->has_data;
-                cur->has_data = true;
-                if (was_new) { cur->data = value; elem_count.fetch_add(1); }
-                cur->bump_version();
-                cur->write_unlock();
-                return {iterator(cur, key), was_new};
-            }
-
-            if (common == skip.size()) {
-                kpos += common;
-                char c = key[kpos];
-                node_type* child = cur->get_child(c);
-                if (child) { cur->write_unlock(); cur = child; kpos++; continue; }
-            }
-
-            // Need to split - simplified for fallback
-            cur->write_unlock();
-            return {end(), false};  // Let retry handle it
-        }
-    }
-
-    bool remove_fallback(const Key& key) {
-        node_type* cur = &head;
-        size_t kpos = 0;
-
-        while (true) {
-            cur->write_lock();
-            const std::string& skip = cur->skip;
-            if (!skip.empty()) {
-                if (key.size() - kpos < skip.size()) { cur->write_unlock(); return false; }
-                for (size_t i = 0; i < skip.size(); ++i)
-                    if (key[kpos + i] != skip[i]) { cur->write_unlock(); return false; }
-                kpos += skip.size();
-            }
-            if (kpos == key.size()) {
-                if (!cur->has_data) { cur->write_unlock(); return false; }
-                cur->has_data = false;
-                cur->data = T{};
-                cur->bump_version();
+                elem_count.fetch_sub(1, std::memory_order_relaxed);
                 cur->write_unlock();
                 return true;
             }
-            char c = key[kpos];
+            
+            char c = key[kpos++];
             node_type* child = cur->get_child(c);
-            cur->write_unlock();
-            if (!child) return false;
+            if (!child) { cur->read_unlock(); return false; }
+            
+            child->read_lock();
+            cur->read_unlock();
             cur = child;
-            kpos++;
         }
     }
 };
