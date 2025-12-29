@@ -1,13 +1,15 @@
 #pragma once
-// Thread-safe optimized trie v2:
+// Thread-safe optimized trie v3:
 // 1. Spinlocks with exponential backoff  
 // 2. Read-lock for traversal, upgrade to write only when modifying
 // 3. Hand-over-hand locking
+// 4. string_view for traversal to avoid allocations
 
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <utility>
 #include <initializer_list>
@@ -136,16 +138,14 @@ public:
         state_.store(0, std::memory_order_release);
     }
     
-    // Try to upgrade from read lock to write lock (must hold exactly one read lock)
     bool try_upgrade() {
-        int expected = 1;  // We are the only reader
+        int expected = 1;
         return state_.compare_exchange_strong(expected, -1,
             std::memory_order_acquire, std::memory_order_relaxed);
     }
     
-    // Downgrade from write to read lock
     void downgrade() {
-        state_.store(1, std::memory_order_release);  // -1 -> 1 (one reader)
+        state_.store(1, std::memory_order_release);
     }
 };
 
@@ -172,6 +172,7 @@ public:
     T& get_data() { return data; }
     const T& get_data() const { return data; }
     const std::string& get_skip() const { return skip; }
+    std::string_view get_skip_view() const { return skip; }
     tktrie_node* get_parent() const { return parent; }
     char get_parent_edge() const { return parent_edge; }
 
@@ -203,7 +204,7 @@ private:
 
     void find_next(node_type* n, Key prefix) {
         while (n) {
-            current_key = prefix + n->get_skip();
+            current_key = prefix + std::string(n->get_skip_view());
             if (n->has_value()) { current = n; return; }
             char fc = n->first_child_char();
             if (fc != '\0') { prefix = current_key + fc; n = n->get_child(fc); continue; }
@@ -211,7 +212,7 @@ private:
                 node_type* p = n->get_parent();
                 if (!p) { current = nullptr; return; }
                 char edge = n->get_parent_edge();
-                Key pk = current_key.substr(0, current_key.length() - n->get_skip().length() - 1);
+                Key pk = current_key.substr(0, current_key.length() - n->get_skip_view().length() - 1);
                 char next = p->next_child_char(edge);
                 if (next != '\0') { prefix = pk + next; n = p->get_child(next); break; }
                 current_key = pk; n = p;
@@ -238,7 +239,7 @@ public:
             node_type* p = n->get_parent();
             if (!p) { current = nullptr; return *this; }
             char edge = n->get_parent_edge();
-            Key pk = current_key.substr(0, current_key.length() - n->get_skip().length() - 1);
+            Key pk = current_key.substr(0, current_key.length() - n->get_skip_view().length() - 1);
             char next = p->next_child_char(edge);
             if (next != '\0') { find_next(p->get_child(next), pk + next); return *this; }
             current_key = pk; n = p;
@@ -294,30 +295,29 @@ public:
     size_type count(const Key& key) { return contains(key) ? 1 : 0; }
 
 private:
+    // Use string_view for traversal - no allocations
     node_type* find_internal(const Key& key) {
+        std::string_view kv(key);
         node_type* cur = &head;
         cur->read_lock();
-        size_t kpos = 0;
 
         while (true) {
-            const std::string& skip = cur->skip;
+            std::string_view skip = cur->get_skip_view();
+            
             if (!skip.empty()) {
-                if (key.size() - kpos < skip.size()) { cur->read_unlock(); return nullptr; }
-                bool mismatch = false;
-                for (size_t i = 0; i < skip.size(); ++i) {
-                    if (key[kpos + i] != skip[i]) { mismatch = true; break; }
-                }
-                if (mismatch) { cur->read_unlock(); return nullptr; }
-                kpos += skip.size();
+                if (kv.size() < skip.size()) { cur->read_unlock(); return nullptr; }
+                if (kv.substr(0, skip.size()) != skip) { cur->read_unlock(); return nullptr; }
+                kv.remove_prefix(skip.size());
             }
             
-            if (kpos == key.size()) {
+            if (kv.empty()) {
                 node_type* result = cur->has_data ? cur : nullptr;
                 cur->read_unlock();
                 return result;
             }
             
-            char c = key[kpos++];
+            char c = kv[0];
+            kv.remove_prefix(1);
             node_type* child = cur->get_child(c);
             if (!child) { cur->read_unlock(); return nullptr; }
             
@@ -328,25 +328,27 @@ private:
     }
 
     std::pair<iterator, bool> insert_internal(const Key& key, const T& value) {
+        std::string_view kv(key);
         node_type* cur = &head;
-        cur->read_lock();  // Start with read lock
-        size_t kpos = 0;
+        cur->read_lock();
+        size_t kpos = 0;  // Track position for creating substrings only when needed
 
         while (true) {
-            const std::string& skip = cur->skip;
+            std::string_view skip = cur->get_skip_view();
             size_t common = 0;
-            while (common < skip.size() && kpos + common < key.size() &&
-                   skip[common] == key[kpos + common]) ++common;
+            size_t kv_len = kv.size();
+            size_t skip_len = skip.size();
+            
+            while (common < skip_len && common < kv_len && skip[common] == kv[common]) 
+                ++common;
 
-            // Case 1: Exact match
-            if (kpos + common == key.size() && common == skip.size()) {
-                // Try to upgrade to write
+            // Case 1: Exact match - kv fully consumed and skip fully matched
+            if (common == kv_len && common == skip_len) {
                 if (!cur->try_upgrade()) {
                     cur->read_unlock();
                     cur->write_lock();
-                    // Re-verify state after acquiring write lock
-                    if (cur->skip != skip) {
-                        // Structure changed, restart
+                    // Re-verify
+                    if (cur->skip.size() != skip_len) {
                         cur->write_unlock();
                         return insert_internal(key, value);
                     }
@@ -361,23 +363,25 @@ private:
                 return {iterator(cur, key), was_new};
             }
 
-            // Case 2: Key is prefix - need write lock for split
-            if (kpos + common == key.size()) {
+            // Case 2: Key is prefix of current node - split needed
+            if (common == kv_len) {
                 cur->read_unlock();
                 cur->write_lock();
-                // Re-verify after acquiring write lock
-                const std::string& skip2 = cur->skip;
+                
+                // Re-verify after lock upgrade
+                std::string_view skip2 = cur->get_skip_view();
                 size_t common2 = 0;
-                while (common2 < skip2.size() && kpos + common2 < key.size() &&
-                       skip2[common2] == key[kpos + common2]) ++common2;
-                if (kpos + common2 != key.size()) {
-                    // State changed, restart
+                while (common2 < skip2.size() && common2 < kv.size() && 
+                       skip2[common2] == kv[common2]) ++common2;
+                       
+                if (common2 != kv.size()) {
                     cur->write_unlock();
                     return insert_internal(key, value);
                 }
                 
+                // Split: create child with remainder of skip
                 auto* child = new node_type();
-                child->skip = skip2.substr(common2 + 1);
+                child->skip = std::string(skip2.substr(common2 + 1));
                 child->has_data = cur->has_data;
                 child->data = std::move(cur->data);
                 child->children = std::move(cur->children);
@@ -386,7 +390,7 @@ private:
                 child->parent_edge = skip2[common2];
                 for (auto* gc : child->children) if (gc) gc->parent = child;
                 
-                cur->skip = skip2.substr(0, common2);
+                cur->skip = std::string(skip2.substr(0, common2));
                 cur->has_data = true;
                 cur->data = value;
                 cur->children.clear();
@@ -399,33 +403,33 @@ private:
                 return {iterator(cur, key), true};
             }
 
-            // Case 3: Skip fully matched, continue
-            if (common == skip.size()) {
+            // Case 3: Skip fully matched, continue to child
+            if (common == skip_len) {
                 kpos += common;
-                char c = key[kpos];
+                kv.remove_prefix(common);
+                char c = kv[0];
                 node_type* child = cur->get_child(c);
                 
                 if (child) {
                     child->read_lock();
                     cur->read_unlock();
                     cur = child;
+                    kv.remove_prefix(1);
                     kpos++;
                     continue;
                 }
                 
-                // Need write lock to add child
+                // Need write lock to add new child
                 cur->read_unlock();
                 cur->write_lock();
-                // Re-check child existence
                 child = cur->get_child(c);
                 if (child) {
-                    // Another thread added it, retry
                     cur->write_unlock();
                     return insert_internal(key, value);
                 }
                 
                 auto* newc = new node_type();
-                newc->skip = key.substr(kpos + 1);
+                newc->skip = std::string(kv.substr(1));
                 newc->has_data = true;
                 newc->data = value;
                 newc->parent = cur;
@@ -438,22 +442,24 @@ private:
                 return {iterator(newc, key), true};
             }
 
-            // Case 4: Mismatch - need write lock for split
+            // Case 4: Mismatch in skip - split node
             cur->read_unlock();
             cur->write_lock();
+            
             // Re-verify
-            const std::string& skip2 = cur->skip;
+            std::string_view skip2 = cur->get_skip_view();
             size_t common2 = 0;
-            while (common2 < skip2.size() && kpos + common2 < key.size() &&
-                   skip2[common2] == key[kpos + common2]) ++common2;
+            while (common2 < skip2.size() && common2 < kv.size() && 
+                   skip2[common2] == kv[common2]) ++common2;
+                   
             if (common2 == skip2.size()) {
-                // State changed, restart
                 cur->write_unlock();
                 return insert_internal(key, value);
             }
             
+            // Create node for old content
             auto* old_child = new node_type();
-            old_child->skip = skip2.substr(common2 + 1);
+            old_child->skip = std::string(skip2.substr(common2 + 1));
             old_child->has_data = cur->has_data;
             old_child->data = std::move(cur->data);
             old_child->children = std::move(cur->children);
@@ -462,14 +468,15 @@ private:
             old_child->parent_edge = skip2[common2];
             for (auto* gc : old_child->children) if (gc) gc->parent = old_child;
             
+            // Create node for new key
             auto* new_child = new node_type();
-            new_child->skip = key.substr(kpos + common2 + 1);
+            new_child->skip = std::string(kv.substr(common2 + 1));
             new_child->has_data = true;
             new_child->data = value;
             new_child->parent = cur;
-            new_child->parent_edge = key[kpos + common2];
+            new_child->parent_edge = kv[common2];
             
-            cur->skip = skip2.substr(0, common2);
+            cur->skip = std::string(skip2.substr(0, common2));
             cur->has_data = false;
             cur->data = T{};
             cur->children.clear();
@@ -486,25 +493,21 @@ private:
     }
 
     bool remove_internal(const Key& key) {
+        std::string_view kv(key);
         node_type* cur = &head;
         cur->read_lock();
-        size_t kpos = 0;
 
         while (true) {
-            const std::string& skip = cur->skip;
+            std::string_view skip = cur->get_skip_view();
+            
             if (!skip.empty()) {
-                if (key.size() - kpos < skip.size()) { cur->read_unlock(); return false; }
-                bool mismatch = false;
-                for (size_t i = 0; i < skip.size(); ++i) {
-                    if (key[kpos + i] != skip[i]) { mismatch = true; break; }
-                }
-                if (mismatch) { cur->read_unlock(); return false; }
-                kpos += skip.size();
+                if (kv.size() < skip.size()) { cur->read_unlock(); return false; }
+                if (kv.substr(0, skip.size()) != skip) { cur->read_unlock(); return false; }
+                kv.remove_prefix(skip.size());
             }
             
-            if (kpos == key.size()) {
+            if (kv.empty()) {
                 if (!cur->has_data) { cur->read_unlock(); return false; }
-                // Upgrade to write
                 if (!cur->try_upgrade()) {
                     cur->read_unlock();
                     cur->write_lock();
@@ -517,7 +520,8 @@ private:
                 return true;
             }
             
-            char c = key[kpos++];
+            char c = kv[0];
+            kv.remove_prefix(1);
             node_type* child = cur->get_child(c);
             if (!child) { cur->read_unlock(); return false; }
             
