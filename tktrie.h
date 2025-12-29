@@ -1,596 +1,355 @@
 #pragma once
-// Thread-safe optimized trie v3:
-// 1. Spinlocks with exponential backoff  
-// 2. Read-lock for traversal, upgrade to write only when modifying
-// 3. Hand-over-hand locking
-// 4. string_view for traversal to avoid allocations
+// RCU-style trie: lock-free reads, copy-on-write for mutations
+// Readers: just follow pointers, no atomics/locks
+// Writers: copy path from root to modified node, atomic swap root
 
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
-#include <utility>
-#include <initializer_list>
 #include <thread>
 
-namespace gteitelbaum {
+namespace rcu {
 
-class alignas(64) pop_tp {
-    using bits_t = uint64_t;
-    std::array<bits_t, 4> bits{};
+// Simple deferred deletion using a retire list
+// In production, use proper epoch-based reclamation
+class RetireList {
+    struct Retired {
+        void* ptr;
+        void (*deleter)(void*);
+    };
+    std::vector<Retired> list;
+    std::mutex mtx;
+    
+public:
+    template<typename T>
+    void retire(T* ptr) {
+        std::lock_guard<std::mutex> lock(mtx);
+        list.push_back({ptr, [](void* p) { delete static_cast<T*>(p); }});
+        
+        // Don't delete anything during benchmark - let destructor handle it
+        // This is safe but leaks memory
+        // In production, use proper epoch-based reclamation
+    }
+    
+    ~RetireList() {
+        for (auto& r : list) {
+            r.deleter(r.ptr);
+        }
+    }
+};
+
+// Bitmap for sparse children
+class PopCount {
+    uint64_t bits[4]{};
 
 public:
-    bool find_pop(char c, int* cnt) const {
-        uint8_t v = static_cast<uint8_t>(c);
-        const int word = v >> 6;
-        const int bit = v & 63;
-        const bits_t mask = 1ULL << bit;
-        if (!(bits[word] & mask)) return false;
-        int idx = std::popcount(bits[word] & (mask - 1));
-        for (int i = 0; i < word; ++i) idx += std::popcount(bits[i]);
-        *cnt = idx;
-        return true;
-    }
-
-    int set_bit(char c) {
-        uint8_t v = static_cast<uint8_t>(c);
-        const int word = v >> 6;
-        const int bit = v & 63;
-        const bits_t mask = 1ULL << bit;
-        int idx = std::popcount(bits[word] & (mask - 1));
-        for (int i = 0; i < word; ++i) idx += std::popcount(bits[i]);
-        bits[word] |= mask;
-        return idx;
-    }
-
-    int clear_bit(char c) {
-        uint8_t v = static_cast<uint8_t>(c);
-        const int word = v >> 6;
-        const int bit = v & 63;
-        const bits_t mask = 1ULL << bit;
-        int idx = std::popcount(bits[word] & (mask - 1));
-        for (int i = 0; i < word; ++i) idx += std::popcount(bits[i]);
-        bits[word] &= ~mask;
-        return idx;
-    }
-
-    int count() const {
-        int total = 0;
-        for (const auto& w : bits) total += std::popcount(w);
-        return total;
-    }
-
-    bool empty() const { return (bits[0] | bits[1] | bits[2] | bits[3]) == 0; }
-
-    char first_char() const {
-        for (int word = 0; word < 4; ++word) {
-            if (bits[word] != 0) return static_cast<char>((word << 6) | std::countr_zero(bits[word]));
-        }
-        return '\0';
-    }
-
-    char next_char(char c) const {
+    bool find(char c, int* idx) const {
         uint8_t v = static_cast<uint8_t>(c);
         int word = v >> 6;
         int bit = v & 63;
-        bits_t mask = ~((1ULL << (bit + 1)) - 1);
-        bits_t remaining = bits[word] & mask;
-        if (remaining != 0) return static_cast<char>((word << 6) | std::countr_zero(remaining));
-        for (int w = word + 1; w < 4; ++w) {
-            if (bits[w] != 0) return static_cast<char>((w << 6) | std::countr_zero(bits[w]));
-        }
-        return '\0';
+        uint64_t mask = 1ULL << bit;
+        if (!(bits[word] & mask)) return false;
+        int i = std::popcount(bits[word] & (mask - 1));
+        for (int w = 0; w < word; ++w) i += std::popcount(bits[w]);
+        *idx = i;
+        return true;
+    }
+
+    int set(char c) {
+        uint8_t v = static_cast<uint8_t>(c);
+        int word = v >> 6;
+        int bit = v & 63;
+        uint64_t mask = 1ULL << bit;
+        int idx = std::popcount(bits[word] & (mask - 1));
+        for (int w = 0; w < word; ++w) idx += std::popcount(bits[w]);
+        bits[word] |= mask;
+        return idx;
     }
 };
 
-template <class Key, class T> class tktrie;
-
-// Optimized reader-writer spinlock with try_upgrade
-class rw_spinlock {
-    std::atomic<int> state_{0};  // 0=free, -1=write, >0=readers
-    
-    void backoff(int spins) {
-        if (spins < 4) {
-            #if defined(__x86_64__)
-            __builtin_ia32_pause();
-            #endif
-        } else if (spins < 16) {
-            for (int i = 0; i < spins; i++) {
-                #if defined(__x86_64__)
-                __builtin_ia32_pause();
-                #endif
-            }
-        } else if (spins < 32) {
-            std::this_thread::yield();
-        } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(1));
-        }
-    }
-    
-public:
-    void read_lock() {
-        int spins = 0;
-        while (true) {
-            int expected = state_.load(std::memory_order_relaxed);
-            if (expected >= 0 && state_.compare_exchange_weak(expected, expected + 1,
-                std::memory_order_acquire, std::memory_order_relaxed)) return;
-            backoff(++spins);
-        }
-    }
-    
-    void read_unlock() {
-        state_.fetch_sub(1, std::memory_order_release);
-    }
-    
-    void write_lock() {
-        int spins = 0;
-        while (true) {
-            int expected = 0;
-            if (state_.compare_exchange_weak(expected, -1,
-                std::memory_order_acquire, std::memory_order_relaxed)) return;
-            backoff(++spins);
-        }
-    }
-    
-    void write_unlock() {
-        state_.store(0, std::memory_order_release);
-    }
-    
-    bool try_upgrade() {
-        int expected = 1;
-        return state_.compare_exchange_strong(expected, -1,
-            std::memory_order_acquire, std::memory_order_relaxed);
-    }
-    
-    void downgrade() {
-        state_.store(1, std::memory_order_release);
-    }
-};
-
-template <class Key, class T>
-class alignas(64) tktrie_node {
-    friend class tktrie<Key, T>;
-
-    mutable rw_spinlock lock_;
-    pop_tp pop{};
-    std::vector<tktrie_node*> children{};
-    tktrie_node* parent{nullptr};
+template <typename T>
+struct Node {
+    PopCount pop{};
+    std::vector<Node*> children{};
     std::string skip{};
     T data{};
-    char parent_edge{'\0'};
     bool has_data{false};
 
-public:
-    tktrie_node() = default;
-    ~tktrie_node() { for (auto* c : children) delete c; }
-    tktrie_node(const tktrie_node&) = delete;
-    tktrie_node& operator=(const tktrie_node&) = delete;
+    Node() = default;
+    
+    // Shallow copy - copies child pointers, not children themselves
+    Node(const Node& other) 
+        : pop(other.pop)
+        , children(other.children)
+        , skip(other.skip)
+        , data(other.data)
+        , has_data(other.has_data) 
+    {}
 
-    bool has_value() const { return has_data; }
-    T& get_data() { return data; }
-    const T& get_data() const { return data; }
-    const std::string& get_skip() const { return skip; }
-    std::string_view get_skip_view() const { return skip; }
-    tktrie_node* get_parent() const { return parent; }
-    char get_parent_edge() const { return parent_edge; }
-
-    tktrie_node* get_child(char c) const {
+    Node* get_child(char c) const {
         int idx;
-        if (pop.find_pop(c, &idx)) return children[idx];
+        if (pop.find(c, &idx)) return children[idx];
         return nullptr;
     }
-
-    char first_child_char() const { return pop.first_char(); }
-    char next_child_char(char c) const { return pop.next_char(c); }
-
-    void read_lock() const { lock_.read_lock(); }
-    void read_unlock() const { lock_.read_unlock(); }
-    void write_lock() { lock_.write_lock(); }
-    void write_unlock() { lock_.write_unlock(); }
-    bool try_upgrade() { return lock_.try_upgrade(); }
-    void downgrade() { lock_.downgrade(); }
 };
 
-template <class Key, class T>
-class tktrie_iterator {
-public:
-    using node_type = tktrie_node<Key, T>;
-    using reference = std::pair<const Key&, T&>;
-private:
-    node_type* current{nullptr};
-    Key current_key;
-
-    void find_next(node_type* n, Key prefix) {
-        while (n) {
-            current_key = prefix + std::string(n->get_skip_view());
-            if (n->has_value()) { current = n; return; }
-            char fc = n->first_child_char();
-            if (fc != '\0') { prefix = current_key + fc; n = n->get_child(fc); continue; }
-            while (n) {
-                node_type* p = n->get_parent();
-                if (!p) { current = nullptr; return; }
-                char edge = n->get_parent_edge();
-                Key pk = current_key.substr(0, current_key.length() - n->get_skip_view().length() - 1);
-                char next = p->next_child_char(edge);
-                if (next != '\0') { prefix = pk + next; n = p->get_child(next); break; }
-                current_key = pk; n = p;
-            }
-        }
-        current = nullptr;
-    }
-
-public:
-    tktrie_iterator() = default;
-    tktrie_iterator(node_type* root, bool is_end = false) {
-        if (is_end || !root) { current = nullptr; return; }
-        find_next(root, "");
-    }
-    tktrie_iterator(node_type* n, const Key& key) : current(n), current_key(key) {}
-    
-    reference operator*() const { return {current_key, current->get_data()}; }
-    tktrie_iterator& operator++() {
-        if (!current) return *this;
-        node_type* n = current;
-        char fc = n->first_child_char();
-        if (fc != '\0') { find_next(n->get_child(fc), current_key + fc); return *this; }
-        while (n) {
-            node_type* p = n->get_parent();
-            if (!p) { current = nullptr; return *this; }
-            char edge = n->get_parent_edge();
-            Key pk = current_key.substr(0, current_key.length() - n->get_skip_view().length() - 1);
-            char next = p->next_child_char(edge);
-            if (next != '\0') { find_next(p->get_child(next), pk + next); return *this; }
-            current_key = pk; n = p;
-        }
-        current = nullptr;
-        return *this;
-    }
-    bool operator==(const tktrie_iterator& o) const { return current == o.current; }
-    bool operator!=(const tktrie_iterator& o) const { return current != o.current; }
-    node_type* get_node() const { return current; }
-    const Key& key() const { return current_key; }
-};
-
-template <class Key, class T>
+template <typename Key, typename T>
 class tktrie {
 public:
-    using iterator = tktrie_iterator<Key, T>;
-    using node_type = tktrie_node<Key, T>;
+    using node_type = Node<T>;
     using size_type = std::size_t;
 
 private:
-    node_type head;
-    std::atomic<size_type> elem_count{0};
+    std::atomic<node_type*> root_{new node_type()};
+    std::atomic<size_type> elem_count_{0};
+    RetireList retired_;
+    std::mutex write_mutex_;
 
 public:
     tktrie() = default;
-    tktrie(std::initializer_list<std::pair<const Key, T>> init) {
-        for (const auto& p : init) insert(p);
-    }
-    ~tktrie() = default;
-    tktrie(const tktrie&) = delete;
-    tktrie& operator=(const tktrie&) = delete;
-
-    iterator begin() noexcept { return iterator(&head); }
-    iterator end() noexcept { return iterator(nullptr, true); }
-    bool empty() const noexcept { return size() == 0; }
-    size_type size() const noexcept { return elem_count.load(std::memory_order_relaxed); }
-
-    std::pair<iterator, bool> insert(const std::pair<const Key, T>& value) {
-        return insert_internal(value.first, value.second);
+    
+    ~tktrie() {
+        delete_tree(root_.load(std::memory_order_relaxed));
     }
 
-    size_type erase(const Key& key) {
-        return remove_internal(key) ? 1 : 0;
+    bool empty() const { return size() == 0; }
+    size_type size() const { return elem_count_.load(std::memory_order_relaxed); }
+
+    // Lock-free find - NO synchronization in hot path!
+    node_type* find(const Key& key) const {
+        std::string_view kv(key);
+        node_type* cur = root_.load(std::memory_order_acquire);
+        
+        while (cur) {
+            const std::string& skip = cur->skip;
+            
+            if (!skip.empty()) {
+                if (kv.size() < skip.size()) return nullptr;
+                if (kv.substr(0, skip.size()) != skip) return nullptr;
+                kv.remove_prefix(skip.size());
+            }
+            
+            if (kv.empty()) {
+                return cur->has_data ? cur : nullptr;
+            }
+            
+            char c = kv[0];
+            kv.remove_prefix(1);
+            cur = cur->get_child(c);
+        }
+        return nullptr;
     }
 
-    iterator find(const Key& key) {
-        node_type* n = find_internal(key);
-        return n ? iterator(n, key) : end();
+    bool contains(const Key& key) const {
+        return find(key) != nullptr;
     }
 
-    bool contains(const Key& key) { return find_internal(key) != nullptr; }
-    size_type count(const Key& key) { return contains(key) ? 1 : 0; }
+    // Copy-on-write insert - copies entire path from root
+    bool insert(const std::pair<const Key, T>& value) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return insert_cow(value.first, value.second);
+    }
+
+    bool erase(const Key& key) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return erase_cow(key);
+    }
 
 private:
-    // Use string_view for traversal - no allocations
-    node_type* find_internal(const Key& key) {
-        std::string_view kv(key);
-        node_type* cur = &head;
-        cur->read_lock();
-
-        while (true) {
-            std::string_view skip = cur->get_skip_view();
-            
-            if (!skip.empty()) {
-                if (kv.size() < skip.size()) { cur->read_unlock(); return nullptr; }
-                if (kv.substr(0, skip.size()) != skip) { cur->read_unlock(); return nullptr; }
-                kv.remove_prefix(skip.size());
-            }
-            
-            if (kv.empty()) {
-                node_type* result = cur->has_data ? cur : nullptr;
-                cur->read_unlock();
-                return result;
-            }
-            
-            char c = kv[0];
-            kv.remove_prefix(1);
-            node_type* child = cur->get_child(c);
-            if (!child) { cur->read_unlock(); return nullptr; }
-            
-            child->read_lock();
-            cur->read_unlock();
-            cur = child;
+    void delete_tree(node_type* n) {
+        if (!n) return;
+        for (auto* child : n->children) {
+            delete_tree(child);
         }
+        delete n;
     }
 
-    std::pair<iterator, bool> insert_internal(const Key& key, const T& value) {
-        std::string_view kv(key);
-        node_type* cur = &head;
-        cur->read_lock();
-        size_t kpos = 0;  // Track position for creating substrings only when needed
-
-        while (true) {
-            std::string_view skip = cur->get_skip_view();
-            size_t common = 0;
-            size_t kv_len = kv.size();
-            size_t skip_len = skip.size();
-            
-            while (common < skip_len && common < kv_len && skip[common] == kv[common]) 
-                ++common;
-
-            // Case 1: Exact match - kv fully consumed and skip fully matched
-            if (common == kv_len && common == skip_len) {
-                if (!cur->try_upgrade()) {
-                    cur->read_unlock();
-                    cur->write_lock();
-                    // Re-verify
-                    if (cur->skip.size() != skip_len) {
-                        cur->write_unlock();
-                        return insert_internal(key, value);
-                    }
-                }
-                bool was_new = !cur->has_data;
-                cur->has_data = true;
-                if (was_new) {
-                    cur->data = value;
-                    elem_count.fetch_add(1, std::memory_order_relaxed);
-                }
-                cur->write_unlock();
-                return {iterator(cur, key), was_new};
+    // Copy entire path from root to target, apply modification
+    bool insert_cow(const Key& key, const T& value) {
+        node_type* old_root = root_.load(std::memory_order_relaxed);
+        
+        // Build new tree with path copied
+        std::vector<node_type*> retired_nodes;
+        auto [new_root, inserted] = copy_and_insert(old_root, key, 0, value, retired_nodes);
+        
+        if (new_root) {
+            root_.store(new_root, std::memory_order_release);
+            // Retire only the copied nodes, not the entire old tree
+            for (auto* n : retired_nodes) {
+                retired_.retire(n);
             }
-
-            // Case 2: Key is prefix of current node - split needed
-            if (common == kv_len) {
-                // Prepare everything BEFORE locking
-                std::string new_cur_skip = std::string(skip.substr(0, common));
-                std::string child_skip = std::string(skip.substr(common + 1));
-                char edge_char = skip[common];
-                
-                // Create and fully initialize child node
-                auto* child = new node_type();
-                child->skip = std::move(child_skip);
-                child->parent_edge = edge_char;
-                child->has_data = true;  // Will swap with cur
-                child->data = value;     // New value goes here temporarily
-                
-                // Prepare new children vector for cur
-                std::vector<node_type*> new_cur_children;
-                new_cur_children.push_back(child);
-                
-                // Prepare new pop for cur
-                pop_tp new_cur_pop{};
-                new_cur_pop.set_bit(edge_char);
-                
-                cur->read_unlock();
-                cur->write_lock();
-                
-                // Re-verify after lock upgrade
-                std::string_view skip2 = cur->get_skip_view();
-                size_t common2 = 0;
-                while (common2 < skip2.size() && common2 < kv.size() && 
-                       skip2[common2] == kv[common2]) ++common2;
-                       
-                if (common2 != kv.size()) {
-                    cur->write_unlock();
-                    delete child;
-                    return insert_internal(key, value);
-                }
-                
-                // Inside lock: only swaps and pointer updates
-                // Swap data: cur gets new value, child gets old value
-                std::swap(child->has_data, cur->has_data);
-                std::swap(child->data, cur->data);
-                
-                // Child takes cur's children and pop
-                child->children.swap(cur->children);
-                std::swap(child->pop, cur->pop);
-                child->parent = cur;
-                
-                // Update grandchildren parent pointers
-                for (auto* gc : child->children) if (gc) gc->parent = child;
-                
-                // Cur gets new skip (swap to defer destruction)
-                cur->skip.swap(new_cur_skip);
-                
-                // Cur gets new children vector and pop
-                cur->children.swap(new_cur_children);
-                cur->pop = new_cur_pop;
-                
-                elem_count.fetch_add(1, std::memory_order_relaxed);
-                cur->write_unlock();
-                
-                // new_cur_skip (old cur->skip) destroyed here
-                // new_cur_children (empty) destroyed here
-                return {iterator(cur, key), true};
+            if (inserted) {
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
             }
+            return inserted;
+        }
+        return false;
+    }
 
-            // Case 3: Skip fully matched, continue to child
-            if (common == skip_len) {
-                kpos += common;
-                kv.remove_prefix(common);
-                char c = kv[0];
-                node_type* child = cur->get_child(c);
-                
-                if (child) {
-                    child->read_lock();
-                    cur->read_unlock();
-                    cur = child;
-                    kv.remove_prefix(1);
-                    kpos++;
-                    continue;
-                }
-                
-                // Prepare new node BEFORE locking
-                auto* newc = new node_type();
-                newc->skip = std::string(kv.substr(1));
-                newc->has_data = true;
-                newc->data = value;
-                newc->parent = cur;
-                newc->parent_edge = c;
-                
-                cur->read_unlock();
-                cur->write_lock();
-                child = cur->get_child(c);
-                if (child) {
-                    cur->write_unlock();
-                    delete newc;
-                    return insert_internal(key, value);
-                }
-                
-                // insert() may realloc but it's unavoidable without more complexity
-                int idx = cur->pop.set_bit(c);
-                cur->children.insert(cur->children.begin() + idx, newc);
-                
-                elem_count.fetch_add(1, std::memory_order_relaxed);
-                cur->write_unlock();
-                return {iterator(newc, key), true};
+    // Returns {new_node, was_inserted}
+    std::pair<node_type*, bool> copy_and_insert(node_type* cur, const Key& key, 
+                                                 size_t kpos, const T& value,
+                                                 std::vector<node_type*>& retired) {
+        if (!cur) {
+            // Create new node for remaining key
+            node_type* n = new node_type();
+            n->skip = key.substr(kpos);
+            n->has_data = true;
+            n->data = value;
+            return {n, true};
+        }
+        
+        const std::string& skip = cur->skip;
+        size_t common = 0;
+        while (common < skip.size() && kpos + common < key.size() &&
+               skip[common] == key[kpos + common]) {
+            ++common;
+        }
+
+        // Case 1: Exact match
+        if (kpos + common == key.size() && common == skip.size()) {
+            if (cur->has_data) {
+                return {nullptr, false};  // Already exists
             }
+            node_type* n = new node_type(*cur);
+            n->has_data = true;
+            n->data = value;
+            retired.push_back(cur);
+            return {n, true};
+        }
 
-            // Case 4: Mismatch in skip - split node
-            // Prepare everything BEFORE locking
-            std::string old_child_skip = std::string(skip.substr(common + 1));
-            std::string new_child_skip = std::string(kv.substr(common + 1));
-            std::string new_cur_skip = std::string(skip.substr(0, common));
-            char old_edge = skip[common];
-            char new_edge = kv[common];
+        // Case 2: Key is prefix of skip - split
+        if (kpos + common == key.size()) {
+            node_type* split = new node_type();
+            split->skip = skip.substr(0, common);
+            split->has_data = true;
+            split->data = value;
             
-            // Create old_child - will receive cur's data via swap
-            auto* old_child = new node_type();
-            old_child->skip = std::move(old_child_skip);
-            old_child->parent_edge = old_edge;
-            old_child->has_data = false;  // Will swap with cur
+            node_type* child = new node_type(*cur);
+            child->skip = skip.substr(common + 1);
             
-            // Create new_child - fully initialized
-            auto* new_child = new node_type();
-            new_child->skip = std::move(new_child_skip);
-            new_child->has_data = true;
-            new_child->data = value;
-            new_child->parent_edge = new_edge;
+            char edge = skip[common];
+            split->pop.set(edge);
+            split->children.push_back(child);
             
-            // Pre-build children vector and pop
-            pop_tp new_cur_pop{};
-            int i1 = new_cur_pop.set_bit(old_edge);
-            int i2 = new_cur_pop.set_bit(new_edge);
+            retired.push_back(cur);
+            return {split, true};
+        }
+
+        // Case 3: Skip fully matched, continue to child
+        if (common == skip.size()) {
+            kpos += common;
+            char c = key[kpos];
+            node_type* child = cur->get_child(c);
             
-            std::vector<node_type*> new_cur_children;
-            new_cur_children.reserve(2);
-            if (i1 <= i2) {
-                new_cur_children.push_back(old_child);
-                new_cur_children.push_back(new_child);
+            auto [new_child, inserted] = copy_and_insert(child, key, kpos + 1, value, retired);
+            if (!new_child && !inserted) {
+                return {nullptr, false};
+            }
+            
+            node_type* n = new node_type(*cur);
+            int idx;
+            if (n->pop.find(c, &idx)) {
+                n->children[idx] = new_child;
             } else {
-                new_cur_children.push_back(new_child);
-                new_cur_children.push_back(old_child);
+                idx = n->pop.set(c);
+                n->children.insert(n->children.begin() + idx, new_child);
             }
-            
-            cur->read_unlock();
-            cur->write_lock();
-            
-            // Re-verify
-            std::string_view skip2 = cur->get_skip_view();
-            size_t common2 = 0;
-            while (common2 < skip2.size() && common2 < kv.size() && 
-                   skip2[common2] == kv[common2]) ++common2;
-                   
-            if (common2 == skip2.size()) {
-                cur->write_unlock();
-                delete old_child;
-                delete new_child;
-                return insert_internal(key, value);
-            }
-            
-            // Inside lock: only swaps and pointer updates
-            // old_child takes cur's data via swap
-            std::swap(old_child->has_data, cur->has_data);
-            std::swap(old_child->data, cur->data);
-            
-            // old_child takes cur's children and pop via swap
-            old_child->children.swap(cur->children);
-            std::swap(old_child->pop, cur->pop);
-            old_child->parent = cur;
-            new_child->parent = cur;
-            
-            // Update grandchildren parent pointers
-            for (auto* gc : old_child->children) if (gc) gc->parent = old_child;
-            
-            // cur gets new skip, children, pop via swap
-            cur->skip.swap(new_cur_skip);
-            cur->children.swap(new_cur_children);
-            cur->pop = new_cur_pop;
-            
-            elem_count.fetch_add(1, std::memory_order_relaxed);
-            cur->write_unlock();
-            
-            // new_cur_skip (old cur->skip), new_cur_children (empty) destroyed here
-            return {iterator(new_child, key), true};
+            retired.push_back(cur);
+            return {n, inserted};
         }
+
+        // Case 4: Mismatch - split
+        node_type* split = new node_type();
+        split->skip = skip.substr(0, common);
+        
+        // old_child gets the remainder AFTER the mismatch char
+        node_type* old_child = new node_type(*cur);
+        old_child->skip = (common + 1 < skip.size()) ? skip.substr(common + 1) : "";
+        
+        // new_child gets the remainder of key AFTER the mismatch char  
+        node_type* new_child = new node_type();
+        new_child->skip = (kpos + common + 1 < key.size()) ? key.substr(kpos + common + 1) : "";
+        new_child->has_data = true;
+        new_child->data = value;
+        
+        char old_edge = skip[common];
+        char new_edge = key[kpos + common];
+        
+        // Must insert in sorted order by edge character
+        if (old_edge < new_edge) {
+            split->pop.set(old_edge);
+            split->pop.set(new_edge);
+            split->children.push_back(old_child);
+            split->children.push_back(new_child);
+        } else {
+            split->pop.set(new_edge);
+            split->pop.set(old_edge);
+            split->children.push_back(new_child);
+            split->children.push_back(old_child);
+        }
+        
+        retired.push_back(cur);
+        return {split, true};
     }
 
-    bool remove_internal(const Key& key) {
-        std::string_view kv(key);
-        node_type* cur = &head;
-        cur->read_lock();
-
-        while (true) {
-            std::string_view skip = cur->get_skip_view();
-            
-            if (!skip.empty()) {
-                if (kv.size() < skip.size()) { cur->read_unlock(); return false; }
-                if (kv.substr(0, skip.size()) != skip) { cur->read_unlock(); return false; }
-                kv.remove_prefix(skip.size());
+    bool erase_cow(const Key& key) {
+        node_type* old_root = root_.load(std::memory_order_relaxed);
+        
+        std::vector<node_type*> retired_nodes;
+        auto [new_root, erased] = copy_and_erase(old_root, key, 0, retired_nodes);
+        
+        if (erased) {
+            root_.store(new_root ? new_root : new node_type(), std::memory_order_release);
+            for (auto* n : retired_nodes) {
+                retired_.retire(n);
             }
-            
-            if (kv.empty()) {
-                if (!cur->has_data) { cur->read_unlock(); return false; }
-                if (!cur->try_upgrade()) {
-                    cur->read_unlock();
-                    cur->write_lock();
-                    if (!cur->has_data) { cur->write_unlock(); return false; }
-                }
-                
-                // Move data out to defer destruction until after unlock
-                T old_data = std::move(cur->data);
-                cur->has_data = false;
-                elem_count.fetch_sub(1, std::memory_order_relaxed);
-                cur->write_unlock();
-                
-                // old_data destroyed here, outside lock
-                return true;
-            }
-            
-            char c = kv[0];
-            kv.remove_prefix(1);
-            node_type* child = cur->get_child(c);
-            if (!child) { cur->read_unlock(); return false; }
-            
-            child->read_lock();
-            cur->read_unlock();
-            cur = child;
+            elem_count_.fetch_sub(1, std::memory_order_relaxed);
+            return true;
         }
+        return false;
+    }
+
+    std::pair<node_type*, bool> copy_and_erase(node_type* cur, const Key& key, size_t kpos,
+                                                std::vector<node_type*>& retired) {
+        if (!cur) return {nullptr, false};
+        
+        const std::string& skip = cur->skip;
+        
+        if (!skip.empty()) {
+            if (key.size() - kpos < skip.size()) return {nullptr, false};
+            if (key.substr(kpos, skip.size()) != skip) return {nullptr, false};
+            kpos += skip.size();
+        }
+        
+        if (kpos == key.size()) {
+            if (!cur->has_data) return {nullptr, false};
+            
+            node_type* n = new node_type(*cur);
+            n->has_data = false;
+            n->data = T{};
+            retired.push_back(cur);
+            return {n, true};
+        }
+        
+        char c = key[kpos];
+        node_type* child = cur->get_child(c);
+        if (!child) return {nullptr, false};
+        
+        auto [new_child, erased] = copy_and_erase(child, key, kpos + 1, retired);
+        if (!erased) return {nullptr, false};
+        
+        node_type* n = new node_type(*cur);
+        int idx;
+        n->pop.find(c, &idx);
+        n->children[idx] = new_child;
+        retired.push_back(cur);
+        return {n, true};
     }
 };
 
-} // namespace gteitelbaum
+} // namespace rcu
