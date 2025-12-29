@@ -365,6 +365,11 @@ private:
 
             // Case 2: Key is prefix of current node - split needed
             if (common == kv_len) {
+                // Prepare split data before locking
+                std::string new_skip = std::string(skip.substr(0, common));
+                std::string child_skip = std::string(skip.substr(common + 1));
+                char edge_char = skip[common];
+                
                 cur->read_unlock();
                 cur->write_lock();
                 
@@ -381,16 +386,16 @@ private:
                 
                 // Split: create child with remainder of skip
                 auto* child = new node_type();
-                child->skip = std::string(skip2.substr(common2 + 1));
+                child->skip = std::move(child_skip);
                 child->has_data = cur->has_data;
                 child->data = std::move(cur->data);
                 child->children = std::move(cur->children);
                 child->pop = cur->pop;
                 child->parent = cur;
-                child->parent_edge = skip2[common2];
+                child->parent_edge = edge_char;
                 for (auto* gc : child->children) if (gc) gc->parent = child;
                 
-                cur->skip = std::string(skip2.substr(0, common2));
+                cur->skip = std::move(new_skip);
                 cur->has_data = true;
                 cur->data = value;
                 cur->children.clear();
@@ -419,21 +424,25 @@ private:
                     continue;
                 }
                 
-                // Need write lock to add new child
-                cur->read_unlock();
-                cur->write_lock();
-                child = cur->get_child(c);
-                if (child) {
-                    cur->write_unlock();
-                    return insert_internal(key, value);
-                }
-                
+                // Prepare new node BEFORE locking
                 auto* newc = new node_type();
                 newc->skip = std::string(kv.substr(1));
                 newc->has_data = true;
                 newc->data = value;
                 newc->parent = cur;
                 newc->parent_edge = c;
+                
+                // Now lock briefly to attach
+                cur->read_unlock();
+                cur->write_lock();
+                child = cur->get_child(c);
+                if (child) {
+                    // Another thread beat us - discard our node
+                    delete newc;
+                    cur->write_unlock();
+                    return insert_internal(key, value);
+                }
+                
                 int idx = cur->pop.set_bit(c);
                 cur->children.insert(cur->children.begin() + idx, newc);
                 
@@ -443,6 +452,23 @@ private:
             }
 
             // Case 4: Mismatch in skip - split node
+            // Prepare both new nodes BEFORE locking
+            std::string old_child_skip = std::string(skip.substr(common + 1));
+            std::string new_child_skip = std::string(kv.substr(common + 1));
+            std::string new_cur_skip = std::string(skip.substr(0, common));
+            char old_edge = skip[common];
+            char new_edge = kv[common];
+            
+            auto* old_child = new node_type();
+            old_child->skip = std::move(old_child_skip);
+            old_child->parent_edge = old_edge;
+            
+            auto* new_child = new node_type();
+            new_child->skip = std::move(new_child_skip);
+            new_child->has_data = true;
+            new_child->data = value;
+            new_child->parent_edge = new_edge;
+            
             cur->read_unlock();
             cur->write_lock();
             
@@ -453,30 +479,26 @@ private:
                    skip2[common2] == kv[common2]) ++common2;
                    
             if (common2 == skip2.size()) {
+                // State changed - discard prepared nodes
+                delete old_child;
+                delete new_child;
                 cur->write_unlock();
                 return insert_internal(key, value);
             }
             
-            // Create node for old content
-            auto* old_child = new node_type();
-            old_child->skip = std::string(skip2.substr(common2 + 1));
+            // Complete old_child setup with cur's data
             old_child->has_data = cur->has_data;
             old_child->data = std::move(cur->data);
             old_child->children = std::move(cur->children);
             old_child->pop = cur->pop;
             old_child->parent = cur;
-            old_child->parent_edge = skip2[common2];
             for (auto* gc : old_child->children) if (gc) gc->parent = old_child;
             
-            // Create node for new key
-            auto* new_child = new node_type();
-            new_child->skip = std::string(kv.substr(common2 + 1));
-            new_child->has_data = true;
-            new_child->data = value;
+            // Complete new_child setup
             new_child->parent = cur;
-            new_child->parent_edge = kv[common2];
             
-            cur->skip = std::string(skip2.substr(0, common2));
+            // Update cur
+            cur->skip = std::move(new_cur_skip);
             cur->has_data = false;
             cur->data = T{};
             cur->children.clear();
