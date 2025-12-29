@@ -13,6 +13,8 @@
 #include <initializer_list>
 #include <thread>
 
+namespace gteitelbaum {
+
 class alignas(64) pop_tp {
     using bits_t = uint64_t;
     std::array<bits_t, 4> bits{};
@@ -525,3 +527,5 @@ private:
         }
     }
 };
+
+} // namespace gteitelbaum
