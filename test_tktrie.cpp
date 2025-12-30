@@ -11,6 +11,7 @@
 #include <algorithm>
 #include "tktrie.h"
 
+// ~1000 common English words
 const std::vector<std::string> STRING_KEYS = {
     "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
     "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
@@ -110,34 +111,24 @@ std::vector<uint64_t> generate_uint64_keys(size_t count) {
     std::vector<uint64_t> keys;
     keys.reserve(count);
     std::mt19937_64 rng(42);
-    std::uniform_int_distribution<uint64_t> dist(
-        std::numeric_limits<uint64_t>::min(),
-        std::numeric_limits<uint64_t>::max()
-    );
     for (size_t i = 0; i < count; i++) {
-        keys.push_back(dist(rng));
+        keys.push_back(rng());
     }
     return keys;
 }
 
-std::vector<int64_t> generate_int64_keys(size_t count) {
-    std::vector<int64_t> keys;
+std::vector<int> generate_int_keys(size_t count) {
+    std::vector<int> keys;
     keys.reserve(count);
-    std::mt19937_64 rng(42);  // Same seed = same bit patterns
-    std::uniform_int_distribution<uint64_t> dist(
-        std::numeric_limits<uint64_t>::min(),
-        std::numeric_limits<uint64_t>::max()
-    );
+    std::mt19937 rng(42);
     for (size_t i = 0; i < count; i++) {
-        // Reinterpret same bits as int64_t for identical distribution
-        uint64_t bits = dist(rng);
-        keys.push_back(static_cast<int64_t>(bits));
+        keys.push_back(static_cast<int>(rng()));
     }
     return keys;
 }
 
 const std::vector<uint64_t> UINT64_KEYS = generate_uint64_keys(10000);
-const std::vector<int64_t> INT64_KEYS = generate_int64_keys(10000);
+const std::vector<int> INT_KEYS = generate_int_keys(10000);
 
 template<typename M>
 class guarded_map {
@@ -148,145 +139,163 @@ public:
         std::shared_lock lock(mtx);
         return data.find(key) != data.end();
     }
-    bool insert(const std::pair<typename M::key_type, typename M::mapped_type>& kv) {
+    auto find(const typename M::key_type& key) const {
+        std::shared_lock lock(mtx);
+        return data.find(key);
+    }
+    void insert(const std::pair<typename M::key_type, typename M::mapped_type>& kv) {
         std::unique_lock lock(mtx);
-        return data.insert(kv).second;
+        data.insert(kv);
     }
     bool erase(const typename M::key_type& key) {
         std::unique_lock lock(mtx);
         return data.erase(key) > 0;
     }
+    size_t size() const {
+        std::shared_lock lock(mtx);
+        return data.size();
+    }
 };
 
-template<typename K, typename V> using locked_map = guarded_map<std::map<K, V>>;
-template<typename K, typename V> using locked_umap = guarded_map<std::unordered_map<K, V>>;
+template<typename K, typename V>
+using locked_map = guarded_map<std::map<K, V>>;
 
-std::atomic<bool> stop{false};
+template<typename K, typename V>
+using locked_umap = guarded_map<std::unordered_map<K, V>>;
 
 template<typename Container, typename Keys>
 double bench_find(Container& c, const Keys& keys, int threads, int ms) {
-    std::atomic<long long> ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
+    std::atomic<bool> running{true};
+    std::atomic<uint64_t> ops{0};
+    std::vector<std::thread> pool;
+    
     for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&]() {
-            long long local = 0;
-            while (!stop) { for (const auto& k : keys) { c.contains(k); local++; } }
-            ops += local;
+        pool.emplace_back([&, t]() {
+            uint64_t local = 0;
+            size_t i = t;
+            while (running.load(std::memory_order_relaxed)) {
+                c.contains(keys[i % keys.size()]);
+                i += threads;
+                local++;
+            }
+            ops.fetch_add(local, std::memory_order_relaxed);
         });
     }
+    
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return ops * 1000.0 / ms;
+    running.store(false);
+    for (auto& th : pool) th.join();
+    return ops.load() * 1000.0 / ms;
 }
 
 template<typename Container, typename Keys, typename V>
 double bench_insert(const Keys& keys, int threads, int ms) {
-    // Warmup: one full iteration per thread to prime allocator
-    std::vector<std::thread> warmup_threads;
-    for (int t = 0; t < threads; t++) {
-        warmup_threads.emplace_back([&]() {
-            Container c;
-            for (const auto& k : keys) c.insert({k, V{}});
-        });
-    }
-    for (auto& w : warmup_threads) w.join();
+    std::atomic<bool> running{true};
+    std::atomic<uint64_t> ops{0};
+    std::vector<std::thread> pool;
+    Container c;
     
-    std::atomic<long long> ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
     for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&, t]() {
-            long long local = 0;
-            while (!stop) {
-                Container c;  // Fresh empty tree each iteration
-                for (const auto& k : keys) { 
-                    c.insert({k, (V)(t*10000 + local)}); 
-                    local++; 
-                }
+        pool.emplace_back([&, t]() {
+            uint64_t local = 0;
+            size_t i = t;
+            while (running.load(std::memory_order_relaxed)) {
+                c.insert({keys[i % keys.size()], V{}});
+                i += threads;
+                local++;
             }
-            ops += local;
+            ops.fetch_add(local, std::memory_order_relaxed);
         });
     }
+    
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return ops * 1000.0 / ms;
+    running.store(false);
+    for (auto& th : pool) th.join();
+    return ops.load() * 1000.0 / ms;
 }
 
 template<typename Container, typename Keys, typename V>
 double bench_erase(const Keys& keys, int threads, int ms) {
-    // Warmup
-    std::vector<std::thread> warmup_threads;
-    for (int t = 0; t < threads; t++) {
-        warmup_threads.emplace_back([&]() {
-            Container c;
-            for (size_t i = 0; i < keys.size(); i++) c.insert({keys[i], (V)i});
-            for (const auto& k : keys) c.erase(k);
-        });
-    }
-    for (auto& w : warmup_threads) w.join();
+    std::atomic<bool> running{true};
+    std::atomic<uint64_t> ops{0};
+    std::vector<std::thread> pool;
+    Container c;
     
-    std::atomic<long long> ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
+    // Pre-populate
+    for (size_t i = 0; i < keys.size(); i++) {
+        c.insert({keys[i], V{}});
+    }
+    
     for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&, t]() {
-            long long local = 0;
-            while (!stop) {
-                Container c;  // Fresh tree
-                for (size_t i = 0; i < keys.size(); i++) c.insert({keys[i], (V)i});  // Populate
-                for (const auto& k : keys) { 
-                    c.erase(k); 
-                    local++; 
-                }
+        pool.emplace_back([&, t]() {
+            uint64_t local = 0;
+            size_t i = t;
+            while (running.load(std::memory_order_relaxed)) {
+                c.erase(keys[i % keys.size()]);
+                c.insert({keys[i % keys.size()], V{}});  // Re-insert for next erase
+                i += threads;
+                local++;
             }
-            ops += local;
+            ops.fetch_add(local, std::memory_order_relaxed);
         });
     }
+    
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return ops * 1000.0 / ms;
+    running.store(false);
+    for (auto& th : pool) th.join();
+    return ops.load() * 1000.0 / ms;
 }
 
 template<typename Container, typename Keys, typename V>
-double bench_mixed_find(const Keys& keys, int find_threads, int write_threads, int ms) {
+double bench_mixed_find(const Keys& keys, int readers, int writers, int ms) {
+    std::atomic<bool> running{true};
+    std::atomic<uint64_t> read_ops{0};
+    std::vector<std::thread> pool;
     Container c;
-    for (size_t i = 0; i < keys.size(); i++) c.insert({keys[i], (V)i});
-    std::atomic<long long> find_ops{0};
-    stop = false;
-    std::vector<std::thread> workers;
-    for (int t = 0; t < find_threads; t++) {
-        workers.emplace_back([&]() {
-            long long local = 0;
-            while (!stop) { for (const auto& k : keys) { c.contains(k); local++; } }
-            find_ops += local;
+    
+    // Pre-populate
+    for (size_t i = 0; i < keys.size(); i++) {
+        c.insert({keys[i], V{}});
+    }
+    
+    // Reader threads
+    for (int t = 0; t < readers; t++) {
+        pool.emplace_back([&, t]() {
+            uint64_t local = 0;
+            size_t i = t;
+            while (running.load(std::memory_order_relaxed)) {
+                c.contains(keys[i % keys.size()]);
+                i += readers;
+                local++;
+            }
+            read_ops.fetch_add(local, std::memory_order_relaxed);
         });
     }
-    for (int t = 0; t < write_threads; t++) {
-        workers.emplace_back([&, t]() {
-            int i = 0;
-            while (!stop) {
-                for (size_t j = 0; j < keys.size(); j++) {
-                    if (j % 2 == 0) c.insert({keys[j], (V)(t*10000 + i++)});
-                    else c.erase(keys[j]);
-                }
+    
+    // Writer threads
+    for (int t = 0; t < writers; t++) {
+        pool.emplace_back([&, t]() {
+            size_t i = t;
+            while (running.load(std::memory_order_relaxed)) {
+                c.erase(keys[i % keys.size()]);
+                c.insert({keys[i % keys.size()], V{}});
+                i += writers;
             }
         });
     }
+    
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    stop = true;
-    for (auto& w : workers) w.join();
-    return find_ops * 1000.0 / ms;
+    running.store(false);
+    for (auto& th : pool) th.join();
+    return read_ops.load() * 1000.0 / ms;
 }
 
 void test_signed_ordering() {
     std::cout << "## Signed Integer Ordering Test\n\n";
-    gteitelbaum::tktrie<int64_t, std::string> t;
     
-    std::vector<int64_t> vals = {-1000000, -100, -1, 0, 1, 100, 1000000};
+    gteitelbaum::tktrie<int, std::string> t;
+    std::vector<int> vals = {-1000000, -100, -1, 0, 1, 100, 1000000};
+    
     for (auto v : vals) {
         t.insert({v, "val_" + std::to_string(v)});
     }
@@ -298,7 +307,6 @@ void test_signed_ordering() {
         std::cout << "  find(" << v << ") = " << (it.valid() ? it.value() : "NOT FOUND") << "\n";
     }
     
-    // Verify ordering by checking that all are found
     bool all_found = true;
     for (auto v : vals) {
         if (!t.contains(v)) all_found = false;
@@ -375,15 +383,13 @@ int main() {
     constexpr int MS = 500;
     
     std::cout << "# tktrie Benchmark Results\n\n";
-    std::cout << "- Variable-length keys (string): multi-segment compression\n";
-    std::cout << "- Fixed-length keys (integers): single-skip with variant leaves\n";
     std::cout << "- Duration: " << MS << "ms per test\n\n";
     
     test_signed_ordering();
     
     run_benchmark("String Keys (std::string)", STRING_KEYS, MS);
+    run_benchmark("Integer Keys (int)", INT_KEYS, MS);
     run_benchmark("Unsigned Integer Keys (uint64_t)", UINT64_KEYS, MS);
-    run_benchmark("Signed Integer Keys (int64_t)", INT64_KEYS, MS);
     
     return 0;
 }
