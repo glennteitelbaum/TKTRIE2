@@ -33,8 +33,12 @@ std::vector<uint64_t> generate_uint64_keys(size_t count) {
     std::vector<uint64_t> keys;
     keys.reserve(count);
     std::mt19937_64 rng(42);
+    std::uniform_int_distribution<uint64_t> dist(
+        std::numeric_limits<uint64_t>::min(),
+        std::numeric_limits<uint64_t>::max()
+    );
     for (size_t i = 0; i < count; i++) {
-        keys.push_back(rng());
+        keys.push_back(dist(rng));
     }
     return keys;
 }
@@ -42,9 +46,15 @@ std::vector<uint64_t> generate_uint64_keys(size_t count) {
 std::vector<int64_t> generate_int64_keys(size_t count) {
     std::vector<int64_t> keys;
     keys.reserve(count);
-    std::mt19937_64 rng(42);
+    std::mt19937_64 rng(42);  // Same seed = same bit patterns
+    std::uniform_int_distribution<uint64_t> dist(
+        std::numeric_limits<uint64_t>::min(),
+        std::numeric_limits<uint64_t>::max()
+    );
     for (size_t i = 0; i < count; i++) {
-        keys.push_back(static_cast<int64_t>(rng()));
+        // Reinterpret same bits as int64_t for identical distribution
+        uint64_t bits = dist(rng);
+        keys.push_back(static_cast<int64_t>(bits));
     }
     return keys;
 }
@@ -95,14 +105,30 @@ double bench_find(Container& c, const Keys& keys, int threads, int ms) {
 }
 
 template<typename Container, typename Keys, typename V>
-double bench_insert(Container& c, const Keys& keys, int threads, int ms) {
+double bench_insert(const Keys& keys, int threads, int ms) {
+    // Warmup: one full iteration per thread to prime allocator
+    std::vector<std::thread> warmup_threads;
+    for (int t = 0; t < threads; t++) {
+        warmup_threads.emplace_back([&]() {
+            Container c;
+            for (const auto& k : keys) c.insert({k, V{}});
+        });
+    }
+    for (auto& w : warmup_threads) w.join();
+    
     std::atomic<long long> ops{0};
     stop = false;
     std::vector<std::thread> workers;
     for (int t = 0; t < threads; t++) {
         workers.emplace_back([&, t]() {
-            long long local = 0; int i = 0;
-            while (!stop) { for (const auto& k : keys) { c.insert({k, (V)(t*10000 + i++)}); local++; } }
+            long long local = 0;
+            while (!stop) {
+                Container c;  // Fresh empty tree each iteration
+                for (const auto& k : keys) { 
+                    c.insert({k, (V)(t*10000 + local)}); 
+                    local++; 
+                }
+            }
             ops += local;
         });
     }
@@ -112,15 +138,33 @@ double bench_insert(Container& c, const Keys& keys, int threads, int ms) {
     return ops * 1000.0 / ms;
 }
 
-template<typename Container, typename Keys>
-double bench_erase(Container& c, const Keys& keys, int threads, int ms) {
+template<typename Container, typename Keys, typename V>
+double bench_erase(const Keys& keys, int threads, int ms) {
+    // Warmup
+    std::vector<std::thread> warmup_threads;
+    for (int t = 0; t < threads; t++) {
+        warmup_threads.emplace_back([&]() {
+            Container c;
+            for (size_t i = 0; i < keys.size(); i++) c.insert({keys[i], (V)i});
+            for (const auto& k : keys) c.erase(k);
+        });
+    }
+    for (auto& w : warmup_threads) w.join();
+    
     std::atomic<long long> ops{0};
     stop = false;
     std::vector<std::thread> workers;
     for (int t = 0; t < threads; t++) {
-        workers.emplace_back([&]() {
+        workers.emplace_back([&, t]() {
             long long local = 0;
-            while (!stop) { for (const auto& k : keys) { c.erase(k); local++; } }
+            while (!stop) {
+                Container c;  // Fresh tree
+                for (size_t i = 0; i < keys.size(); i++) c.insert({keys[i], (V)i});  // Populate
+                for (const auto& k : keys) { 
+                    c.erase(k); 
+                    local++; 
+                }
+            }
             ops += local;
         });
     }
@@ -208,7 +252,7 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
         double tr = bench_find(trie, keys, threads, ms);
         double m = bench_find(lm, keys, threads, ms);
         double u = bench_find(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+        printf("| %d | %.2fM | %.2fM | %.2fM | %.2fx | %.2fx |\n", 
                threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
@@ -217,13 +261,10 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
     std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        gteitelbaum::tktrie<K, int> trie;
-        locked_map<K, int> lm;
-        locked_umap<K, int> lu;
-        double tr = bench_insert<decltype(trie), Keys, int>(trie, keys, threads, ms);
-        double m = bench_insert<decltype(lm), Keys, int>(lm, keys, threads, ms);
-        double u = bench_insert<decltype(lu), Keys, int>(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+        double tr = bench_insert<gteitelbaum::tktrie<K, int>, Keys, int>(keys, threads, ms);
+        double m = bench_insert<locked_map<K, int>, Keys, int>(keys, threads, ms);
+        double u = bench_insert<locked_umap<K, int>, Keys, int>(keys, threads, ms);
+        printf("| %d | %.2fM | %.2fM | %.2fM | %.2fx | %.2fx |\n", 
                threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
@@ -232,18 +273,10 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
     std::cout << "|---------|--------|----------|-------------------|------------|-------------|\n";
     
     for (int threads : {1, 2, 4, 8}) {
-        gteitelbaum::tktrie<K, int> trie;
-        locked_map<K, int> lm;
-        locked_umap<K, int> lu;
-        for (size_t i = 0; i < keys.size(); i++) {
-            trie.insert({keys[i], (int)i});
-            lm.insert({keys[i], (int)i});
-            lu.insert({keys[i], (int)i});
-        }
-        double tr = bench_erase(trie, keys, threads, ms);
-        double m = bench_erase(lm, keys, threads, ms);
-        double u = bench_erase(lu, keys, threads, ms);
-        printf("| %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+        double tr = bench_erase<gteitelbaum::tktrie<K, int>, Keys, int>(keys, threads, ms);
+        double m = bench_erase<locked_map<K, int>, Keys, int>(keys, threads, ms);
+        double u = bench_erase<locked_umap<K, int>, Keys, int>(keys, threads, ms);
+        printf("| %d | %.2fM | %.2fM | %.2fM | %.2fx | %.2fx |\n", 
                threads, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     
@@ -255,7 +288,7 @@ void run_benchmark(const std::string& name, const Keys& keys, int ms) {
         double tr = bench_mixed_find<gteitelbaum::tktrie<K, int>, Keys, int>(keys, f, w, ms);
         double m = bench_mixed_find<locked_map<K, int>, Keys, int>(keys, f, w, ms);
         double u = bench_mixed_find<locked_umap<K, int>, Keys, int>(keys, f, w, ms);
-        printf("| %d | %d | %.1fM | %.1fM | %.1fM | %.1fx | %.1fx |\n", 
+        printf("| %d | %d | %.2fM | %.2fM | %.2fM | %.2fx | %.2fx |\n", 
                f, w, tr/1e6, m/1e6, u/1e6, tr/m, tr/u);
     }
     std::cout << "\n";
