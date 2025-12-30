@@ -110,25 +110,17 @@ public:
     bool valid() const { return valid_; }
 };
 
-template <typename T> struct SegmentVL {
-    std::string skip; T data{}; bool has_data{false}; bool use_pop{false};
-    SegmentVL() = default;
-    SegmentVL(std::string s, T d, bool hd, bool up) : skip(std::move(s)), data(std::move(d)), has_data(hd), use_pop(up) {}
-};
-
-template <typename T> struct NodeVL {
-    PopCount pop{}; std::vector<NodeVL*> children{}; std::vector<SegmentVL<T>> segments{};
-    NodeVL() = default;
-    NodeVL(const NodeVL& o) : pop(o.pop), children(o.children), segments(o.segments) {}
-    NodeVL* get_child(unsigned char c) const { int idx; return pop.find(c, &idx) ? children[idx] : nullptr; }
-    bool get_child_idx(unsigned char c, int* idx) const { return pop.find(c, idx); }
-};
-
-template <typename T> struct NodeFL {
-    PopCount pop{}; std::vector<NodeFL*> children{}; std::string skip{}; T data{}; bool has_data{false};
-    NodeFL() = default;
-    NodeFL(const NodeFL& o) : pop(o.pop), children(o.children), skip(o.skip), data(o.data), has_data(o.has_data) {}
-    NodeFL* get_child(unsigned char c) const { int idx; return pop.find(c, &idx) ? children[idx] : nullptr; }
+// Trie node - used for both fixed and variable length keys
+template <typename T> struct Node {
+    PopCount pop{};
+    std::vector<Node*> children{};
+    std::string skip{};
+    T data{};
+    bool has_data{false};
+    
+    Node() = default;
+    Node(const Node& o) : pop(o.pop), children(o.children), skip(o.skip), data(o.data), has_data(o.has_data) {}
+    Node* get_child(unsigned char c) const { int idx; return pop.find(c, &idx) ? children[idx] : nullptr; }
     bool get_child_idx(unsigned char c, int* idx) const { return pop.find(c, idx); }
 };
 
@@ -138,7 +130,7 @@ public:
     using Traits = tktrie_traits<Key>;
     static constexpr size_t fixed_len = Traits::fixed_len;
     static constexpr bool is_fixed = (fixed_len > 0);
-    using node_type = std::conditional_t<is_fixed, NodeFL<T>, NodeVL<T>>;
+    using node_type = std::conditional_t<is_fixed, Node<T>, Node<T>>;
     using size_type = std::size_t;
     using iterator = tktrie_iterator<Key, T>;
 
@@ -166,12 +158,12 @@ private:
 
     // Fixed-length path commit using array
     template<size_t N>
-    void commit_fixed_path(std::array<NodeFL<T>*, N>& nodes, std::array<int, N>& indices, 
-                           int depth, int change_depth, NodeFL<T>* new_node, NodeFL<T>* old_node) {
+    void commit_fixed_path(std::array<Node<T>*, N>& nodes, std::array<int, N>& indices, 
+                           int depth, int change_depth, Node<T>* new_node, Node<T>* old_node) {
         retired_.retire(old_node);
-        NodeFL<T>* child = new_node;
+        Node<T>* child = new_node;
         for (int i = change_depth - 1; i >= 0; i--) {
-            NodeFL<T>* new_parent = new NodeFL<T>(*nodes[i]);
+            Node<T>* new_parent = new Node<T>(*nodes[i]);
             new_parent->children[indices[i]] = child;
             retired_.retire(nodes[i]);
             child = new_parent;
@@ -217,32 +209,30 @@ private:
     // ==================== VARIABLE-LENGTH ====================
     bool contains_variable(const Key& key) const {
         std::string_view kv = Traits::to_bytes(key);
-        NodeVL<T>* cur = get_root();
+        Node<T>* cur = get_root();
         while (cur) {
-            bool br = false;
-            for (const auto& seg : cur->segments) {
-                if (kv.size() < seg.skip.size() || kv.substr(0, seg.skip.size()) != seg.skip) return false;
-                kv.remove_prefix(seg.skip.size());
-                if (kv.empty()) return seg.has_data;
-                if (seg.use_pop) { cur = cur->get_child((unsigned char)kv[0]); kv.remove_prefix(1); br = true; break; }
+            if (!cur->skip.empty()) {
+                if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return false;
+                kv.remove_prefix(cur->skip.size());
             }
-            if (!br) { if (kv.empty()) return false; cur = cur->get_child((unsigned char)kv[0]); kv.remove_prefix(1); }
+            if (kv.empty()) return cur->has_data;
+            cur = cur->get_child((unsigned char)kv[0]);
+            kv.remove_prefix(1);
         }
         return false;
     }
 
     iterator find_variable(const Key& key) const {
         std::string_view kv = Traits::to_bytes(key);
-        NodeVL<T>* cur = get_root();
+        Node<T>* cur = get_root();
         while (cur) {
-            bool br = false;
-            for (const auto& seg : cur->segments) {
-                if (kv.size() < seg.skip.size() || kv.substr(0, seg.skip.size()) != seg.skip) return end();
-                kv.remove_prefix(seg.skip.size());
-                if (kv.empty()) return seg.has_data ? iterator(key, seg.data) : end();
-                if (seg.use_pop) { cur = cur->get_child((unsigned char)kv[0]); kv.remove_prefix(1); br = true; break; }
+            if (!cur->skip.empty()) {
+                if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return end();
+                kv.remove_prefix(cur->skip.size());
             }
-            if (!br) { if (kv.empty()) return end(); cur = cur->get_child((unsigned char)kv[0]); kv.remove_prefix(1); }
+            if (kv.empty()) return cur->has_data ? iterator(key, cur->data) : end();
+            cur = cur->get_child((unsigned char)kv[0]);
+            kv.remove_prefix(1);
         }
         return end();
     }
@@ -250,113 +240,112 @@ private:
     bool insert_variable(const Key& key, const T& value) {
         std::string_view kv = Traits::to_bytes(key);
         std::vector<PathEntry> path;
-        NodeVL<T>* cur = get_root();
+        Node<T>* cur = get_root();
+        
         while (true) {
-            for (size_t si = 0; si < cur->segments.size(); si++) {
-                const auto& seg = cur->segments[si];
-                size_t common = 0;
-                while (common < seg.skip.size() && common < kv.size() && seg.skip[common] == kv[common]) ++common;
-                if (common < seg.skip.size()) {
-                    NodeVL<T>* n = new NodeVL<T>();
-                    for (size_t i = 0; i < si; i++) n->segments.push_back(cur->segments[i]);
-                    if (common == kv.size()) {
-                        n->segments.push_back(SegmentVL<T>(seg.skip.substr(0, common), value, true, true));
-                        NodeVL<T>* suf = new NodeVL<T>();
-                        suf->segments.push_back(SegmentVL<T>(seg.skip.substr(common + 1), seg.data, seg.has_data, seg.use_pop));
-                        for (size_t i = si + 1; i < cur->segments.size(); i++) suf->segments.push_back(cur->segments[i]);
-                        suf->pop = cur->pop; suf->children = cur->children;
-                        n->pop.set((unsigned char)seg.skip[common]); n->children.push_back(suf);
+            size_t common = 0;
+            while (common < cur->skip.size() && common < kv.size() && 
+                   cur->skip[common] == kv[common]) ++common;
+            
+            if (common < cur->skip.size()) {
+                // Split needed
+                Node<T>* n = new Node<T>();
+                n->skip = cur->skip.substr(0, common);
+                
+                Node<T>* old_suffix = new Node<T>(*cur);
+                old_suffix->skip = cur->skip.substr(common + 1);
+                
+                if (common == kv.size()) {
+                    // Key ends at split point
+                    n->has_data = true;
+                    n->data = value;
+                    int idx = n->pop.set((unsigned char)cur->skip[common]);
+                    n->children.insert(n->children.begin() + idx, old_suffix);
+                } else {
+                    // Key continues past split
+                    Node<T>* new_child = new Node<T>();
+                    new_child->skip = std::string(kv.substr(common + 1));
+                    new_child->has_data = true;
+                    new_child->data = value;
+                    
+                    unsigned char oc = (unsigned char)cur->skip[common];
+                    unsigned char nc = (unsigned char)kv[common];
+                    if (oc < nc) {
+                        n->pop.set(oc); n->pop.set(nc);
+                        n->children.push_back(old_suffix);
+                        n->children.push_back(new_child);
                     } else {
-                        n->segments.push_back(SegmentVL<T>(seg.skip.substr(0, common), T{}, false, true));
-                        NodeVL<T>* os = new NodeVL<T>();
-                        os->segments.push_back(SegmentVL<T>(seg.skip.substr(common + 1), seg.data, seg.has_data, seg.use_pop));
-                        for (size_t i = si + 1; i < cur->segments.size(); i++) os->segments.push_back(cur->segments[i]);
-                        os->pop = cur->pop; os->children = cur->children;
-                        NodeVL<T>* nc = new NodeVL<T>();
-                        nc->segments.push_back(SegmentVL<T>(std::string(kv.substr(common + 1)), value, true, false));
-                        unsigned char oe = (unsigned char)seg.skip[common], ne = (unsigned char)kv[common];
-                        if (oe < ne) { n->pop.set(oe); n->pop.set(ne); n->children.push_back(os); n->children.push_back(nc); }
-                        else { n->pop.set(ne); n->pop.set(oe); n->children.push_back(nc); n->children.push_back(os); }
+                        n->pop.set(nc); n->pop.set(oc);
+                        n->children.push_back(new_child);
+                        n->children.push_back(old_suffix);
                     }
-                    commit_path(path, n, cur);
-                    elem_count_.fetch_add(1, std::memory_order_relaxed);
-                    return true;
                 }
-                kv.remove_prefix(common);
-                if (kv.empty()) {
-                    if (seg.has_data) return false;
-                    NodeVL<T>* n = new NodeVL<T>(*cur);
-                    n->segments[si].has_data = true; n->segments[si].data = value;
-                    commit_path(path, n, cur);
-                    elem_count_.fetch_add(1, std::memory_order_relaxed);
-                    return true;
-                }
-                if (seg.use_pop) {
-                    unsigned char c = (unsigned char)kv[0]; int idx;
-                    if (cur->get_child_idx(c, &idx)) { path.push_back({cur, idx}); cur = cur->children[idx]; kv.remove_prefix(1); goto next_vl; }
-                    NodeVL<T>* n = new NodeVL<T>(*cur);
-                    NodeVL<T>* ch = new NodeVL<T>();
-                    ch->segments.push_back(SegmentVL<T>(std::string(kv.substr(1)), value, true, false));
-                    int ni = n->pop.set(c); n->children.insert(n->children.begin() + ni, ch);
-                    commit_path(path, n, cur);
-                    elem_count_.fetch_add(1, std::memory_order_relaxed);
-                    return true;
-                }
-            }
-            if (kv.empty()) return false;
-            if (cur->pop.count() == 0) {
-                NodeVL<T>* n = new NodeVL<T>(*cur);
-                n->segments.push_back(SegmentVL<T>(std::string(kv), value, true, false));
                 commit_path(path, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            { unsigned char c = (unsigned char)kv[0]; int idx;
-              if (cur->get_child_idx(c, &idx)) { path.push_back({cur, idx}); cur = cur->children[idx]; kv.remove_prefix(1); }
-              else {
-                  NodeVL<T>* n = new NodeVL<T>(*cur);
-                  NodeVL<T>* ch = new NodeVL<T>();
-                  ch->segments.push_back(SegmentVL<T>(std::string(kv.substr(1)), value, true, false));
-                  int ni = n->pop.set(c); n->children.insert(n->children.begin() + ni, ch);
-                  commit_path(path, n, cur);
-                  elem_count_.fetch_add(1, std::memory_order_relaxed);
-                  return true;
-              }
+            
+            kv.remove_prefix(common);
+            
+            if (kv.empty()) {
+                if (cur->has_data) return false;
+                Node<T>* n = new Node<T>(*cur);
+                n->has_data = true;
+                n->data = value;
+                commit_path(path, n, cur);
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                return true;
             }
-            next_vl:;
+            
+            unsigned char c = (unsigned char)kv[0];
+            int idx;
+            if (cur->get_child_idx(c, &idx)) {
+                path.push_back({cur, idx});
+                cur = cur->children[idx];
+                kv.remove_prefix(1);
+                continue;
+            }
+            
+            Node<T>* n = new Node<T>(*cur);
+            Node<T>* child = new Node<T>();
+            child->skip = std::string(kv.substr(1));
+            child->has_data = true;
+            child->data = value;
+            int ni = n->pop.set(c);
+            n->children.insert(n->children.begin() + ni, child);
+            commit_path(path, n, cur);
+            elem_count_.fetch_add(1, std::memory_order_relaxed);
+            return true;
         }
     }
 
     bool erase_variable(const Key& key) {
         std::string_view kv = Traits::to_bytes(key);
         std::vector<PathEntry> path;
-        NodeVL<T>* cur = get_root();
+        Node<T>* cur = get_root();
+        
         while (cur) {
-            bool br = false;
-            for (size_t si = 0; si < cur->segments.size(); si++) {
-                const auto& seg = cur->segments[si];
-                if (kv.size() < seg.skip.size() || kv.substr(0, seg.skip.size()) != seg.skip) return false;
-                kv.remove_prefix(seg.skip.size());
-                if (kv.empty()) {
-                    if (!seg.has_data) return false;
-                    NodeVL<T>* n = new NodeVL<T>(*cur);
-                    n->segments[si].has_data = false; n->segments[si].data = T{};
-                    commit_path(path, n, cur);
-                    elem_count_.fetch_sub(1, std::memory_order_relaxed);
-                    return true;
-                }
-                if (seg.use_pop) {
-                    unsigned char c = (unsigned char)kv[0]; int idx;
-                    if (!cur->get_child_idx(c, &idx)) return false;
-                    path.push_back({cur, idx}); cur = cur->children[idx]; kv.remove_prefix(1); br = true; break;
-                }
+            if (!cur->skip.empty()) {
+                if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return false;
+                kv.remove_prefix(cur->skip.size());
             }
-            if (!br) {
-                if (kv.empty()) return false;
-                unsigned char c = (unsigned char)kv[0]; int idx;
-                if (!cur->get_child_idx(c, &idx)) return false;
-                path.push_back({cur, idx}); cur = cur->children[idx]; kv.remove_prefix(1);
+            
+            if (kv.empty()) {
+                if (!cur->has_data) return false;
+                Node<T>* n = new Node<T>(*cur);
+                n->has_data = false;
+                n->data = T{};
+                commit_path(path, n, cur);
+                elem_count_.fetch_sub(1, std::memory_order_relaxed);
+                return true;
             }
+            
+            unsigned char c = (unsigned char)kv[0];
+            int idx;
+            if (!cur->get_child_idx(c, &idx)) return false;
+            path.push_back({cur, idx});
+            cur = cur->children[idx];
+            kv.remove_prefix(1);
         }
         return false;
     }
@@ -367,7 +356,7 @@ private:
     bool contains_fixed(const Key& key) const {
         std::string kv = Traits::to_bytes(key);
         std::string_view kvv(kv);
-        NodeFL<T>* cur = get_root();
+        Node<T>* cur = get_root();
         while (cur) {
             if (!cur->skip.empty()) {
                 if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return false;
@@ -384,7 +373,7 @@ private:
     iterator find_fixed(const Key& key) const {
         std::string kv = Traits::to_bytes(key);
         std::string_view kvv(kv);
-        NodeFL<T>* cur = get_root();
+        Node<T>* cur = get_root();
         while (cur) {
             if (!cur->skip.empty()) {
                 if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return end();
@@ -400,39 +389,31 @@ private:
 
     bool insert_fixed(const Key& key, const T& value) {
         std::string kv = Traits::to_bytes(key);
-        std::string_view kvv(kv);
         
-        // Phase 1: Collect path
-        std::array<NodeFL<T>*, MAX_DEPTH> nodes{};
+        std::array<Node<T>*, MAX_DEPTH> nodes{};
         std::array<int, MAX_DEPTH> indices{};
-        std::array<size_t, MAX_DEPTH> key_pos{};  // Position in key when entering each node
         int depth = 0;
         size_t pos = 0;
         
-        NodeFL<T>* cur = get_root();
+        Node<T>* cur = get_root();
         nodes[depth] = cur;
-        key_pos[depth] = pos;
         
         while (true) {
-            // Match skip
             size_t common = 0;
             while (common < cur->skip.size() && pos + common < kv.size() && 
                    cur->skip[common] == kv[pos + common]) ++common;
             
             if (common < cur->skip.size()) {
-                // Split needed at this node
-                kvv = std::string_view(kv).substr(pos);
-                
-                NodeFL<T>* n = new NodeFL<T>();
+                Node<T>* n = new Node<T>();
                 n->skip = cur->skip.substr(0, common);
-                NodeFL<T>* os = new NodeFL<T>(*cur);
+                Node<T>* os = new Node<T>(*cur);
                 os->skip = cur->skip.substr(common + 1);
-                NodeFL<T>* nc = new NodeFL<T>();
-                nc->skip = std::string(kvv.substr(common + 1));
+                Node<T>* nc = new Node<T>();
+                nc->skip = kv.substr(pos + common + 1);
                 nc->has_data = true; nc->data = value;
                 
                 unsigned char oe = (unsigned char)cur->skip[common];
-                unsigned char ne = (unsigned char)kvv[common];
+                unsigned char ne = (unsigned char)kv[pos + common];
                 if (oe < ne) { 
                     n->pop.set(oe); n->pop.set(ne); 
                     n->children.push_back(os); n->children.push_back(nc); 
@@ -448,21 +429,18 @@ private:
             
             pos += common;
             if (pos == kv.size()) {
-                // Key exhausted - set data on this node
                 if (cur->has_data) return false;
-                NodeFL<T>* n = new NodeFL<T>(*cur);
+                Node<T>* n = new Node<T>(*cur);
                 n->has_data = true; n->data = value;
                 commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             
-            // Follow child
             unsigned char c = (unsigned char)kv[pos]; int idx;
             if (!cur->pop.find(c, &idx)) {
-                // Add new child
-                NodeFL<T>* n = new NodeFL<T>(*cur);
-                NodeFL<T>* ch = new NodeFL<T>();
+                Node<T>* n = new Node<T>(*cur);
+                Node<T>* ch = new Node<T>();
                 ch->skip = kv.substr(pos + 1);
                 ch->has_data = true; ch->data = value;
                 int ni = n->pop.set(c);
@@ -477,24 +455,21 @@ private:
             pos++;
             cur = cur->children[idx];
             nodes[depth] = cur;
-            key_pos[depth] = pos;
         }
     }
 
     bool erase_fixed(const Key& key) {
         std::string kv = Traits::to_bytes(key);
         
-        // Phase 1: Collect path
-        std::array<NodeFL<T>*, MAX_DEPTH> nodes{};
+        std::array<Node<T>*, MAX_DEPTH> nodes{};
         std::array<int, MAX_DEPTH> indices{};
         int depth = 0;
         size_t pos = 0;
         
-        NodeFL<T>* cur = get_root();
+        Node<T>* cur = get_root();
         nodes[depth] = cur;
         
         while (cur) {
-            // Match skip
             if (!cur->skip.empty()) {
                 if (kv.size() - pos < cur->skip.size()) return false;
                 for (size_t i = 0; i < cur->skip.size(); i++) {
@@ -504,9 +479,8 @@ private:
             }
             
             if (pos == kv.size()) {
-                // Found - erase
                 if (!cur->has_data) return false;
-                NodeFL<T>* n = new NodeFL<T>(*cur);
+                Node<T>* n = new Node<T>(*cur);
                 n->has_data = false; n->data = T{};
                 commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_sub(1, std::memory_order_relaxed);
