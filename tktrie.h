@@ -115,11 +115,20 @@ template <typename T> struct Node {
     PopCount pop{};
     std::vector<Node*> children{};
     std::string skip{};
-    T data{};
-    bool has_data{false};
+    T* data{nullptr};  // nullptr = no data, otherwise points to allocated T
     
     Node() = default;
-    Node(const Node& o) : pop(o.pop), children(o.children), skip(o.skip), data(o.data), has_data(o.has_data) {}
+    Node(const Node& o) : pop(o.pop), children(o.children), skip(o.skip), 
+                          data(o.data ? new T(*o.data) : nullptr) {}
+    ~Node() { delete data; }
+    
+    bool has_data() const { return data != nullptr; }
+    void set_data(const T& val) { 
+        if (data) *data = val;
+        else data = new T(val);
+    }
+    void clear_data() { delete data; data = nullptr; }
+    
     Node* get_child(unsigned char c) const { int idx; return pop.find(c, &idx) ? children[idx] : nullptr; }
     bool get_child_idx(unsigned char c, int* idx) const { return pop.find(c, idx); }
 };
@@ -215,7 +224,7 @@ private:
                 if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return false;
                 kv.remove_prefix(cur->skip.size());
             }
-            if (kv.empty()) return cur->has_data;
+            if (kv.empty()) return cur->has_data();
             cur = cur->get_child((unsigned char)kv[0]);
             kv.remove_prefix(1);
         }
@@ -230,7 +239,7 @@ private:
                 if (kv.size() < cur->skip.size() || kv.substr(0, cur->skip.size()) != cur->skip) return end();
                 kv.remove_prefix(cur->skip.size());
             }
-            if (kv.empty()) return cur->has_data ? iterator(key, cur->data) : end();
+            if (kv.empty()) return cur->has_data() ? iterator(key, *cur->data) : end();
             cur = cur->get_child((unsigned char)kv[0]);
             kv.remove_prefix(1);
         }
@@ -257,16 +266,14 @@ private:
                 
                 if (common == kv.size()) {
                     // Key ends at split point
-                    n->has_data = true;
-                    n->data = value;
+                    n->set_data(value);
                     int idx = n->pop.set((unsigned char)cur->skip[common]);
                     n->children.insert(n->children.begin() + idx, old_suffix);
                 } else {
                     // Key continues past split
                     Node<T>* new_child = new Node<T>();
                     new_child->skip = std::string(kv.substr(common + 1));
-                    new_child->has_data = true;
-                    new_child->data = value;
+                    new_child->set_data(value);
                     
                     unsigned char oc = (unsigned char)cur->skip[common];
                     unsigned char nc = (unsigned char)kv[common];
@@ -288,10 +295,9 @@ private:
             kv.remove_prefix(common);
             
             if (kv.empty()) {
-                if (cur->has_data) return false;
+                if (cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
-                n->has_data = true;
-                n->data = value;
+                n->set_data(value);
                 commit_path(path, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
@@ -309,8 +315,7 @@ private:
             Node<T>* n = new Node<T>(*cur);
             Node<T>* child = new Node<T>();
             child->skip = std::string(kv.substr(1));
-            child->has_data = true;
-            child->data = value;
+            child->set_data(value);
             int ni = n->pop.set(c);
             n->children.insert(n->children.begin() + ni, child);
             commit_path(path, n, cur);
@@ -331,10 +336,9 @@ private:
             }
             
             if (kv.empty()) {
-                if (!cur->has_data) return false;
+                if (!cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
-                n->has_data = false;
-                n->data = T{};
+                n->clear_data();
                 commit_path(path, n, cur);
                 elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 return true;
@@ -362,7 +366,7 @@ private:
                 if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return false;
                 kvv.remove_prefix(cur->skip.size());
             }
-            if (kvv.empty()) return cur->has_data;
+            if (kvv.empty()) return cur->has_data();
             unsigned char c = (unsigned char)kvv[0]; int idx;
             if (!cur->pop.find(c, &idx)) return false;
             cur = cur->children[idx]; kvv.remove_prefix(1);
@@ -379,7 +383,7 @@ private:
                 if (kvv.size() < cur->skip.size() || kvv.substr(0, cur->skip.size()) != cur->skip) return end();
                 kvv.remove_prefix(cur->skip.size());
             }
-            if (kvv.empty()) return cur->has_data ? iterator(key, cur->data) : end();
+            if (kvv.empty()) return cur->has_data() ? iterator(key, *cur->data) : end();
             unsigned char c = (unsigned char)kvv[0]; int idx;
             if (!cur->pop.find(c, &idx)) return end();
             cur = cur->children[idx]; kvv.remove_prefix(1);
@@ -410,7 +414,7 @@ private:
                 os->skip = cur->skip.substr(common + 1);
                 Node<T>* nc = new Node<T>();
                 nc->skip = kv.substr(pos + common + 1);
-                nc->has_data = true; nc->data = value;
+                nc->set_data(value);
                 
                 unsigned char oe = (unsigned char)cur->skip[common];
                 unsigned char ne = (unsigned char)kv[pos + common];
@@ -429,9 +433,9 @@ private:
             
             pos += common;
             if (pos == kv.size()) {
-                if (cur->has_data) return false;
+                if (cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
-                n->has_data = true; n->data = value;
+                n->set_data(value);
                 commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
@@ -442,7 +446,7 @@ private:
                 Node<T>* n = new Node<T>(*cur);
                 Node<T>* ch = new Node<T>();
                 ch->skip = kv.substr(pos + 1);
-                ch->has_data = true; ch->data = value;
+                ch->set_data(value);
                 int ni = n->pop.set(c);
                 n->children.insert(n->children.begin() + ni, ch);
                 commit_fixed_path(nodes, indices, depth, depth, n, cur);
@@ -479,9 +483,9 @@ private:
             }
             
             if (pos == kv.size()) {
-                if (!cur->has_data) return false;
+                if (!cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
-                n->has_data = false; n->data = T{};
+                n->clear_data();
                 commit_fixed_path(nodes, indices, depth, depth, n, cur);
                 elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 return true;
