@@ -153,37 +153,44 @@ private:
     node_type* get_root() const { return __atomic_load_n(&root_, __ATOMIC_ACQUIRE); }
     void set_root(node_type* n) { __atomic_store_n(&root_, n, __ATOMIC_RELEASE); }
 
-    void commit_path(std::vector<PathEntry>& path, node_type* new_node, node_type* old_node) {
-        retired_.retire(old_node);
+    // Returns the new root and populates to_retire with old nodes
+    node_type* build_new_path(std::vector<PathEntry>& path, node_type* new_node, 
+                               node_type* old_node, std::vector<node_type*>& to_retire) {
+        to_retire.push_back(old_node);
         node_type* child = new_node;
         for (int i = (int)path.size() - 1; i >= 0; i--) {
             node_type* new_parent = new node_type(*path[i].node);
             new_parent->children[path[i].child_idx] = child;
-            retired_.retire(path[i].node);
+            to_retire.push_back(path[i].node);
             child = new_parent;
         }
-        set_root(child);
+        return child;
     }
 
-    // Fixed-length path commit using array
+    // Fixed-length version
     template<size_t N>
-    void commit_fixed_path(std::array<Node<T>*, N>& nodes, std::array<int, N>& indices, 
-                           int depth, int change_depth, Node<T>* new_node, Node<T>* old_node) {
-        retired_.retire(old_node);
+    Node<T>* build_new_path_fixed(std::array<Node<T>*, N>& nodes, std::array<int, N>& indices, 
+                                   int change_depth, Node<T>* new_node, Node<T>* old_node,
+                                   std::vector<Node<T>*>& to_retire) {
+        to_retire.push_back(old_node);
         Node<T>* child = new_node;
         for (int i = change_depth - 1; i >= 0; i--) {
             Node<T>* new_parent = new Node<T>(*nodes[i]);
             new_parent->children[indices[i]] = child;
-            retired_.retire(nodes[i]);
+            to_retire.push_back(nodes[i]);
             child = new_parent;
         }
-        set_root(child);
+        return child;
+    }
+
+    void retire_nodes(std::vector<node_type*>& nodes) {
+        for (auto* n : nodes) retired_.retire(n);
     }
 
     void delete_tree(node_type* n) {
         if (!n) return;
         for (auto* c : n->children) delete_tree(c);
-        delete n;  // Destructor deletes data
+        delete n;
     }
 
 public:
@@ -201,17 +208,29 @@ public:
         else return find_variable(key);
     }
     iterator end() const { return iterator::end_iterator(); }
+    
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& value) {
-        std::lock_guard<std::mutex> lock(write_mutex_);
-        bool ins; 
-        if constexpr (is_fixed) ins = insert_fixed(value.first, value.second);
-        else ins = insert_variable(value.first, value.second);
+        std::vector<node_type*> to_retire; to_retire.reserve(16);
+        bool ins;
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            if constexpr (is_fixed) ins = insert_fixed(value.first, value.second, to_retire);
+            else ins = insert_variable(value.first, value.second, to_retire);
+        }
+        retire_nodes(to_retire);
         return {iterator(value.first, value.second), ins};
     }
+    
     bool erase(const Key& key) {
-        std::lock_guard<std::mutex> lock(write_mutex_);
-        if constexpr (is_fixed) return erase_fixed(key);
-        else return erase_variable(key);
+        std::vector<node_type*> to_retire; to_retire.reserve(16);
+        bool erased;
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            if constexpr (is_fixed) erased = erase_fixed(key, to_retire);
+            else erased = erase_variable(key, to_retire);
+        }
+        retire_nodes(to_retire);
+        return erased;
     }
 
 private:
@@ -246,9 +265,9 @@ private:
         return end();
     }
 
-    bool insert_variable(const Key& key, const T& value) {
+    bool insert_variable(const Key& key, const T& value, std::vector<node_type*>& to_retire) {
         std::string_view kv = Traits::to_bytes(key);
-        std::vector<PathEntry> path;
+        std::vector<PathEntry> path; path.reserve(16);
         Node<T>* cur = get_root();
         
         while (true) {
@@ -287,7 +306,7 @@ private:
                         n->children.push_back(old_suffix);
                     }
                 }
-                commit_path(path, n, cur);
+                set_root(build_new_path(path, n, cur, to_retire));
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -298,7 +317,7 @@ private:
                 if (cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
                 n->set_data(value);
-                commit_path(path, n, cur);
+                set_root(build_new_path(path, n, cur, to_retire));
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -318,15 +337,15 @@ private:
             child->set_data(value);
             int ni = n->pop.set(c);
             n->children.insert(n->children.begin() + ni, child);
-            commit_path(path, n, cur);
+            set_root(build_new_path(path, n, cur, to_retire));
             elem_count_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
 
-    bool erase_variable(const Key& key) {
+    bool erase_variable(const Key& key, std::vector<node_type*>& to_retire) {
         std::string_view kv = Traits::to_bytes(key);
-        std::vector<PathEntry> path;
+        std::vector<PathEntry> path; path.reserve(16);
         Node<T>* cur = get_root();
         
         while (cur) {
@@ -339,7 +358,7 @@ private:
                 if (!cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
                 n->clear_data();
-                commit_path(path, n, cur);
+                set_root(build_new_path(path, n, cur, to_retire));
                 elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 return true;
             }
@@ -391,7 +410,7 @@ private:
         return end();
     }
 
-    bool insert_fixed(const Key& key, const T& value) {
+    bool insert_fixed(const Key& key, const T& value, std::vector<node_type*>& to_retire) {
         std::string kv = Traits::to_bytes(key);
         
         std::array<Node<T>*, MAX_DEPTH> nodes{};
@@ -426,7 +445,7 @@ private:
                     n->children.push_back(nc); n->children.push_back(os); 
                 }
                 
-                commit_fixed_path(nodes, indices, depth, depth, n, cur);
+                set_root(build_new_path_fixed(nodes, indices, depth, n, cur, to_retire));
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -436,7 +455,7 @@ private:
                 if (cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
                 n->set_data(value);
-                commit_fixed_path(nodes, indices, depth, depth, n, cur);
+                set_root(build_new_path_fixed(nodes, indices, depth, n, cur, to_retire));
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -449,7 +468,7 @@ private:
                 ch->set_data(value);
                 int ni = n->pop.set(c);
                 n->children.insert(n->children.begin() + ni, ch);
-                commit_fixed_path(nodes, indices, depth, depth, n, cur);
+                set_root(build_new_path_fixed(nodes, indices, depth, n, cur, to_retire));
                 elem_count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -462,7 +481,7 @@ private:
         }
     }
 
-    bool erase_fixed(const Key& key) {
+    bool erase_fixed(const Key& key, std::vector<node_type*>& to_retire) {
         std::string kv = Traits::to_bytes(key);
         
         std::array<Node<T>*, MAX_DEPTH> nodes{};
@@ -486,7 +505,7 @@ private:
                 if (!cur->has_data()) return false;
                 Node<T>* n = new Node<T>(*cur);
                 n->clear_data();
-                commit_fixed_path(nodes, indices, depth, depth, n, cur);
+                set_root(build_new_path_fixed(nodes, indices, depth, n, cur, to_retire));
                 elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 return true;
             }
