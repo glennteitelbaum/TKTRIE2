@@ -2,7 +2,7 @@
 
 ## Overview
 
-A thread-safe trie implementation where nodes are represented as contiguous arrays of `uint64_t`. This design prioritizes cache locality, SWAR (SIMD Within A Register) operations, and clean separation between threaded and non-threaded variants.
+A thread-safe trie implementation where nodes are represented as contiguous arrays of `uint64_t` (or `std::atomic<uint64_t>` when threaded). This design prioritizes cache locality, SWAR (SIMD Within A Register) operations, and clean separation between threaded and non-threaded variants.
 
 ### Template Parameters
 
@@ -20,9 +20,23 @@ class tktrie;
 
 ---
 
+## Node Array Storage
+
+```cpp
+// Non-threaded: plain arrays
+uint64_t* node;
+
+// Threaded: atomic arrays
+std::atomic<uint64_t>* node;
+```
+
+All slot accesses in threaded mode use appropriate memory ordering.
+
+---
+
 ## Node Array Layout
 
-Each node is a contiguous array of `uint64_t` values. The layout is determined by flags in the header.
+Each node is a contiguous array. The layout is determined by flags in the header.
 
 ### Header (Always First Element)
 
@@ -39,7 +53,7 @@ Each node is a contiguous array of `uint64_t` values. The layout is determined b
 - Bits 58-27: Version (32 bits) - used for optimistic concurrency when THREADED=true
 - Bits 26-0: Size (27 bits) - number of uint64_t elements in this node array
 
-**Size Capacity:** 27 bits allows up to 134,217,727 elements per node (far exceeding practical needs).
+**Size Capacity:** 27 bits allows up to 134,217,727 elements per node.
 
 ### Flags
 
@@ -69,8 +83,58 @@ static constexpr int VERSION_SHIFT      = 27;
 1. `LIST` and `POP` are mutually exclusive (never both set)
 2. `SKIP_EOS` requires `SKIP` to be set
 3. `SKIP` with length 0 is invalid (clear the flag instead)
-4. `LIST` with count 1 is invalid if `SKIP` is also set (extend the skip instead)
+4. `LIST` with count 1 is invalid UNLESS `SKIP` is also set in the node
 5. `nullptr` values are not allowed
+6. **fixed_len > 0 specific:**
+   - `EOS` and `SKIP_EOS` can ONLY occur at leaf depth (depth == fixed_len)
+   - At leaf depth, `EOS` and `SKIP_EOS` are mutually exclusive
+   - Internal nodes (depth < fixed_len) never have `EOS` or `SKIP_EOS` set
+
+---
+
+## fixed_len > 0 Optimization
+
+When `Key` is a fixed-length type (e.g., integers), additional optimizations apply:
+
+### Leaf Node Structure
+
+At leaf depth, instead of `Node*` child pointers, nodes store `dataptr` directly:
+
+```
+Internal Node (depth < fixed_len):
+┌──────────────────────────────────────────────────────────────────┐
+│ [0] HEADER: LIST | version | size                                │
+├──────────────────────────────────────────────────────────────────┤
+│ [1] small_list                                                   │
+├──────────────────────────────────────────────────────────────────┤
+│ [2] child_ptr[0] (Node*)                                         │
+│ [3] child_ptr[1] (Node*)                                         │
+│ ...                                                              │
+└──────────────────────────────────────────────────────────────────┘
+
+Leaf Node (depth == fixed_len):
+┌──────────────────────────────────────────────────────────────────┐
+│ [0] HEADER: EOS | LIST | version | size                          │
+├──────────────────────────────────────────────────────────────────┤
+│ [1] small_list                                                   │
+├──────────────────────────────────────────────────────────────────┤
+│ [2] dataptr[0] (Value*)                                          │
+│ [3] dataptr[1] (Value*)                                          │
+│ ...                                                              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Path Arrays
+
+For fixed-length keys, path tracking uses stack allocation:
+
+```cpp
+// fixed_len == 0 (variable length keys)
+std::vector<PathEntry> path;
+
+// fixed_len > 0 (fixed length keys)
+std::array<PathEntry, fixed_len> path;
+```
 
 ---
 
@@ -123,6 +187,7 @@ Flags: EOS | SKIP | SKIP_EOS
 ```
 
 **Use Case:** Keys "cat" and "catalog" in same node with no "cats" branch.
+**Note:** This layout only valid when fixed_len == 0.
 
 ### Layout 4: LIST (1-7 children, no data here)
 
@@ -131,13 +196,15 @@ Flags: LIST
 ┌──────────────────────────────────────────────────────────────────┐
 │ [0] HEADER: LIST | version | size                                │
 ├──────────────────────────────────────────────────────────────────┤
-│ [1] small_list: sorted_chars[0-6] | count (see SWAR section)     │
+│ [1] small_list: sorted_chars[0-6] | count                        │
 ├──────────────────────────────────────────────────────────────────┤
-│ [2] child_ptr[0] (Node*)                                         │
-│ [3] child_ptr[1] (Node*)                                         │
+│ [2] child_ptr[0] (Node* or dataptr if leaf)                      │
+│ [3] child_ptr[1]                                                 │
 │ ... (count child pointers)                                       │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**Note:** LIST with count==1 requires SKIP to also be set (otherwise extend skip).
 
 ### Layout 5: POP (8+ children, no data here)
 
@@ -151,8 +218,8 @@ Flags: POP
 │ [3] bitmap[2] (chars 128-191)                                    │
 │ [4] bitmap[3] (chars 192-255)                                    │
 ├──────────────────────────────────────────────────────────────────┤
-│ [5] child_ptr[0] (Node*)                                         │
-│ [6] child_ptr[1] (Node*)                                         │
+│ [5] child_ptr[0] (Node* or dataptr if leaf)                      │
+│ [6] child_ptr[1]                                                 │
 │ ... (popcount(bitmap) child pointers)                            │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -172,6 +239,8 @@ Flags: EOS | LIST
 │ ... (count child pointers)                                       │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**Note for fixed_len > 0:** Only valid at leaf depth. Children are dataptr, not Node*.
 
 ### Layout 7: EOS | POP (Data here + 8+ children)
 
@@ -257,9 +326,11 @@ Flags: EOS | SKIP | SKIP_EOS | LIST
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+**Note:** Only valid when fixed_len == 0.
+
 ### Layout 13: EOS | SKIP | SKIP_EOS | POP
 
-(Similar with bitmap)
+(Similar with bitmap. Only valid when fixed_len == 0.)
 
 ---
 
@@ -277,64 +348,54 @@ Flags: EOS | SKIP | SKIP_EOS | LIST
 **Key SWAR Operations:**
 
 #### 1. Byte Broadcasting
-Replicate a single byte to all positions:
 ```cpp
 constexpr uint64_t REP = 0x0101010101010101ULL;
 uint64_t broadcast = REP * byte_value;
-// Example: byte = 0x41 ('A') → 0x4141414141414141
 ```
 
 #### 2. Zero Byte Detection (Finding a character)
 ```cpp
-// Find which bytes in a word equal search_char
 constexpr uint64_t rep = 0x01'01'01'01'01'01'01'00ULL;  // exclude count byte
 constexpr uint64_t low_bits = 0x7F'7F'7F'7F'7F'7F'7F'7FULL;
 
-uint64_t diff = n_ ^ (rep * search_char);  // matching bytes become 0x00
+uint64_t diff = n_ ^ (rep * search_char);
 uint64_t zeros = ~((((diff & low_bits) + low_bits) | diff) | low_bits);
-// zeros has 0x80 in each position where match occurred
 
-int pos = std::countl_zero(zeros) / 8;  // byte index of first match
-return (pos + 1 <= count) ? pos + 1 : 0;  // 1-based offset, 0 if not found
+int pos = std::countl_zero(zeros) / 8;
+return (pos + 1 <= count) ? pos + 1 : 0;
 ```
 
 **Credit:** Bit Twiddling Hacks - "Determine if a word has a byte equal to n"
 
 #### 3. SWAR Unsigned Byte Comparison (For insertion)
-Split into two cases based on high bit:
 ```cpp
 constexpr uint64_t h = 0x80'80'80'80'80'80'80'80ULL;
 constexpr uint64_t m = 0x7F'7F'7F'7F'7F'7F'7F'7FULL;
 
-// Case 1: High bits differ - A < B iff B has high bit set
 uint64_t diff_high = (chars ^ rep_x) & h;
 uint64_t B_high_wins = rep_x & diff_high;
-
-// Case 2: High bits match - compare low 7 bits
 uint64_t same_high = ~diff_high & h;
 uint64_t low_cmp = ~((chars | h) - rep_x) & h;
 
 uint64_t lt = B_high_wins | (same_high & low_cmp);
-int insert_pos = std::popcount(lt);  // count bytes where chars[i] < new_char
+int insert_pos = std::popcount(lt);
 ```
 
 ### PopCount Bitmap Structure (POP flag, 8+ children)
 
-Four `uint64_t` words covering all 256 possible byte values:
-
 ```cpp
-class PopCount {
-    uint64_t bits[4]{};  // bits[c >> 6] & (1ULL << (c & 63))
+class popcount_bitmap {
+    uint64_t bits_[4]{};
     
 public:
     bool find(unsigned char c, int* idx) const {
         int word = c >> 6, bit = c & 63;
         uint64_t mask = 1ULL << bit;
-        if (!(bits[word] & mask)) return false;
+        if (!(bits_[word] & mask)) return false;
         
-        *idx = std::popcount(bits[word] & (mask - 1));
+        *idx = std::popcount(bits_[word] & (mask - 1));
         for (int w = 0; w < word; ++w) 
-            *idx += std::popcount(bits[w]);
+            *idx += std::popcount(bits_[w]);
         return true;
     }
     
@@ -342,22 +403,15 @@ public:
         int word = c >> 6, bit = c & 63;
         uint64_t mask = 1ULL << bit;
         
-        int idx = std::popcount(bits[word] & (mask - 1));
+        int idx = std::popcount(bits_[word] & (mask - 1));
         for (int w = 0; w < word; ++w) 
-            idx += std::popcount(bits[w]);
+            idx += std::popcount(bits_[w]);
         
-        bits[word] |= mask;
+        bits_[word] |= mask;
         return idx;
     }
 };
 ```
-
-### LIST to POP Transition
-
-When child count exceeds 7:
-- Replace 1-word small_list with 4-word bitmap
-- Net cost: +3 words for the transition
-- Threshold of 7 keeps most nodes compact (sparse branching is common)
 
 ---
 
@@ -373,7 +427,7 @@ static constexpr uint64_t PTR_MASK  = (1ULL << 62) - 1;
 
 ### Reader Protocol
 
-**Path Traversal (cheap):**
+**Path Traversal (cheap, no READ_BIT needed):**
 ```cpp
 uint64_t child = child_slot.load(std::memory_order_acquire);
 if (child & WRITE_BIT) {
@@ -382,12 +436,28 @@ if (child & WRITE_BIT) {
 Node* next = reinterpret_cast<Node*>(child & PTR_MASK);
 ```
 
-**Data Access (leaf):**
+**Data Access (leaf) - CAS to avoid reader-reader gap:**
 ```cpp
-uint64_t old = data_slot.fetch_or(READ_BIT, std::memory_order_acq_rel);
-if (old & WRITE_BIT) {
-    data_slot.fetch_and(~READ_BIT, std::memory_order_release);
-    return retry_from_root();
+while (true) {
+    uint64_t old = data_slot.load(std::memory_order_acquire);
+    
+    if (old & WRITE_BIT) {
+        return retry_from_root();
+    }
+    
+    if (old & READ_BIT) {
+        // Another reader has it - spin
+        spin();
+        continue;
+    }
+    
+    // Try to set READ_BIT exclusively
+    if (data_slot.compare_exchange_weak(old, old | READ_BIT, 
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+        break;  // We own READ_BIT
+    }
+    // CAS failed - retry loop
 }
 
 Value copy = *reinterpret_cast<Value*>(old & PTR_MASK);
@@ -395,74 +465,103 @@ data_slot.fetch_and(~READ_BIT, std::memory_order_release);
 return copy;
 ```
 
-**Reader-Reader Contention:**
-- If another reader has READ_BIT set, the new reader's fetch_or is a no-op
-- Both see WRITE_BIT clear, both proceed
-- Brief overlap during copy is safe (both reading same data)
+**Why CAS instead of fetch_or:**
+- R1 sets READ_BIT via fetch_or
+- R2's fetch_or sees READ_BIT already set (no-op)
+- R1 clears READ_BIT
+- Writer grabs WRITE_BIT immediately
+- R2 proceeds to copy with WRITE_BIT now set → use-after-free
+
+With CAS, R2 either gets exclusive READ_BIT or spins until safe.
 
 ### Writer Protocol
 
-**Marking Phase (bottom-up):**
+**Phase 1: Build new path (outside lock, as a reader):**
 ```cpp
-// 1. Mark data slot first
-uint64_t old_data = data_slot.fetch_or(WRITE_BIT, std::memory_order_acq_rel);
-if (old_data & READ_BIT) {
-    // Reader is copying - spin until done
-    while (data_slot.load(std::memory_order_acquire) & READ_BIT) {
-        // spin
-    }
+// Create complete new path from modification point down
+// Reuse existing valid child pointers where unchanged
+std::vector<uint64_t*> new_nodes = build_new_path(key, value);
+```
+
+**Phase 2: Collect version path (outside lock):**
+```cpp
+// For fixed_len > 0: std::array<PathEntry, fixed_len>
+// For fixed_len == 0: std::vector<PathEntry>
+auto path = collect_path_versions(key);
+
+// If we hit a WRITE_BIT during traversal - retry (we're a reader here)
+if (hit_write_bit) {
+    cleanup_new_nodes(new_nodes);
+    return retry();
+}
+```
+
+**Phase 3: Acquire lock:**
+```cpp
+std::lock_guard<std::mutex> lock(write_mutex_);
+```
+
+**Phase 4: Verify path, redo if changed:**
+```cpp
+if (!path_versions_match(path)) {
+    // Structure changed - redo work inside lock
+    cleanup_new_nodes(new_nodes);
+    new_nodes = build_new_path(key, value);
+    path = collect_path_versions(key);
+}
+```
+
+**Phase 5: Swap and cleanup flags, update versions:**
+```cpp
+// Mark data slot, wait for any reader
+data_slot.fetch_or(WRITE_BIT, std::memory_order_acq_rel);
+while (data_slot.load(std::memory_order_acquire) & READ_BIT) {
+    spin();
 }
 
-// 2. Mark path from leaf to modification point (bottom-up)
+// Mark path bottom-up
 for (auto it = path.rbegin(); it != path.rend(); ++it) {
     it->slot->fetch_or(WRITE_BIT, std::memory_order_release);
 }
+
+// Perform swap
+parent_slot->store(reinterpret_cast<uint64_t>(new_root), std::memory_order_release);
+
+// Update versions in modified nodes
+// Clear WRITE_BITs on unchanged portions
+update_versions_and_clear_flags(path);
 ```
 
-**Modification Phase:**
+**Phase 6: Unlock and delete old nodes:**
 ```cpp
-std::lock_guard<std::mutex> lock(write_mutex_);
+// Collect nodes to delete (store in vector/array before unlock)
+std::vector<uint64_t*> to_delete = collect_replaced_nodes(path);
 
-// Verify versions unchanged (optimistic check)
-if (!path_versions_valid(path)) {
-    // Another writer modified structure - retry
-    clear_write_bits(path);
-    return retry();
+// Unlock happens here (end of lock_guard scope)
 }
 
-// Create new node, perform swap
-Node* new_node = create_modified_node(...);
-parent_slot->store(reinterpret_cast<uint64_t>(new_node), std::memory_order_release);
-
-// Clear write bits on unchanged path portions
-clear_unchanged_write_bits(path);
+// Delete outside lock - safe because:
+// - WRITE_BIT forced all readers to retry
+// - Anyone who had old pointer hit WRITE_BIT on data access
+for (auto* node : to_delete) {
+    deallocate_node(node);
+}
 ```
-
-**Freeing Old Nodes:**
-- Writer holds write lock during swap
-- Any reader that got old pointer before marking will hit WRITE_BIT on data slot and retry
-- Any reader that got old pointer after marking sees WRITE_BIT on path and retries
-- After clearing bits and releasing lock, old node can be freed
-- The "hole" is only the copy duration (reader sets READ_BIT → clears READ_BIT)
 
 ### Race Analysis
 
 | Scenario | Outcome |
 |----------|---------|
-| Reader loads child ptr, then Writer marks | Reader enters node, sees WRITE_BIT on data → retry |
+| Reader loads child ptr, then Writer marks | Reader enters node, CAS on data fails (WRITE_BIT) → retry |
 | Writer marks, then Reader loads | Reader sees WRITE_BIT on path → retry |
-| Reader fetch_or READ_BIT, then Writer marks | Writer spins on READ_BIT until reader finishes copy |
-| Writer marks, then Reader fetch_or READ_BIT | Reader sees WRITE_BIT → undo READ_BIT → retry |
-
-**Key Invariant:** Reader never accesses memory that writer might free because:
-1. Path traversal is pointer loads only (no dereference of node content until reaching data)
-2. Data access sets READ_BIT, writer waits for it to clear before freeing
+| Reader CAS succeeds, then Writer marks | Writer spins on READ_BIT until reader copies |
+| Writer marks, then Reader CAS | Reader sees WRITE_BIT → retry |
+| R1 has READ_BIT, R2 tries | R2 spins until R1 clears, then CAS succeeds |
+| R1 clears, Writer grabs before R2 | R2's CAS fails (WRITE_BIT now set) → retry |
 
 ---
 
 ## The `dataptr` Class
-
-Unified interface for data storage with different implementations based on template parameters.
 
 ### Template Selection
 
@@ -473,9 +572,7 @@ static constexpr bool can_embed_v =
     std::is_trivially_copyable_v<T>;
 
 template <typename T, bool THREADED, typename Allocator>
-class dataptr {
-    // Implementation selected based on THREADED and can_embed_v<T>
-};
+class dataptr;
 ```
 
 ### Interface
@@ -484,26 +581,18 @@ class dataptr {
 template <typename T, bool THREADED, typename Allocator>
 class dataptr {
 public:
-    // Construction / Destruction
     dataptr();
-    ~dataptr();  // frees owned data if present
+    ~dataptr();
     
-    // Reading
     bool has_data() const;
-    bool try_read(T& out);  // copies value to out, returns false if no data
+    bool try_read(T& out);  // returns false if no data or WRITE_BIT (caller retries)
     
-    // Writing (call in sequence for THREADED=true)
-    void begin_write();     // marks WRITE_BIT, spins on READ_BIT
-    void set(const T& value);  // copy
-    void set(T&& value);       // move
-    void clear();              // remove data
-    void end_write();       // clears WRITE_BIT
+    void begin_write();     // THREADED: set WRITE_BIT, spin on READ_BIT
+    void set(const T& value);
+    void set(T&& value);
+    void clear();
+    void end_write();       // THREADED: clear WRITE_BIT
     
-    // For non-threaded or when lock already held
-    void set_direct(const T& value);
-    void set_direct(T&& value);
-    
-    // Raw access (for node array serialization)
     uint64_t to_u64() const;
     static dataptr from_u64(uint64_t v);
 };
@@ -516,55 +605,50 @@ template <typename T, typename Allocator>
 class dataptr<T, true, Allocator> {
     std::atomic<uint64_t> bits_;
     
-    static constexpr uint64_t WRITE_BIT = 1ULL << 63;
-    static constexpr uint64_t READ_BIT  = 1ULL << 62;
-    static constexpr uint64_t PTR_MASK  = (1ULL << 62) - 1;
-    
 public:
-    bool has_data() const {
-        return (bits_.load(std::memory_order_acquire) & PTR_MASK) != 0;
-    }
-    
     bool try_read(T& out) {
         while (true) {
-            uint64_t old = bits_.fetch_or(READ_BIT, std::memory_order_acq_rel);
+            uint64_t old = bits_.load(std::memory_order_acquire);
             
-            if (old & WRITE_BIT) {
-                bits_.fetch_and(~READ_BIT, std::memory_order_release);
-                return false;  // caller should retry from root
-            }
+            if (old & WRITE_BIT) return false;  // caller retries from root
             
             T* ptr = reinterpret_cast<T*>(old & PTR_MASK);
-            if (!ptr) {
-                bits_.fetch_and(~READ_BIT, std::memory_order_release);
-                return false;
+            if (!ptr) return false;
+            
+            if (old & READ_BIT) {
+                spin();
+                continue;
             }
             
-            out = *ptr;  // copy
-            bits_.fetch_and(~READ_BIT, std::memory_order_release);
-            return true;
+            if (bits_.compare_exchange_weak(old, old | READ_BIT,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
+                out = *ptr;
+                bits_.fetch_and(~READ_BIT, std::memory_order_release);
+                return true;
+            }
         }
     }
     
     void begin_write() {
         bits_.fetch_or(WRITE_BIT, std::memory_order_acq_rel);
         while (bits_.load(std::memory_order_acquire) & READ_BIT) {
-            // spin - reader is copying
+            spin();
         }
     }
     
     void set(const T& value) {
-        T* new_ptr = /* allocate and copy construct */;
+        T* new_ptr = allocate_and_construct(value);
         T* old_ptr = reinterpret_cast<T*>(bits_.load(std::memory_order_relaxed) & PTR_MASK);
         bits_.store(reinterpret_cast<uint64_t>(new_ptr) | WRITE_BIT, std::memory_order_release);
-        if (old_ptr) { /* destroy and deallocate old_ptr */ }
+        if (old_ptr) destroy_and_deallocate(old_ptr);
     }
     
     void set(T&& value) {
-        T* new_ptr = /* allocate and move construct */;
+        T* new_ptr = allocate_and_construct(std::move(value));
         T* old_ptr = reinterpret_cast<T*>(bits_.load(std::memory_order_relaxed) & PTR_MASK);
         bits_.store(reinterpret_cast<uint64_t>(new_ptr) | WRITE_BIT, std::memory_order_release);
-        if (old_ptr) { /* destroy and deallocate old_ptr */ }
+        if (old_ptr) destroy_and_deallocate(old_ptr);
     }
     
     void end_write() {
@@ -577,10 +661,9 @@ public:
 
 ```cpp
 template <typename T, typename Allocator>
-    requires (!THREADED && can_embed_v<T>)
 class dataptr<T, false, Allocator> {
     uint64_t bits_;
-    bool has_value_;  // cannot use bits_ == 0 as sentinel (T might be 0)
+    bool has_value_;
     
 public:
     bool has_data() const { return has_value_; }
@@ -591,21 +674,17 @@ public:
         return true;
     }
     
-    void begin_write() { }  // no-op
-    void end_write() { }    // no-op
+    void begin_write() { }
+    void end_write() { }
     
     void set(const T& value) {
         std::memcpy(&bits_, &value, sizeof(T));
         has_value_ = true;
     }
     
-    void set(T&& value) {
-        set(value);  // same as copy for trivially copyable
-    }
+    void set(T&& value) { set(value); }
     
-    void clear() {
-        has_value_ = false;
-    }
+    void clear() { has_value_ = false; }
 };
 ```
 
@@ -613,10 +692,8 @@ public:
 
 ```cpp
 template <typename T, typename Allocator>
-    requires (!THREADED && !can_embed_v<T>)
 class dataptr<T, false, Allocator> {
-    T* ptr_;
-    Allocator alloc_;
+    T* ptr_ = nullptr;
     
 public:
     bool has_data() const { return ptr_ != nullptr; }
@@ -627,25 +704,25 @@ public:
         return true;
     }
     
-    void begin_write() { }  // no-op
-    void end_write() { }    // no-op
+    void begin_write() { }
+    void end_write() { }
     
     void set(const T& value) {
-        if (ptr_) { std::destroy_at(ptr_); }
-        else { ptr_ = alloc_.allocate(1); }
+        if (!ptr_) ptr_ = allocate(1);
+        else std::destroy_at(ptr_);
         std::construct_at(ptr_, value);
     }
     
     void set(T&& value) {
-        if (ptr_) { std::destroy_at(ptr_); }
-        else { ptr_ = alloc_.allocate(1); }
+        if (!ptr_) ptr_ = allocate(1);
+        else std::destroy_at(ptr_);
         std::construct_at(ptr_, std::move(value));
     }
     
     void clear() {
         if (ptr_) {
             std::destroy_at(ptr_);
-            alloc_.deallocate(ptr_, 1);
+            deallocate(ptr_, 1);
             ptr_ = nullptr;
         }
     }
@@ -656,20 +733,17 @@ public:
 
 ## Key Traits
 
-Support for different key types via traits specialization:
-
 ```cpp
 template <typename Key>
 struct tktrie_traits;
 
-// String keys
 template <>
 struct tktrie_traits<std::string> {
-    static constexpr size_t fixed_len = 0;  // variable length
+    static constexpr size_t fixed_len = 0;
     static std::string_view to_bytes(const std::string& k) { return k; }
+    static std::string from_bytes(std::string_view bytes) { return std::string(bytes); }
 };
 
-// Integral keys (sorted by value, not byte representation)
 template <typename T>
     requires std::is_integral_v<T>
 struct tktrie_traits<T> {
@@ -679,17 +753,25 @@ struct tktrie_traits<T> {
     static std::string to_bytes(T k) {
         unsigned_type sortable;
         if constexpr (std::is_signed_v<T>) {
-            // Flip sign bit so negative < positive in byte comparison
             sortable = static_cast<unsigned_type>(k) + (unsigned_type{1} << (sizeof(T) * 8 - 1));
         } else {
             sortable = k;
         }
-        // Convert to big-endian for correct lexicographic ordering
         unsigned_type be = byteswap_if_little_endian(sortable);
-        
         char buf[sizeof(T)];
         std::memcpy(buf, &be, sizeof(T));
         return std::string(buf, sizeof(T));
+    }
+    
+    static T from_bytes(std::string_view bytes) {
+        unsigned_type be;
+        std::memcpy(&be, bytes.data(), sizeof(T));
+        unsigned_type sortable = byteswap_if_little_endian(be);
+        if constexpr (std::is_signed_v<T>) {
+            return static_cast<T>(sortable - (unsigned_type{1} << (sizeof(T) * 8 - 1)));
+        } else {
+            return static_cast<T>(sortable);
+        }
     }
 };
 ```
@@ -708,215 +790,410 @@ tktrie/
 ├── tktrie_dataptr.h      // dataptr class implementations
 ├── tktrie_small_list.h   // SWAR small list operations
 ├── tktrie_popcount.h     // Bitmap operations
-├── tktrie_node.h         // Node array layout and parsing
+├── tktrie_node.h         // Node array layout and parsing (node_view, node_builder)
 ├── tktrie_iterator.h     // Iterator type
-└── tktrie_impl.h         // Main trie implementation
+├── tktrie_impl.h         // Main trie implementation
+├── tktrie_help_common.h  // Static helper functions (shared)
+├── tktrie_help_insert.h  // Static helper functions (insert)
+├── tktrie_help_remove.h  // Static helper functions (remove)
+├── tktrie_help_nav.h     // Static helper functions (navigation)
+├── tktrie_debug.h        // pretty_print, validate
+└── tktrie_test.h         // Test utilities (optional)
 ```
+
+**Guidelines:**
+- No file should exceed ~1000 lines
+- Use sparse comments
+- Split helpers if any file grows too large
 
 ### Core Classes
 
 ```cpp
 // tktrie_defines.h
 namespace gteitelbaum {
-    // Force inline macro
-    #define KTRIE_FORCE_INLINE ...
-    
-    // Debug assertions
-    #define KTRIE_DEBUG_ASSERT(cond) ...
-    
-    // Byte order utilities
-    template <typename T>
-    constexpr T byteswap_if_little_endian(T value);
-    
-    // Char array casting utilities
-    inline std::array<char, 8> to_char_static(uint64_t v);
-    inline uint64_t from_char_static(std::array<char, 8> arr);
-}
 
+#define KTRIE_FORCE_INLINE ...
+#define KTRIE_DEBUG_ASSERT(cond) ...
+
+// Validation control - set via compiler define: -DKTRIE_VALIDATE=1
+#ifndef KTRIE_VALIDATE
+#define KTRIE_VALIDATE 0
+#endif
+static constexpr bool k_validate = (KTRIE_VALIDATE != 0);
+
+template <typename T>
+constexpr T byteswap_if_little_endian(T value);
+
+inline std::array<char, 8> to_char_static(uint64_t v);
+inline uint64_t from_char_static(std::array<char, 8> arr);
+
+}
+```
+
+```cpp
 // tktrie_small_list.h
 namespace gteitelbaum {
-    class small_list {
-        uint64_t n_;
-    public:
-        static constexpr int max_count = 7;
-        
-        int count() const;
-        uint8_t char_at(int pos) const;
-        int offset(char c) const;      // 1-based, 0 if not found (SWAR)
-        int insert_pos(char c) const;  // position to insert (SWAR)
-        
-        uint64_t to_u64() const;
-        static small_list from_u64(uint64_t v);
-    };
-}
 
+class small_list {
+    uint64_t n_;
+public:
+    static constexpr int max_count = 7;
+    
+    int count() const;
+    uint8_t char_at(int pos) const;
+    int offset(char c) const;      // 1-based, 0 if not found
+    int insert_pos(char c) const;
+    
+    uint64_t to_u64() const;
+    static small_list from_u64(uint64_t v);
+};
+
+}
+```
+
+```cpp
 // tktrie_popcount.h
 namespace gteitelbaum {
-    class popcount_bitmap {
-        uint64_t bits_[4]{};
-    public:
-        bool find(unsigned char c, int* idx) const;
-        int set(unsigned char c);  // returns index
-        int count() const;
-        
-        std::array<uint64_t, 4> to_array() const;
-        static popcount_bitmap from_array(std::array<uint64_t, 4> arr);
-    };
-}
 
+class popcount_bitmap {
+    uint64_t bits_[4]{};
+public:
+    bool find(unsigned char c, int* idx) const;
+    int set(unsigned char c);
+    int count() const;
+    
+    std::array<uint64_t, 4> to_array() const;
+    static popcount_bitmap from_array(std::array<uint64_t, 4> arr);
+};
+
+}
+```
+
+```cpp
 // tktrie_node.h
 namespace gteitelbaum {
-    template <typename T, bool THREADED, typename Allocator>
-    class node_view {
-        // Non-owning view into a node array
-        // Provides accessors based on flags
-        uint64_t* arr_;
-        
-    public:
-        explicit node_view(uint64_t* arr);
-        
-        // Header access
-        uint64_t flags() const;
-        uint32_t version() const;
-        uint32_t size() const;
-        
-        // Flag queries
-        bool has_eos() const;
-        bool has_skip() const;
-        bool has_skip_eos() const;
-        bool has_list() const;
-        bool has_pop() const;
-        
-        // Data access (offsets computed from flags)
-        dataptr<T, THREADED, Allocator>* eos_data();
-        dataptr<T, THREADED, Allocator>* skip_eos_data();
-        
-        // Skip access
-        size_t skip_length() const;
-        std::string_view skip_chars() const;
-        
-        // Children access
-        small_list* list();
-        popcount_bitmap* bitmap();
-        uint64_t* child_ptrs();  // array of Node*
-        int child_count() const;
-        
-        // Traversal
-        uint64_t* find_child(unsigned char c) const;  // returns slot, or nullptr
-    };
-    
-    template <typename T, bool THREADED, typename Allocator>
-    class node_builder {
-        // Constructs new node arrays
-        Allocator& alloc_;
-        
-    public:
-        // Build various node types
-        uint64_t* build_eos(const T& value);
-        uint64_t* build_skip(std::string_view skip, const T* skip_eos_value);
-        uint64_t* build_list(small_list list, std::span<uint64_t*> children);
-        // ... etc for all layouts
-        
-        // Modification helpers
-        uint64_t* clone_with_new_child(node_view<T, THREADED, Allocator> src, 
-                                        unsigned char c, uint64_t* child);
-        uint64_t* clone_with_split_skip(node_view<T, THREADED, Allocator> src,
-                                         size_t split_pos, const T* new_value);
-    };
-}
 
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+class node_view {
+    using slot_type = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
+    slot_type* arr_;
+    
+public:
+    explicit node_view(slot_type* arr);
+    
+    uint64_t flags() const;
+    uint32_t version() const;
+    uint32_t size() const;
+    
+    bool has_eos() const;
+    bool has_skip() const;
+    bool has_skip_eos() const;
+    bool has_list() const;
+    bool has_pop() const;
+    
+    dataptr<T, THREADED, Allocator>* eos_data();
+    dataptr<T, THREADED, Allocator>* skip_eos_data();
+    
+    size_t skip_length() const;
+    std::string_view skip_chars() const;
+    
+    small_list* list();
+    popcount_bitmap* bitmap();
+    slot_type* child_ptrs();
+    int child_count() const;
+    
+    slot_type* find_child(unsigned char c) const;
+};
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+class node_builder {
+    Allocator& alloc_;
+    
+public:
+    using slot_type = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
+    
+    slot_type* build_eos(const T& value);
+    slot_type* build_eos(T&& value);
+    slot_type* build_skip(std::string_view skip, const T* skip_eos_value);
+    slot_type* build_list(small_list list, std::span<slot_type*> children);
+    slot_type* build_pop(popcount_bitmap bitmap, std::span<slot_type*> children);
+    // ... other layouts
+    
+    slot_type* clone_with_new_child(node_view<T, THREADED, Allocator, FIXED_LEN> src,
+                                     unsigned char c, slot_type* child);
+    slot_type* clone_with_split_skip(node_view<T, THREADED, Allocator, FIXED_LEN> src,
+                                      size_t split_pos, const T* new_value);
+    
+    void deallocate_node(slot_type* node);
+};
+
+}
+```
+
+```cpp
+// tktrie_help_common.h
+namespace gteitelbaum {
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct trie_helpers {
+    using slot_type = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
+    using node_view_t = node_view<T, THREADED, Allocator, FIXED_LEN>;
+    using node_builder_t = node_builder<T, THREADED, Allocator, FIXED_LEN>;
+    
+    // Common utilities
+    static uint64_t load_slot(slot_type* slot);
+    static void store_slot(slot_type* slot, uint64_t value);
+    static bool cas_slot(slot_type* slot, uint64_t expected, uint64_t desired);
+    
+    static void spin();
+};
+
+}
+```
+
+```cpp
+// tktrie_help_nav.h
+namespace gteitelbaum {
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
+    using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
+    using slot_type = typename base::slot_type;
+    
+    // Returns nullptr if not found, or if WRITE_BIT encountered (sets hit_write)
+    static slot_type* find_node(slot_type* root, std::string_view key, bool& hit_write);
+    
+    // Collect path with versions for optimistic concurrency
+    template <typename PathContainer>
+    static bool collect_path(slot_type* root, std::string_view key, 
+                             PathContainer& path, bool& hit_write);
+};
+
+}
+```
+
+```cpp
+// tktrie_help_insert.h
+namespace gteitelbaum {
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
+    using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
+    using slot_type = typename base::slot_type;
+    
+    // Build new path for insertion
+    static std::vector<slot_type*> build_insert_path(
+        node_builder_t& builder,
+        slot_type* cur,
+        std::string_view remaining_key,
+        const T& value,
+        size_t depth);
+    
+    static std::vector<slot_type*> build_insert_path(
+        node_builder_t& builder,
+        slot_type* cur,
+        std::string_view remaining_key,
+        T&& value,
+        size_t depth);
+};
+
+}
+```
+
+```cpp
+// tktrie_help_remove.h
+namespace gteitelbaum {
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
+    using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
+    using slot_type = typename base::slot_type;
+    
+    // Build new path for removal (may collapse nodes)
+    static std::vector<slot_type*> build_remove_path(
+        node_builder_t& builder,
+        slot_type* cur,
+        std::string_view remaining_key,
+        size_t depth);
+};
+
+}
+```
+
+```cpp
 // tktrie_iterator.h
 namespace gteitelbaum {
-    template <typename Key, typename T>
-    class tktrie_iterator {
-        Key key_;
-        T value_;
-        bool valid_;
-        
-    public:
-        using value_type = std::pair<Key, T>;
-        
-        tktrie_iterator();  // end iterator
-        tktrie_iterator(const Key& k, const T& v);
-        
-        const Key& key() const;
-        T& value();
-        value_type operator*() const;
-        
-        bool valid() const;
-        bool operator==(const tktrie_iterator& o) const;
-        bool operator!=(const tktrie_iterator& o) const;
-    };
+
+template <typename Key, typename T, bool THREADED, typename Allocator>
+class tktrie;
+
+template <typename Key, typename T, bool THREADED, typename Allocator>
+class tktrie_iterator {
+    friend class tktrie<Key, T, THREADED, Allocator>;
+    
+    tktrie<Key, T, THREADED, Allocator>* parent_;
+    std::string key_bytes_;  // stored as bytes, converted via traits on access
+    T value_;                // copy of value
+    bool valid_;
+    
+public:
+    using value_type = std::pair<Key, T>;
+    using traits = tktrie_traits<Key>;
+    
+    tktrie_iterator();  // end iterator
+    tktrie_iterator(tktrie<Key, T, THREADED, Allocator>* parent,
+                    std::string_view key_bytes, const T& value);
+    
+    Key key() const { return traits::from_bytes(key_bytes_); }
+    const T& value() const { return value_; }
+    T& value() { return value_; }
+    
+    value_type operator*() const { return {key(), value_}; }
+    
+    bool valid() const { return valid_; }
+    bool operator==(const tktrie_iterator& o) const;
+    bool operator!=(const tktrie_iterator& o) const;
+    
+    // Iterator is a reader - follows same rules including retry and READ_BIT tagging
+    tktrie_iterator& operator++();
+    tktrie_iterator operator++(int);
+};
+
+}
+```
+
+```cpp
+// tktrie_debug.h
+namespace gteitelbaum {
+
+template <typename Key, typename T, bool THREADED, typename Allocator>
+class tktrie;
+
+template <typename Key, typename T, bool THREADED, typename Allocator>
+struct trie_debug {
+    using trie_type = tktrie<Key, T, THREADED, Allocator>;
+    using slot_type = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
+    
+    // Print tree structure with all details (flags, versions, etc.)
+    static void pretty_print(const trie_type& trie, std::ostream& os);
+    static void pretty_print_node(slot_type* node, std::ostream& os, 
+                                   int depth, const std::string& prefix);
+    
+    // Validate all invariants - asserts on failure
+    // No-op if k_validate == false
+    static void validate(const trie_type& trie);
+    static void validate_node(slot_type* node, size_t depth, size_t fixed_len);
+};
+
+// Writers call this after modifications
+template <typename Key, typename T, bool THREADED, typename Allocator>
+inline void validate_trie(const tktrie<Key, T, THREADED, Allocator>& trie) {
+    if constexpr (k_validate) {
+        trie_debug<Key, T, THREADED, Allocator>::validate(trie);
+    }
 }
 
+}
+```
+
+```cpp
 // tktrie_impl.h / tktrie.h
 namespace gteitelbaum {
-    template <typename Key, typename T, bool THREADED = false, 
-              typename Allocator = std::allocator<uint64_t>>
-    class tktrie {
-    public:
-        using traits = tktrie_traits<Key>;
-        using size_type = std::size_t;
-        using iterator = tktrie_iterator<Key, T>;
-        
-    private:
-        using node_view_t = node_view<T, THREADED, Allocator>;
-        using node_builder_t = node_builder<T, THREADED, Allocator>;
-        using dataptr_t = dataptr<T, THREADED, Allocator>;
-        
-        uint64_t* root_;
-        std::conditional_t<THREADED, std::atomic<size_type>, size_type> elem_count_;
-        std::conditional_t<THREADED, std::mutex, empty_mutex> write_mutex_;
-        Allocator alloc_;
-        
-    public:
-        // Construction / Destruction
-        tktrie();
-        explicit tktrie(const Allocator& alloc);
-        ~tktrie();
-        
-        tktrie(const tktrie&) = delete;  // or implement deep copy
-        tktrie& operator=(const tktrie&) = delete;
-        tktrie(tktrie&&) noexcept;
-        tktrie& operator=(tktrie&&) noexcept;
-        
-        // Capacity
-        bool empty() const;
-        size_type size() const;
-        
-        // Lookup
-        bool contains(const Key& key) const;
-        iterator find(const Key& key) const;
-        iterator end() const;
-        
-        // Modification
-        std::pair<iterator, bool> insert(const std::pair<const Key, T>& value);
-        std::pair<iterator, bool> insert(std::pair<const Key, T>&& value);
-        
-        template <typename... Args>
-        std::pair<iterator, bool> emplace(const Key& key, Args&&... args);
-        
-        bool erase(const Key& key);
-        void clear();
-        
-    private:
-        // Internal implementation
-        bool contains_impl(std::string_view key_bytes) const;
-        iterator find_impl(const Key& key, std::string_view key_bytes) const;
-        std::pair<iterator, bool> insert_impl(const Key& key, const T& value);
-        std::pair<iterator, bool> insert_impl(const Key& key, T&& value);
-        bool erase_impl(const Key& key);
-        
-        // Node management
-        void delete_tree(uint64_t* node);
-        uint64_t* clone_node(uint64_t* node);
-    };
+
+template <typename Key, typename T, bool THREADED = false,
+          typename Allocator = std::allocator<uint64_t>>
+class tktrie {
+public:
+    using traits = tktrie_traits<Key>;
+    static constexpr size_t fixed_len = traits::fixed_len;
+    using size_type = std::size_t;
+    using iterator = tktrie_iterator<Key, T, THREADED, Allocator>;
     
-    // Empty mutex for THREADED=false
-    struct empty_mutex {
-        void lock() { }
-        void unlock() { }
-    };
+private:
+    using slot_type = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
+    using node_view_t = node_view<T, THREADED, Allocator, fixed_len>;
+    using node_builder_t = node_builder<T, THREADED, Allocator, fixed_len>;
+    using dataptr_t = dataptr<T, THREADED, Allocator>;
+    
+    // Path container type based on fixed_len
+    using path_container = std::conditional_t<
+        (fixed_len > 0),
+        std::array<PathEntry, fixed_len>,
+        std::vector<PathEntry>
+    >;
+    
+    slot_type* root_;
+    std::conditional_t<THREADED, std::atomic<size_type>, size_type> elem_count_{0};
+    std::conditional_t<THREADED, std::mutex, empty_mutex> write_mutex_;
+    Allocator alloc_;
+    
+public:
+    // Construction
+    tktrie();
+    explicit tktrie(const Allocator& alloc);
+    
+    // Destruction
+    ~tktrie();
+    
+    // Copy (deep copy)
+    tktrie(const tktrie& other);
+    tktrie& operator=(const tktrie& other);
+    
+    // Move (shallow)
+    tktrie(tktrie&& other) noexcept;
+    tktrie& operator=(tktrie&& other) noexcept;
+    
+    // Capacity
+    bool empty() const;
+    size_type size() const;
+    
+    // Lookup
+    bool contains(const Key& key) const;
+    iterator find(const Key& key) const;
+    iterator end() const;
+    
+    // Modification
+    std::pair<iterator, bool> insert(const std::pair<const Key, T>& value);
+    std::pair<iterator, bool> insert(std::pair<const Key, T>&& value);
+    
+    template <typename... Args>
+    std::pair<iterator, bool> emplace(const Key& key, Args&&... args);
+    
+    bool erase(const Key& key);
+    void clear();
+    
+    // Range operations (stubs - implementation deferred)
+    std::pair<iterator, iterator> prefix_match(const std::string& prefix) const
+        requires (fixed_len == 0);
+    std::pair<iterator, iterator> prefix_match(const Key& key, size_t depth) const
+        requires (fixed_len > 0);
+    
+    // Iteration
+    iterator begin() const;
+    
+    // Debug
+    void pretty_print(std::ostream& os = std::cout) const;
+    
+private:
+    friend struct trie_debug<Key, T, THREADED, Allocator>;
+    
+    bool contains_impl(std::string_view key_bytes) const;
+    iterator find_impl(std::string_view key_bytes) const;
+    
+    std::pair<iterator, bool> insert_impl(const Key& key, const T& value);
+    std::pair<iterator, bool> insert_impl(const Key& key, T&& value);
+    
+    bool erase_impl(const Key& key);
+    
+    void delete_tree(slot_type* node);
+    slot_type* deep_copy_node(slot_type* node);
+};
+
+struct empty_mutex {
+    void lock() { }
+    void unlock() { }
+};
+
 }
 ```
 
@@ -927,13 +1204,14 @@ namespace gteitelbaum {
 ### contains() - Lock-Free Read
 
 ```cpp
-bool contains_impl(std::string_view kv) const {
-    uint64_t* cur = root_;
+template <typename Key, typename T, bool THREADED, typename Allocator>
+bool tktrie<Key, T, THREADED, Allocator>::contains_impl(std::string_view kv) const {
+retry:
+    slot_type* cur = root_;
     
     while (cur) {
         node_view_t view(cur);
         
-        // Check skip sequence
         if (view.has_skip()) {
             std::string_view skip = view.skip_chars();
             if (kv.size() < skip.size()) return false;
@@ -941,33 +1219,40 @@ bool contains_impl(std::string_view kv) const {
             kv.remove_prefix(skip.size());
             
             if (kv.empty()) {
-                return view.has_skip_eos();
+                if (!view.has_skip_eos()) return false;
+                // Read data to verify it exists (follows reader protocol with CAS)
+                T dummy;
+                if (!view.skip_eos_data()->try_read(dummy)) {
+                    if constexpr (THREADED) goto retry;
+                    return false;
+                }
+                return true;
             }
         }
         
-        // Check EOS
         if (kv.empty()) {
-            return view.has_eos();
+            if (!view.has_eos()) return false;
+            T dummy;
+            if (!view.eos_data()->try_read(dummy)) {
+                if constexpr (THREADED) goto retry;
+                return false;
+            }
+            return true;
         }
         
-        // Find child
-        uint64_t* child_slot = view.find_child(static_cast<unsigned char>(kv[0]));
+        slot_type* child_slot = view.find_child(static_cast<unsigned char>(kv[0]));
         if (!child_slot) return false;
         
         uint64_t child_ptr;
         if constexpr (THREADED) {
-            child_ptr = reinterpret_cast<std::atomic<uint64_t>*>(child_slot)
-                        ->load(std::memory_order_acquire);
-            if (child_ptr & WRITE_BIT) {
-                // Writer active - restart
-                return contains_impl(/* original key */);
-            }
+            child_ptr = child_slot->load(std::memory_order_acquire);
+            if (child_ptr & WRITE_BIT) goto retry;
             child_ptr &= PTR_MASK;
         } else {
             child_ptr = *child_slot;
         }
         
-        cur = reinterpret_cast<uint64_t*>(child_ptr);
+        cur = reinterpret_cast<slot_type*>(child_ptr);
         kv.remove_prefix(1);
     }
     
@@ -978,166 +1263,303 @@ bool contains_impl(std::string_view kv) const {
 ### insert() - Optimistic then Locked
 
 ```cpp
-std::pair<iterator, bool> insert_impl(const Key& key, T&& value) {
+template <typename Key, typename T, bool THREADED, typename Allocator>
+auto tktrie<Key, T, THREADED, Allocator>::insert_impl(const Key& key, T&& value)
+    -> std::pair<iterator, bool>
+{
     std::string key_bytes = traits::to_bytes(key);
+    node_builder_t builder(alloc_);
     
-    // Phase 1: Optimistic traversal (collect path + versions)
-    struct PathEntry {
-        uint64_t* node;
-        uint64_t* child_slot;  // slot we followed
-        uint32_t version;
-    };
-    std::vector<PathEntry> path;
-    path.reserve(16);
+    // Phase 1: Build new path (outside lock)
+    bool hit_write = false;
+    auto new_nodes = insert_helpers<T, THREADED, Allocator, fixed_len>
+        ::build_insert_path(builder, root_, key_bytes, std::move(value), 0);
     
-    std::string_view kv(key_bytes);
-    uint64_t* cur = root_;
-    
-    while (true) {
-        node_view_t view(cur);
-        path.push_back({cur, nullptr, view.version()});
-        
-        // Match skip
-        if (view.has_skip()) {
-            std::string_view skip = view.skip_chars();
-            size_t common = 0;
-            while (common < skip.size() && common < kv.size() && 
-                   skip[common] == kv[common]) {
-                ++common;
-            }
-            
-            if (common < skip.size()) {
-                // Need to split - break here
-                break;
-            }
-            kv.remove_prefix(common);
-            
-            if (kv.empty() && view.has_skip_eos()) {
-                // Key exists at skip_eos
-                break;
-            }
-        }
-        
-        if (kv.empty()) {
-            // Key ends at this node
-            break;
-        }
-        
-        // Find child
-        uint64_t* child_slot = view.find_child(static_cast<unsigned char>(kv[0]));
-        if (!child_slot) {
-            // Need to add child - break here
-            break;
-        }
-        
-        path.back().child_slot = child_slot;
-        
-        uint64_t child_ptr = *child_slot;  // safe in phase 1
-        if constexpr (THREADED) {
-            child_ptr &= PTR_MASK;
-        }
-        
-        cur = reinterpret_cast<uint64_t*>(child_ptr);
-        kv.remove_prefix(1);
+    if (new_nodes.empty()) {
+        // Key already exists
+        return {find_impl(key_bytes), false};
     }
     
-    // Phase 2: Lock and verify
+    // Phase 2: Collect version path (outside lock, as reader)
+    // If WRITE_BIT encountered, retry (we're a reader at this point)
+    path_container path;
+    if constexpr (fixed_len == 0) path.reserve(16);
+    
+    if (!nav_helpers<T, THREADED, Allocator, fixed_len>
+            ::collect_path(root_, key_bytes, path, hit_write)) {
+        if (hit_write) {
+            // Clean up and retry
+            for (auto* n : new_nodes) builder.deallocate_node(n);
+            return insert_impl(key, std::move(value));  // retry
+        }
+    }
+    
+    // Phase 3: Lock
     std::lock_guard lock(write_mutex_);
     
-    // Verify versions
+    // Phase 4: Verify path, redo if changed
+    bool path_changed = false;
     for (const auto& entry : path) {
         node_view_t view(entry.node);
         if (view.version() != entry.version) {
-            // Structure changed - redo under lock
-            return insert_locked(key, std::move(value), key_bytes);
+            path_changed = true;
+            break;
         }
     }
     
-    // Phase 3: Execute modification
-    if constexpr (THREADED) {
-        // Mark path with WRITE_BIT (bottom-up)
-        // Handle any READ_BIT on data slots
-        // Create new nodes, swap pointers
-        // Clear WRITE_BIT on unchanged
-    } else {
-        // Direct modification
+    if (path_changed) {
+        for (auto* n : new_nodes) builder.deallocate_node(n);
+        // Redo inside lock
+        new_nodes = insert_helpers<T, THREADED, Allocator, fixed_len>
+            ::build_insert_path(builder, root_, key_bytes, std::move(value), 0);
+        nav_helpers<T, THREADED, Allocator, fixed_len>
+            ::collect_path(root_, key_bytes, path, hit_write);
     }
     
-    return do_insert(key, std::move(value), path, kv);
+    // Collect old nodes for deletion (before swap)
+    std::vector<slot_type*> to_delete;
+    // ... identify replaced nodes
+    
+    // Phase 5: Swap and cleanup flags, update versions
+    if constexpr (THREADED) {
+        // Mark data slot, wait for any reader
+        // Mark path bottom-up with WRITE_BIT
+        // Perform swap
+        // Update versions in modified nodes
+        // Clear WRITE_BITs on unchanged portions
+    } else {
+        // Direct swap
+    }
+    
+    elem_count_.fetch_add(1, std::memory_order_relaxed);
+    
+    // Validate after modification
+    validate_trie(*this);
+    
+    // Phase 6: Unlock (implicit at end of scope)
+    }  // lock released here
+    
+    // Delete old nodes outside lock
+    for (auto* n : to_delete) {
+        builder.deallocate_node(n);
+    }
+    
+    return {iterator(this, key_bytes, value), true};
 }
 ```
 
 ---
 
-## Memory Management
+## Copy and Move Semantics
 
-### Node Allocation
-
-Nodes are allocated as contiguous `uint64_t` arrays via the provided allocator:
+### Move (Shallow)
 
 ```cpp
-uint64_t* allocate_node(size_t num_words) {
-    return std::allocator_traits<Allocator>::allocate(alloc_, num_words);
+tktrie(tktrie&& other) noexcept
+    : root_(other.root_)
+    , elem_count_(other.elem_count_.load())
+    , alloc_(std::move(other.alloc_))
+{
+    other.root_ = nullptr;
+    other.elem_count_ = 0;
 }
 
-void deallocate_node(uint64_t* node, size_t num_words) {
-    std::allocator_traits<Allocator>::deallocate(alloc_, node, num_words);
+tktrie& operator=(tktrie&& other) noexcept {
+    if (this != &other) {
+        delete_tree(root_);
+        root_ = other.root_;
+        elem_count_ = other.elem_count_.load();
+        alloc_ = std::move(other.alloc_);
+        other.root_ = nullptr;
+        other.elem_count_ = 0;
+    }
+    return *this;
 }
 ```
 
-### Value Storage
+### Copy (Deep)
 
-- Small, trivially copyable values (≤8 bytes): Embedded in dataptr
-- Larger values: Allocated separately via allocator (rebound to T)
-- dataptr owns the value and frees on destruction/replacement
+```cpp
+tktrie(const tktrie& other)
+    : alloc_(other.alloc_)
+{
+    root_ = deep_copy_node(other.root_);
+    elem_count_ = other.elem_count_.load();
+}
 
-### Threaded Cleanup
+tktrie& operator=(const tktrie& other) {
+    if (this != &other) {
+        tktrie tmp(other);  // copy
+        *this = std::move(tmp);  // move
+    }
+    return *this;
+}
 
-When THREADED=true, nodes are freed immediately after swap because:
-1. Writer marks data slot first, spins on READ_BIT
-2. Writer marks path bottom-up with WRITE_BIT
-3. Any in-flight reader either:
-   - Already set READ_BIT on data → writer waits for copy to complete
-   - Tries to set READ_BIT → sees WRITE_BIT → retries from root
-4. After swap and clearing bits, no reader can have reference to old node
+slot_type* deep_copy_node(slot_type* src) {
+    if (!src) return nullptr;
+    
+    node_view_t view(src);
+    size_t size = view.size();
+    
+    slot_type* dst = alloc_.allocate(size);
+    
+    // Copy header and non-pointer data
+    // Deep copy dataptr (allocate new Value copies)
+    // Recursively deep copy child nodes
+    // ...
+    
+    return dst;
+}
+```
 
 ---
 
-## Open Design Decisions
+## Debug Facilities
 
-### 1. Copy Semantics for Trie
+### pretty_print
 
-Options:
-- Delete copy constructor/assignment (move-only)
-- Deep copy all nodes
-- Copy-on-write with shared ownership
+```cpp
+template <typename Key, typename T, bool THREADED, typename Allocator>
+void trie_debug<Key, T, THREADED, Allocator>::pretty_print(
+    const trie_type& trie, std::ostream& os)
+{
+    os << "tktrie size=" << trie.size() << "\n";
+    if (trie.root_) {
+        pretty_print_node(trie.root_, os, 0, "");
+    }
+}
 
-**Recommendation:** Start with delete (move-only), add deep copy if needed.
+void pretty_print_node(slot_type* node, std::ostream& os,
+                       int depth, const std::string& prefix)
+{
+    node_view_t view(node);
+    
+    std::string indent(depth * 2, ' ');
+    
+    os << indent << prefix << "NODE["
+       << " flags=0x" << std::hex << view.flags() << std::dec
+       << " ver=" << view.version()
+       << " size=" << view.size()
+       << " ]\n";
+    
+    if (view.has_eos()) {
+        os << indent << "  EOS: (has data)\n";
+    }
+    
+    if (view.has_skip()) {
+        os << indent << "  SKIP[" << view.skip_length() << "]: \"" 
+           << view.skip_chars() << "\"\n";
+        if (view.has_skip_eos()) {
+            os << indent << "  SKIP_EOS: (has data)\n";
+        }
+    }
+    
+    if (view.has_list()) {
+        small_list* lst = view.list();
+        os << indent << "  LIST[" << lst->count() << "]: ";
+        for (int i = 0; i < lst->count(); ++i) {
+            char c = lst->char_at(i);
+            if (std::isprint(c)) os << "'" << c << "' ";
+            else os << "0x" << std::hex << (int)(unsigned char)c << std::dec << " ";
+        }
+        os << "\n";
+        
+        slot_type* children = view.child_ptrs();
+        for (int i = 0; i < lst->count(); ++i) {
+            char c = lst->char_at(i);
+            std::string child_prefix;
+            if (std::isprint(c)) child_prefix = std::string("'") + c + "' -> ";
+            else child_prefix = "0x" + to_hex(c) + " -> ";
+            
+            uint64_t ptr = load_slot(&children[i]) & PTR_MASK;
+            if (ptr) {
+                pretty_print_node(reinterpret_cast<slot_type*>(ptr), os,
+                                  depth + 1, child_prefix);
+            }
+        }
+    }
+    
+    if (view.has_pop()) {
+        popcount_bitmap* bmp = view.bitmap();
+        os << indent << "  POP[" << bmp->count() << " children]\n";
+        // Similar child iteration with bitmap
+    }
+}
+```
 
-### 2. Exception Safety
+### validate
 
-What if allocator throws during insert?
-- Strong guarantee (no change on failure) requires careful node construction before swap
-- Basic guarantee (valid state) is easier
+```cpp
+template <typename Key, typename T, bool THREADED, typename Allocator>
+void trie_debug<Key, T, THREADED, Allocator>::validate(const trie_type& trie) {
+    if constexpr (!k_validate) return;
+    
+    if (trie.root_) {
+        validate_node(trie.root_, 0, trie_type::fixed_len);
+    }
+}
 
-**Recommendation:** Strong guarantee for single-element operations.
+void validate_node(slot_type* node, size_t depth, size_t fixed_len) {
+    node_view_t view(node);
+    uint64_t flags = view.flags();
+    
+    // Invariant 1: LIST and POP mutually exclusive
+    KTRIE_DEBUG_ASSERT(!((flags & FLAG_LIST) && (flags & FLAG_POP)));
+    
+    // Invariant 2: SKIP_EOS requires SKIP
+    if (flags & FLAG_SKIP_EOS) {
+        KTRIE_DEBUG_ASSERT(flags & FLAG_SKIP);
+    }
+    
+    // Invariant 3: SKIP length > 0
+    if (flags & FLAG_SKIP) {
+        KTRIE_DEBUG_ASSERT(view.skip_length() > 0);
+    }
+    
+    // Invariant 4: LIST count 1 requires SKIP
+    if ((flags & FLAG_LIST) && view.list()->count() == 1) {
+        KTRIE_DEBUG_ASSERT(flags & FLAG_SKIP);
+    }
+    
+    // Invariant 6: fixed_len EOS/SKIP_EOS restrictions
+    if (fixed_len > 0) {
+        if (depth < fixed_len) {
+            // Internal node - no EOS or SKIP_EOS
+            KTRIE_DEBUG_ASSERT(!(flags & FLAG_EOS));
+            KTRIE_DEBUG_ASSERT(!(flags & FLAG_SKIP_EOS));
+        } else {
+            // Leaf - EOS and SKIP_EOS mutually exclusive
+            KTRIE_DEBUG_ASSERT(!((flags & FLAG_EOS) && (flags & FLAG_SKIP_EOS)));
+        }
+    }
+    
+    // Recurse to children
+    if (flags & FLAG_LIST) {
+        slot_type* children = view.child_ptrs();
+        int count = view.list()->count();
+        for (int i = 0; i < count; ++i) {
+            uint64_t ptr = load_slot(&children[i]) & PTR_MASK;
+            if (ptr) {
+                validate_node(reinterpret_cast<slot_type*>(ptr), depth + 1, fixed_len);
+            }
+        }
+    } else if (flags & FLAG_POP) {
+        // Similar for POP
+    }
+}
+```
 
-### 3. Iteration
+---
 
-Current design doesn't support iteration over all elements. Would require:
-- Maintaining parent pointers, or
-- Stack-based traversal
-- Thread-safety complications for iteration
+## Exception Safety
 
-**Recommendation:** Defer full iteration support; focus on point queries first.
+**Strong guarantee** for single-element operations:
 
-### 4. Prefix Operations
-
-Natural extensions:
-- `prefix_match(key)` - find longest prefix in trie
-- `prefix_range(prefix)` - iterate all keys with prefix
-
-**Recommendation:** Add after core functionality is stable.
+1. All allocations happen before any modifications (Phase 1: build new path)
+2. New path is built completely before swap
+3. If allocation fails, no state change occurs
+4. Swap is a pointer exchange (cannot fail)
+5. Deallocation of old nodes happens after successful swap (Phase 6)
 
 ---
 
@@ -1145,58 +1567,33 @@ Natural extensions:
 
 ### Unit Tests
 
-1. **Small list SWAR operations**
-   - offset() finds correct position
-   - insert_pos() computes correct position
-   - Boundary cases (empty, full, duplicate)
-
-2. **PopCount bitmap operations**
-   - find() and set() correctness
-   - Transition from list to bitmap
-
-3. **Node layouts**
-   - Each of 13 valid layouts parses correctly
-   - Invalid flag combinations rejected
-
-4. **dataptr variants**
-   - Embedded small types
-   - Pointer for large types
-   - THREADED read/write bit protocol
+1. SWAR operations (small_list, popcount_bitmap)
+2. Node layouts (all 13 valid configurations)
+3. dataptr variants (embedded, pointer, threaded)
+4. Key traits conversions
 
 ### Integration Tests
 
-1. **Basic operations**
-   - Insert, find, erase on various key types
-   - String keys, integer keys
+1. Basic CRUD operations
+2. Edge cases (empty key, very long keys, prefix sharing)
+3. fixed_len specialization
+4. Concurrency stress tests (THREADED=true)
 
-2. **Edge cases**
-   - Empty key
-   - Single character key
-   - Very long keys (skip compression)
-   - Keys sharing long prefixes
+### Debug Tests
 
-3. **Concurrency (THREADED=true)**
-   - Concurrent readers
-   - Reader + writer
-   - Multiple writers (serialized by mutex)
-   - Stress test with random operations
-
-### Benchmarks
-
-1. Insert throughput (sequential keys, random keys)
-2. Lookup latency (existing keys, missing keys)
-3. Memory usage vs std::map / std::unordered_map
-4. Concurrent read scaling
+1. pretty_print output verification
+2. validate catches all invariant violations
+3. Validate called after every write operation (when KTRIE_VALIDATE=1)
 
 ---
 
 ## Future Enhancements
 
-1. **Persistent/memory-mapped mode** - Node arrays are allocation-friendly; could be memory-mapped
-2. **Compression** - Store common skip patterns in shared dictionary
-3. **Range queries** - Leverage sorted structure for range iteration
-4. **Bulk loading** - Optimized construction from sorted input
-5. **Serialization** - Dump/load trie to/from file
+1. Memory-mapped mode
+2. Compression for common patterns
+3. Range queries / full iteration
+4. Bulk loading optimization
+5. Serialization
 
 ---
 
@@ -1205,11 +1602,8 @@ Natural extensions:
 1. Bit Twiddling Hacks - Zero byte detection
    https://graphics.stanford.edu/~seander/bithacks.html
 
-2. SWAR byte comparison techniques
-   https://lemire.me/blog/ (various posts on SIMD-within-a-register)
+2. SWAR techniques (Daniel Lemire's blog)
 
-3. Optimistic concurrency control
-   https://en.wikipedia.org/wiki/Optimistic_concurrency_control
+3. Optimistic concurrency control (Wikipedia)
 
-4. Epoch-based reclamation
-   https://www.cs.toronto.edu/~tomhart/papers/tomhart_thesis.pdf
+4. Epoch-based reclamation (Hart thesis)
