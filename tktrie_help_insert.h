@@ -599,12 +599,31 @@ private:
         bool has_eos = view.has_eos();
         bool has_skip = view.has_skip();
         bool has_skip_eos = view.has_skip_eos();
+        bool has_children = !children.empty();
         
         T eos_val, skip_eos_val;
         if (has_eos) view.eos_data()->try_read(eos_val);
         if (has_skip_eos) view.skip_eos_data()->try_read(skip_eos_val);
         std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
         
+        // Handle nodes without children first
+        if (!has_children) {
+            if (has_eos && has_skip && has_skip_eos) {
+                // This is unusual - skip with both eos and skip_eos but no children
+                // Just build skip_eos (the skip_eos takes precedence)
+                return builder.build_skip_eos(skip, std::move(skip_eos_val));
+            } else if (has_skip && has_skip_eos) {
+                return builder.build_skip_eos(skip, std::move(skip_eos_val));
+            } else if (has_eos) {
+                return builder.build_eos(std::move(eos_val));
+            } else {
+                // No data and no children - shouldn't happen in valid trie
+                KTRIE_DEBUG_ASSERT(false && "rebuild_node: no data and no children");
+                return builder.build_eos(T{});
+            }
+        }
+        
+        // Has children - use list or pop
         if (has_eos && has_skip && has_skip_eos) {
             if (is_list) {
                 return builder.build_eos_skip_eos_list(std::move(eos_val), skip, 

@@ -73,13 +73,18 @@ struct trie_helpers {
 
     /**
      * Extract child pointers from a node as vector
+     * For THREADED mode, masks out control bits
      */
     static std::vector<uint64_t> extract_children(node_view_t& view) {
         std::vector<uint64_t> children;
         int count = view.child_count();
         children.reserve(count);
         for (int i = 0; i < count; ++i) {
-            children.push_back(view.get_child_ptr(i));
+            uint64_t ptr = view.get_child_ptr(i);
+            if constexpr (THREADED) {
+                ptr &= PTR_MASK;
+            }
+            children.push_back(ptr);
         }
         return children;
     }

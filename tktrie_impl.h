@@ -66,14 +66,35 @@ private:
 
     // Mutex type based on THREADED
     using mutex_type = std::conditional_t<THREADED, std::mutex, empty_mutex>;
+    
+    // Root pointer - atomic in THREADED mode for safe publication
+    using root_ptr_type = std::conditional_t<THREADED, std::atomic<slot_type*>, slot_type*>;
 
-    slot_type* root_;
+    root_ptr_type root_;
     std::conditional_t<THREADED, std::atomic<size_type>, size_type> elem_count_{0};
     mutable mutex_type write_mutex_;
     Allocator alloc_;
     node_builder_t builder_;
 
     friend class tktrie_iterator<Key, T, THREADED, Allocator>;
+
+    // Helper to safely read root pointer
+    slot_type* get_root() const noexcept {
+        if constexpr (THREADED) {
+            return root_.load(std::memory_order_acquire);
+        } else {
+            return root_;
+        }
+    }
+    
+    // Helper to safely write root pointer
+    void set_root(slot_type* new_root) noexcept {
+        if constexpr (THREADED) {
+            root_.store(new_root, std::memory_order_release);
+        } else {
+            root_ = new_root;
+        }
+    }
 
 public:
     // =========================================================================
@@ -97,10 +118,11 @@ public:
     tktrie(const tktrie& other)
         : alloc_(other.alloc_)
         , builder_(other.alloc_) {
-        if (other.root_) {
-            root_ = builder_.deep_copy(other.root_);
+        slot_type* other_root = const_cast<tktrie&>(other).get_root();
+        if (other_root) {
+            set_root(builder_.deep_copy(other_root));
         } else {
-            root_ = nullptr;
+            set_root(nullptr);
         }
         if constexpr (THREADED) {
             elem_count_.store(other.elem_count_.load(std::memory_order_relaxed),
@@ -121,9 +143,9 @@ public:
 
     // Move constructor
     tktrie(tktrie&& other) noexcept
-        : root_(other.root_)
-        , alloc_(std::move(other.alloc_))
+        : alloc_(std::move(other.alloc_))
         , builder_(alloc_) {
+        set_root(other.get_root());
         if constexpr (THREADED) {
             elem_count_.store(other.elem_count_.load(std::memory_order_relaxed),
                              std::memory_order_relaxed);
@@ -132,14 +154,14 @@ public:
             elem_count_ = other.elem_count_;
             other.elem_count_ = 0;
         }
-        other.root_ = nullptr;
+        other.set_root(nullptr);
     }
 
     // Move assignment
     tktrie& operator=(tktrie&& other) noexcept {
         if (this != &other) {
             clear();
-            root_ = other.root_;
+            set_root(other.get_root());
             alloc_ = std::move(other.alloc_);
             builder_ = node_builder_t(alloc_);
             if constexpr (THREADED) {
@@ -150,14 +172,16 @@ public:
                 elem_count_ = other.elem_count_;
                 other.elem_count_ = 0;
             }
-            other.root_ = nullptr;
+            other.set_root(nullptr);
         }
         return *this;
     }
 
     // Swap
     void swap(tktrie& other) noexcept {
-        std::swap(root_, other.root_);
+        slot_type* tmp_root = get_root();
+        set_root(other.get_root());
+        other.set_root(tmp_root);
         std::swap(alloc_, other.alloc_);
         if constexpr (THREADED) {
             size_type tmp = elem_count_.load(std::memory_order_relaxed);
@@ -201,12 +225,12 @@ public:
         
         if constexpr (THREADED) {
             while (true) {
-                bool result = nav_t::contains(root_, key_bytes, hit_write);
+                bool result = nav_t::contains(get_root(), key_bytes, hit_write);
                 if (!hit_write) return result;
                 cpu_pause();
             }
         } else {
-            return nav_t::contains(root_, key_bytes, hit_write);
+            return nav_t::contains(get_root(), key_bytes, hit_write);
         }
     }
 
@@ -223,7 +247,7 @@ public:
         
         if constexpr (THREADED) {
             while (true) {
-                bool found = nav_t::read(root_, key_bytes, value, hit_write);
+                bool found = nav_t::read(get_root(), key_bytes, value, hit_write);
                 if (!hit_write) {
                     if (found) {
                         return iterator(this, key_bytes, value);
@@ -233,7 +257,7 @@ public:
                 cpu_pause();
             }
         } else {
-            bool found = nav_t::read(root_, key_bytes, value, hit_write);
+            bool found = nav_t::read(get_root(), key_bytes, value, hit_write);
             if (found) {
                 return iterator(this, key_bytes, value);
             }
@@ -271,8 +295,8 @@ public:
             std::lock_guard<mutex_type> lock(write_mutex_);
         }
         
-        delete_tree(root_);
-        root_ = nullptr;
+        delete_tree(get_root());
+        set_root(nullptr);
         
         if constexpr (THREADED) {
             elem_count_.store(0, std::memory_order_relaxed);
@@ -286,7 +310,7 @@ public:
     // =========================================================================
 
     iterator begin() const {
-        if (!root_) return end();
+        if (!get_root()) return end();
         
         std::string key;
         bool hit_write = false;
@@ -294,7 +318,7 @@ public:
         if constexpr (THREADED) {
             while (true) {
                 key.clear();
-                slot_type* data_slot = nav_t::find_first_leaf(root_, key, hit_write);
+                slot_type* data_slot = nav_t::find_first_leaf(get_root(), key, hit_write);
                 if (hit_write) {
                     cpu_pause();
                     continue;
@@ -310,7 +334,7 @@ public:
                 return iterator(this, key, value);
             }
         } else {
-            slot_type* data_slot = nav_t::find_first_leaf(root_, key, hit_write);
+            slot_type* data_slot = nav_t::find_first_leaf(get_root(), key, hit_write);
             if (!data_slot) return end();
             
             dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
@@ -337,8 +361,8 @@ public:
     void pretty_print(std::ostream& os = std::cout) const {
         os << "tktrie<" << (THREADED ? "THREADED" : "SINGLE") 
            << ", fixed_len=" << fixed_len << "> size=" << size() << "\n";
-        if (root_) {
-            debug_t::pretty_print_node(root_, os, 0, "", 0);
+        if (get_root()) {
+            debug_t::pretty_print_node(get_root(), os, 0, "", 0);
         } else {
             os << "  (empty)\n";
         }
@@ -346,7 +370,7 @@ public:
 
     void validate() const {
         if constexpr (k_validate) {
-            std::string err = debug_t::validate_node(root_, 0);
+            std::string err = debug_t::validate_node(get_root(), 0);
             KTRIE_DEBUG_ASSERT(err.empty());
         }
     }
@@ -421,7 +445,7 @@ private:
     std::pair<iterator, bool> insert_single(const Key& key, 
                                              const std::string& key_bytes,
                                              U&& value) {
-        auto result = insert_t::build_insert_path(builder_, root_, key_bytes, 
+        auto result = insert_t::build_insert_path(builder_, get_root(), key_bytes, 
                                                    std::forward<U>(value));
 
         if (result.already_exists) {
@@ -434,7 +458,7 @@ private:
 
         // Update root
         if (result.new_root) {
-            root_ = result.new_root;
+            set_root(result.new_root);
         }
 
         // Delete old nodes
@@ -447,7 +471,7 @@ private:
 
         ++elem_count_;
 
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(root_);
+        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
         T val;
         if constexpr (std::is_rvalue_reference_v<U&&>) {
@@ -462,19 +486,13 @@ private:
     std::pair<iterator, bool> insert_threaded(const Key& key,
                                                const std::string& key_bytes,
                                                U&& value) {
-        // Phase 1: Build new path outside lock (optimistic)
-        auto result = insert_t::build_insert_path(builder_, root_, key_bytes,
+        // For now, fully serialize all writes
+        // TODO: Implement proper optimistic concurrency with safe memory reclamation
+        std::lock_guard<mutex_type> lock(write_mutex_);
+        
+        auto result = insert_t::build_insert_path(builder_, get_root(), key_bytes,
                                                    std::forward<U>(value));
 
-        if (result.hit_write) {
-            // Clean up and retry
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            cpu_pause();
-            return insert_threaded(key, key_bytes, std::forward<U>(value));
-        }
-
         if (result.already_exists) {
             for (auto* n : result.new_nodes) {
                 builder_.deallocate_node(n);
@@ -482,49 +500,12 @@ private:
             return {find(key), false};
         }
 
-        // Phase 2: Collect path versions
-        path_container path;
-        if constexpr (fixed_len == 0) {
-            path.reserve(16);
-        }
-        bool hit_write = false;
-        nav_t::collect_path(root_, key_bytes, path, hit_write);
-
-        if (hit_write) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            cpu_pause();
-            return insert_threaded(key, key_bytes, std::forward<U>(value));
-        }
-
-        // Phase 3: Lock
-        std::lock_guard<mutex_type> lock(write_mutex_);
-
-        // Phase 4: Verify path
-        size_t path_size = (fixed_len > 0) ? fixed_len + 1 : path.size();
-        if (!nav_t::verify_path(path, path_size)) {
-            // Path changed - redo under lock
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            result = insert_t::build_insert_path(builder_, root_, key_bytes,
-                                                  std::forward<U>(value));
-        }
-
-        if (result.already_exists) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            return {find(key), false};
-        }
-
-        // Phase 5: Update root and versions
+        // Update root
         if (result.new_root) {
-            root_ = result.new_root;
+            set_root(result.new_root);
         }
 
-        // Increment versions on modified path
+        // Increment versions on new nodes
         for (auto* n : result.new_nodes) {
             if (n) {
                 node_view_t view(n);
@@ -534,14 +515,14 @@ private:
 
         elem_count_.fetch_add(1, std::memory_order_relaxed);
 
-        // Phase 6: Cleanup (after lock release would be ideal, but ok here)
+        // Cleanup old nodes
         for (auto* n : result.old_nodes) {
-            if (n != result.new_root) {
+            if (n && n != result.new_root) {
                 builder_.deallocate_node(n);
             }
         }
 
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(root_);
+        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
         T val;
         if constexpr (std::is_rvalue_reference_v<U&&>) {
@@ -568,7 +549,7 @@ private:
     }
 
     bool erase_single(const std::string& key_bytes) {
-        auto result = remove_t::build_remove_path(builder_, root_, key_bytes);
+        auto result = remove_t::build_remove_path(builder_, get_root(), key_bytes);
 
         if (!result.found) {
             return false;
@@ -576,9 +557,9 @@ private:
 
         // Update root
         if (result.root_deleted) {
-            root_ = nullptr;
+            set_root(nullptr);
         } else if (result.new_root) {
-            root_ = result.new_root;
+            set_root(result.new_root);
         }
 
         // Delete old nodes
@@ -590,54 +571,17 @@ private:
 
         --elem_count_;
 
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(root_);
+        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
         return true;
     }
 
     bool erase_threaded(const std::string& key_bytes) {
-        // Phase 1: Build removal path outside lock
-        auto result = remove_t::build_remove_path(builder_, root_, key_bytes);
-
-        if (result.hit_write) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            cpu_pause();
-            return erase_threaded(key_bytes);
-        }
-
-        if (!result.found) {
-            return false;
-        }
-
-        // Phase 2: Collect path versions
-        path_container path;
-        if constexpr (fixed_len == 0) {
-            path.reserve(16);
-        }
-        bool hit_write = false;
-        nav_t::collect_path(root_, key_bytes, path, hit_write);
-
-        if (hit_write) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            cpu_pause();
-            return erase_threaded(key_bytes);
-        }
-
-        // Phase 3: Lock
+        // For now, fully serialize all writes
+        // TODO: Implement proper optimistic concurrency with safe memory reclamation
         std::lock_guard<mutex_type> lock(write_mutex_);
-
-        // Phase 4: Verify path
-        size_t path_size = (fixed_len > 0) ? fixed_len + 1 : path.size();
-        if (!nav_t::verify_path(path, path_size)) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
-            }
-            result = remove_t::build_remove_path(builder_, root_, key_bytes);
-        }
+        
+        auto result = remove_t::build_remove_path(builder_, get_root(), key_bytes);
 
         if (!result.found) {
             for (auto* n : result.new_nodes) {
@@ -646,23 +590,23 @@ private:
             return false;
         }
 
-        // Phase 5: Update root
+        // Update root
         if (result.root_deleted) {
-            root_ = nullptr;
+            set_root(nullptr);
         } else if (result.new_root) {
-            root_ = result.new_root;
+            set_root(result.new_root);
         }
 
         elem_count_.fetch_sub(1, std::memory_order_relaxed);
 
-        // Phase 6: Cleanup
+        // Cleanup old nodes
         for (auto* n : result.old_nodes) {
-            if (n != result.new_root) {
+            if (n && n != result.new_root) {
                 builder_.deallocate_node(n);
             }
         }
 
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(root_);
+        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
         return true;
     }
