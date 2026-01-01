@@ -11,15 +11,18 @@
 #include <vector>
 
 #include "tktrie_defines.h"
-#include "tktrie_traits.h"
 #include "tktrie_dataptr.h"
 #include "tktrie_node.h"
 #include "tktrie_help_common.h"
 #include "tktrie_help_nav.h"
 #include "tktrie_help_insert.h"
 #include "tktrie_help_remove.h"
-#include "tktrie_iterator.h"
-#include "tktrie_debug.h"
+
+// Forward declarations - traits and iterator defined in tktrie.h
+namespace gteitelbaum {
+template <typename Key> struct tktrie_traits;
+template <typename Key, typename T, bool THREADED, typename Allocator> class tktrie_iterator;
+}
 
 namespace gteitelbaum {
 
