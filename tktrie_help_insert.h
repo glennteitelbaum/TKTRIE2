@@ -10,27 +10,18 @@
 namespace gteitelbaum {
 
 /**
- * Path step for WRITE_BIT setting
- */
-template <bool THREADED>
-struct path_step {
-    slot_type_t<THREADED>* node;
-    unsigned char child_char;
-};
-
-/**
  * Insert operation results
  */
 template <bool THREADED>
 struct insert_result {
-    slot_type_t<THREADED>* new_root = nullptr;     // new root if root changed
-    slot_type_t<THREADED>* expected_root = nullptr; // root we built against (for verification)
-    std::vector<slot_type_t<THREADED>*> new_nodes;  // newly allocated nodes
-    std::vector<slot_type_t<THREADED>*> old_nodes;  // nodes to delete
-    std::vector<path_step<THREADED>> path;          // path from root to leaf (for WRITE_BIT)
-    bool already_exists = false;                    // key already existed
-    bool hit_write = false;                         // encountered WRITE_BIT
-    bool hit_read = false;                          // encountered READ_BIT (another writer)
+    slot_type_t<THREADED>* new_root = nullptr;
+    slot_type_t<THREADED>* expected_root = nullptr;
+    std::vector<slot_type_t<THREADED>*> new_nodes;
+    std::vector<slot_type_t<THREADED>*> old_nodes;
+    std::vector<path_step<THREADED>> path;
+    bool already_exists = false;
+    bool hit_write = false;
+    bool hit_read = false;
 };
 
 /**
@@ -44,7 +35,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using node_builder_t = typename base::node_builder_t;
     using dataptr_t = typename base::dataptr_t;
     using result_t = insert_result<THREADED>;
-    using path_step_t = path_step<THREADED>;
+    using path_step_t = typename base::path_step_t;
 
     /**
      * Build new path for insertion
@@ -522,7 +513,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         chars.insert(chars.begin() + pos, c);
         
         // Rebuild parent
-        slot_type* new_parent = rebuild_node(builder, view, is_list, lst, bmp, children);
+        slot_type* new_parent = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_parent);
         result.new_root = new_parent;
         result.old_nodes.push_back(node);
@@ -562,128 +553,13 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         }
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = rebuild_node(builder, view, is_list, lst, bmp, children);
+        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
         
         return result;
-    }
-
-    template <typename U>
-    static result_t& set_leaf_data(node_builder_t& builder,
-                                    slot_type* node,
-                                    unsigned char c,
-                                    U&& value,
-                                    size_t depth,
-                                    result_t& result) {
-        // Clone node with dataptr set for character c
-        node_view_t view(node);
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-        
-        int idx = -1;
-        if (view.has_list()) {
-            idx = view.get_list().offset(c) - 1;
-        } else if (view.has_pop()) {
-            view.get_bitmap().find(c, &idx);
-        }
-        
-        // The child slot holds a dataptr - we need to set it
-        // This requires cloning the node and setting the value
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = rebuild_node(builder, view, is_list, lst, bmp, children);
-        
-        // Now set the data in the new node
-        node_view_t new_view(new_node);
-        dataptr_t* dp = reinterpret_cast<dataptr_t*>(&new_view.child_ptrs()[idx]);
-        new (dp) dataptr_t();
-        dp->begin_write();
-        dp->set(std::forward<U>(value));
-        dp->end_write();
-        
-        result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
-        result.old_nodes.push_back(node);
-        
-        return result;
-    }
-
-    static slot_type* rebuild_node(node_builder_t& builder,
-                                    node_view_t& view,
-                                    bool is_list,
-                                    small_list& lst,
-                                    popcount_bitmap& bmp,
-                                    const std::vector<uint64_t>& children) {
-        bool has_eos = view.has_eos();
-        bool has_skip = view.has_skip();
-        bool has_skip_eos = view.has_skip_eos();
-        bool has_children = !children.empty();
-        
-        T eos_val, skip_eos_val;
-        if (has_eos) view.eos_data()->try_read(eos_val);
-        if (has_skip_eos) view.skip_eos_data()->try_read(skip_eos_val);
-        std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
-        
-        // Handle nodes without children first
-        if (!has_children) {
-            if (has_eos && has_skip && has_skip_eos) {
-                // This is unusual - skip with both eos and skip_eos but no children
-                // Just build skip_eos (the skip_eos takes precedence)
-                return builder.build_skip_eos(skip, std::move(skip_eos_val));
-            } else if (has_skip && has_skip_eos) {
-                return builder.build_skip_eos(skip, std::move(skip_eos_val));
-            } else if (has_eos) {
-                return builder.build_eos(std::move(eos_val));
-            } else {
-                // No data and no children - shouldn't happen in valid trie
-                KTRIE_DEBUG_ASSERT(false && "rebuild_node: no data and no children");
-                return builder.build_eos(T{});
-            }
-        }
-        
-        // Has children - use list or pop
-        if (has_eos && has_skip && has_skip_eos) {
-            if (is_list) {
-                return builder.build_eos_skip_eos_list(std::move(eos_val), skip, 
-                                                       std::move(skip_eos_val), lst, children);
-            } else {
-                return builder.build_eos_skip_eos_pop(std::move(eos_val), skip,
-                                                      std::move(skip_eos_val), bmp, children);
-            }
-        } else if (has_eos && has_skip) {
-            // EOS + SKIP without SKIP_EOS - shouldn't have children after skip
-            if (is_list) {
-                return builder.build_skip_list(skip, lst, children);
-            } else {
-                return builder.build_skip_pop(skip, bmp, children);
-            }
-        } else if (has_skip && has_skip_eos) {
-            if (is_list) {
-                return builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
-            } else {
-                return builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-            }
-        } else if (has_skip) {
-            if (is_list) {
-                return builder.build_skip_list(skip, lst, children);
-            } else {
-                return builder.build_skip_pop(skip, bmp, children);
-            }
-        } else if (has_eos) {
-            if (is_list) {
-                return builder.build_eos_list(std::move(eos_val), lst, children);
-            } else {
-                return builder.build_eos_pop(std::move(eos_val), bmp, children);
-            }
-        } else {
-            if (is_list) {
-                return builder.build_list(lst, children);
-            } else {
-                return builder.build_pop(bmp, children);
-            }
-        }
     }
 };
 

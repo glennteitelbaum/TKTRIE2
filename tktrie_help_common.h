@@ -23,6 +23,15 @@ struct path_entry {
 };
 
 /**
+ * Path step for WRITE_BIT setting during insert/remove
+ */
+template <bool THREADED>
+struct path_step {
+    slot_type_t<THREADED>* node;
+    unsigned char child_char;
+};
+
+/**
  * Common helper functions for trie operations
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -32,6 +41,7 @@ struct trie_helpers {
     using node_builder_t = node_builder<T, THREADED, Allocator, FIXED_LEN>;
     using dataptr_t = dataptr<T, THREADED, Allocator>;
     using path_entry_t = path_entry<THREADED>;
+    using path_step_t = path_step<THREADED>;
 
     /**
      * Spin wait helper
@@ -135,6 +145,16 @@ struct trie_helpers {
     }
 
     /**
+     * Find index of character in chars vector
+     */
+    static int find_char_index(const std::vector<unsigned char>& chars, unsigned char c) {
+        for (size_t i = 0; i < chars.size(); ++i) {
+            if (chars[i] == c) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    /**
      * Insert a character into child structure, returns new index
      */
     static int insert_child_char(small_list& lst, popcount_bitmap& bmp, 
@@ -153,6 +173,49 @@ struct trie_helpers {
         } else {
             return bmp.set(c);
         }
+    }
+
+    /**
+     * Rebuild node with given children - shared by insert and remove helpers
+     */
+    static slot_type* rebuild_node(node_builder_t& builder,
+                                    node_view_t& view,
+                                    bool is_list,
+                                    small_list& lst,
+                                    popcount_bitmap& bmp,
+                                    const std::vector<uint64_t>& children) {
+        bool has_eos = view.has_eos();
+        bool has_skip = view.has_skip();
+        bool has_skip_eos = view.has_skip_eos();
+        
+        T eos_val, skip_eos_val;
+        if (has_eos) view.eos_data()->try_read(eos_val);
+        if (has_skip_eos) view.skip_eos_data()->try_read(skip_eos_val);
+        std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
+        
+        if (children.empty()) {
+            if (has_eos && has_skip && has_skip_eos) 
+                return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
+            if (has_eos) return builder.build_eos(std::move(eos_val));
+            if (has_skip && has_skip_eos) return builder.build_skip_eos(skip, std::move(skip_eos_val));
+            return builder.build_empty_root();
+        }
+        
+        if (has_eos && has_skip && has_skip_eos) {
+            return is_list ? builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children)
+                           : builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
+        } else if (has_eos && has_skip) {
+            return is_list ? builder.build_skip_list(skip, lst, children) : builder.build_skip_pop(skip, bmp, children);
+        } else if (has_skip && has_skip_eos) {
+            return is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
+                           : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
+        } else if (has_skip) {
+            return is_list ? builder.build_skip_list(skip, lst, children) : builder.build_skip_pop(skip, bmp, children);
+        } else if (has_eos) {
+            return is_list ? builder.build_eos_list(std::move(eos_val), lst, children)
+                           : builder.build_eos_pop(std::move(eos_val), bmp, children);
+        }
+        return is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
     }
 };
 

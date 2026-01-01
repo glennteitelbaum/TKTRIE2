@@ -9,18 +9,12 @@
 namespace gteitelbaum {
 
 template <bool THREADED>
-struct remove_path_step {
-    slot_type_t<THREADED>* node;
-    unsigned char child_char;
-};
-
-template <bool THREADED>
 struct remove_result {
     slot_type_t<THREADED>* new_root = nullptr;
     slot_type_t<THREADED>* expected_root = nullptr;
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;
-    std::vector<remove_path_step<THREADED>> path;
+    std::vector<path_step<THREADED>> path;
     bool found = false;
     bool hit_write = false;
     bool root_deleted = false;
@@ -34,7 +28,7 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using node_builder_t = typename base::node_builder_t;
     using dataptr_t = typename base::dataptr_t;
     using result_t = remove_result<THREADED>;
-    using path_step_t = remove_path_step<THREADED>;
+    using path_step_t = typename base::path_step_t;
 
     static result_t build_remove_path(node_builder_t& builder, slot_type* root,
                                        std::string_view key, size_t depth = 0) {
@@ -202,18 +196,18 @@ private:
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        int idx = -1;
-        for (size_t i = 0; i < chars.size(); ++i) if (chars[i] == c) { idx = static_cast<int>(i); break; }
+        int idx = base::find_char_index(chars, c);
+        
         if (idx >= 0) { children.erase(children.begin() + idx); chars.erase(chars.begin() + idx); }
         
         bool has_eos = view.has_eos(), has_skip_eos = view.has_skip_eos();
-        (void)view.has_skip();  // Used indirectly via rebuild_with_children
+        (void)view.has_skip();  // Used indirectly via base::rebuild_node
         if (children.empty() && !has_eos && !has_skip_eos) {
             result.root_deleted = true; result.old_nodes.push_back(node); return result;
         }
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = rebuild_with_children(builder, view, is_list, lst, bmp, children);
+        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
@@ -231,12 +225,12 @@ private:
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        int idx = -1;
-        for (size_t i = 0; i < chars.size(); ++i) if (chars[i] == c) { idx = static_cast<int>(i); break; }
+        int idx = base::find_char_index(chars, c);
+        
         if (idx >= 0) children[idx] = reinterpret_cast<uint64_t>(new_child);
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = rebuild_with_children(builder, view, is_list, lst, bmp, children);
+        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
@@ -250,48 +244,18 @@ private:
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        int idx = -1;
-        for (size_t i = 0; i < chars.size(); ++i) if (chars[i] == c) { idx = static_cast<int>(i); break; }
+        int idx = base::find_char_index(chars, c);
+        
         if (idx >= 0) { children.erase(children.begin() + idx); chars.erase(chars.begin() + idx); }
         
         if (children.empty()) { result.root_deleted = true; result.old_nodes.push_back(node); return result; }
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = rebuild_with_children(builder, view, is_list, lst, bmp, children);
+        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
         return result;
-    }
-
-    static slot_type* rebuild_with_children(node_builder_t& builder, node_view_t& view,
-                                             bool is_list, small_list& lst, popcount_bitmap& bmp,
-                                             const std::vector<uint64_t>& children) {
-        bool has_eos = view.has_eos(), has_skip = view.has_skip(), has_skip_eos = view.has_skip_eos();
-        T eos_val, skip_eos_val;
-        if (has_eos) view.eos_data()->try_read(eos_val);
-        if (has_skip_eos) view.skip_eos_data()->try_read(skip_eos_val);
-        std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
-        
-        if (children.empty()) {
-            if (has_eos && has_skip && has_skip_eos) return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
-            if (has_eos) return builder.build_eos(std::move(eos_val));
-            if (has_skip && has_skip_eos) return builder.build_skip_eos(skip, std::move(skip_eos_val));
-            return builder.build_empty_root();
-        }
-        
-        if (has_eos && has_skip && has_skip_eos) {
-            return is_list ? builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children)
-                           : builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
-        } else if (has_skip && has_skip_eos) {
-            return is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
-                           : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-        } else if (has_skip) {
-            return is_list ? builder.build_skip_list(skip, lst, children) : builder.build_skip_pop(skip, bmp, children);
-        } else if (has_eos) {
-            return is_list ? builder.build_eos_list(std::move(eos_val), lst, children) : builder.build_eos_pop(std::move(eos_val), bmp, children);
-        }
-        return is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
     }
 
     static void try_collapse(node_builder_t& builder, result_t& result) {
