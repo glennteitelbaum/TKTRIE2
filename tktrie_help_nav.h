@@ -76,12 +76,8 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 child_ptr &= PTR_MASK;
             }
             
-            // At leaf depth for fixed_len, child_slot contains dataptr
-            if constexpr (FIXED_LEN > 0) {
-                if (depth == FIXED_LEN - 1 && key.size() == 1) {
-                    return child_slot;  // This is the dataptr slot
-                }
-            }
+            // NOTE: fixed_len leaf optimization disabled
+            // All children are stored as pointers to nodes
             
             cur = reinterpret_cast<slot_type*>(child_ptr);
             key.remove_prefix(1);

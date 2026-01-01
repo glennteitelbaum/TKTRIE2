@@ -4,15 +4,10 @@
  * 
  * Compile with:
  *   g++ -std=c++20 -O2 -o example example.cpp
- * 
- * Or with validation enabled:
- *   g++ -std=c++20 -O2 -DKTRIE_VALIDATE=1 -o example example.cpp
  */
 
 #include <iostream>
 #include <string>
-#include <thread>
-#include <vector>
 
 #include "tktrie.h"
 
@@ -88,46 +83,6 @@ void example_integer_trie() {
     std::cout << "\n";
 }
 
-void example_concurrent_trie() {
-    std::cout << "=== Concurrent Trie Example ===\n";
-    
-    // Create a thread-safe string trie
-    concurrent_string_trie<int> trie;
-    
-    const int num_threads = 4;
-    const int ops_per_thread = 1000;
-    
-    // Launch writer threads
-    std::vector<std::thread> threads;
-    
-    for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&trie, t, ops_per_thread]() {
-            for (int i = 0; i < ops_per_thread; ++i) {
-                std::string key = "thread" + std::to_string(t) + "_key" + std::to_string(i);
-                trie.insert({key, t * ops_per_thread + i});
-            }
-        });
-    }
-    
-    // Wait for all threads
-    for (auto& th : threads) {
-        th.join();
-    }
-    
-    std::cout << "Final size: " << trie.size() << "\n";
-    std::cout << "Expected: " << (num_threads * ops_per_thread) << "\n";
-    
-    // Verify some entries
-    int found = 0;
-    for (int t = 0; t < num_threads; ++t) {
-        for (int i = 0; i < 10; ++i) {
-            std::string key = "thread" + std::to_string(t) + "_key" + std::to_string(i);
-            if (trie.contains(key)) ++found;
-        }
-    }
-    std::cout << "Verified " << found << "/" << (num_threads * 10) << " sample entries\n\n";
-}
-
 void example_emplace() {
     std::cout << "=== Emplace Example ===\n";
     
@@ -158,7 +113,6 @@ void example_emplace() {
 int main() {
     example_string_trie();
     example_integer_trie();
-    example_concurrent_trie();
     example_emplace();
     
     std::cout << "All examples completed.\n";

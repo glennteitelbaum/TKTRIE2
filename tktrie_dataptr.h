@@ -189,74 +189,131 @@ class dataptr<T, true, Allocator, false> : public dataptr<T, true, Allocator, tr
 };
 
 // =============================================================================
-// THREADED=false, embeddable T
+// THREADED=false, embeddable T - use pointer to avoid size issues
 // =============================================================================
 template <typename T, typename Allocator>
 class dataptr<T, false, Allocator, true> {
-    uint64_t bits_{0};
-    bool has_value_{false};
+    T* ptr_{nullptr};
+    
+    using alloc_traits = std::allocator_traits<Allocator>;
+    using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
+    using value_alloc_traits = std::allocator_traits<value_alloc_t>;
 
 public:
     dataptr() noexcept = default;
-    ~dataptr() = default;
     
-    dataptr(const dataptr& other) noexcept 
-        : bits_(other.bits_), has_value_(other.has_value_) {}
+    ~dataptr() {
+        if (ptr_) {
+            value_alloc_t alloc;
+            std::destroy_at(ptr_);
+            value_alloc_traits::deallocate(alloc, ptr_, 1);
+        }
+    }
     
-    dataptr& operator=(const dataptr& other) noexcept {
-        bits_ = other.bits_;
-        has_value_ = other.has_value_;
+    dataptr(const dataptr& other) : ptr_(nullptr) {
+        if (other.ptr_) {
+            value_alloc_t alloc;
+            ptr_ = value_alloc_traits::allocate(alloc, 1);
+            try {
+                std::construct_at(ptr_, *other.ptr_);
+            } catch (...) {
+                value_alloc_traits::deallocate(alloc, ptr_, 1);
+                ptr_ = nullptr;
+                throw;
+            }
+        }
+    }
+    
+    dataptr& operator=(const dataptr& other) {
+        if (this != &other) {
+            dataptr tmp(other);
+            std::swap(ptr_, tmp.ptr_);
+        }
         return *this;
     }
     
-    dataptr(dataptr&& other) noexcept 
-        : bits_(other.bits_), has_value_(other.has_value_) {
-        other.has_value_ = false;
+    dataptr(dataptr&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
     }
     
     dataptr& operator=(dataptr&& other) noexcept {
-        bits_ = other.bits_;
-        has_value_ = other.has_value_;
-        other.has_value_ = false;
+        if (this != &other) {
+            if (ptr_) {
+                value_alloc_t alloc;
+                std::destroy_at(ptr_);
+                value_alloc_traits::deallocate(alloc, ptr_, 1);
+            }
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
         return *this;
     }
 
-    bool has_data() const noexcept { return has_value_; }
+    bool has_data() const noexcept { return ptr_ != nullptr; }
 
     bool try_read(T& out) const noexcept {
-        if (!has_value_) return false;
-        std::memcpy(&out, &bits_, sizeof(T));
+        if (!ptr_) return false;
+        out = *ptr_;
         return true;
     }
 
     void begin_write() noexcept { }
     
-    void set(const T& value) noexcept {
-        std::memcpy(&bits_, &value, sizeof(T));
-        has_value_ = true;
+    void set(const T& value) {
+        value_alloc_t alloc;
+        if (!ptr_) {
+            ptr_ = value_alloc_traits::allocate(alloc, 1);
+            try {
+                std::construct_at(ptr_, value);
+            } catch (...) {
+                value_alloc_traits::deallocate(alloc, ptr_, 1);
+                ptr_ = nullptr;
+                throw;
+            }
+        } else {
+            *ptr_ = value;
+        }
     }
     
-    void set(T&& value) noexcept {
-        set(value);
+    void set(T&& value) {
+        value_alloc_t alloc;
+        if (!ptr_) {
+            ptr_ = value_alloc_traits::allocate(alloc, 1);
+            try {
+                std::construct_at(ptr_, std::move(value));
+            } catch (...) {
+                value_alloc_traits::deallocate(alloc, ptr_, 1);
+                ptr_ = nullptr;
+                throw;
+            }
+        } else {
+            *ptr_ = std::move(value);
+        }
     }
     
-    void clear() noexcept {
-        has_value_ = false;
-        bits_ = 0;
+    void clear() {
+        if (ptr_) {
+            value_alloc_t alloc;
+            std::destroy_at(ptr_);
+            value_alloc_traits::deallocate(alloc, ptr_, 1);
+            ptr_ = nullptr;
+        }
     }
     
     void end_write() noexcept { }
 
-    uint64_t to_u64() const noexcept { return bits_; }
+    uint64_t to_u64() const noexcept { 
+        return reinterpret_cast<uint64_t>(ptr_); 
+    }
     
-    void from_u64(uint64_t v) noexcept { bits_ = v; }
-    
-    bool get_has_value() const noexcept { return has_value_; }
-    void set_has_value(bool v) noexcept { has_value_ = v; }
+    void from_u64(uint64_t v) noexcept { 
+        ptr_ = reinterpret_cast<T*>(v); 
+    }
 
-    void deep_copy_from(const dataptr& other) noexcept {
-        bits_ = other.bits_;
-        has_value_ = other.has_value_;
+    void deep_copy_from(const dataptr& other) {
+        if (other.ptr_) {
+            set(*other.ptr_);
+        }
     }
 };
 

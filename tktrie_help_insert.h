@@ -130,20 +130,8 @@ private:
                 child_ptr &= PTR_MASK;
             }
             
-            // For fixed_len at leaf depth, child_slot is dataptr
-            if constexpr (FIXED_LEN > 0) {
-                if (depth == FIXED_LEN - 1) {
-                    dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
-                    if (dp->has_data()) {
-                        result.already_exists = true;
-                    } else {
-                        // Set data in existing slot (need to clone parent node)
-                        return set_leaf_data(builder, node, c, std::forward<U>(value), 
-                                            depth, result);
-                    }
-                    return result;
-                }
-            }
+            // NOTE: fixed_len leaf optimization disabled
+            // All children are stored as pointers to nodes
             
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             result_t child_result;
@@ -252,9 +240,10 @@ private:
         
         // Key is prefix of skip
         // New node: EOS at key end, then skip continues
+        // skip[match] becomes edge character, skip[match+1:] becomes new suffix skip
         
-        // Build node for rest of skip
-        slot_type* suffix_node = clone_with_shorter_skip(builder, node, match);
+        // Build node for rest of skip (skip the edge char at position match)
+        slot_type* suffix_node = clone_with_shorter_skip(builder, node, match + 1);
         result.new_nodes.push_back(suffix_node);
         
         // Build new root with key as skip_eos
@@ -471,6 +460,9 @@ private:
                                 U&& value,
                                 size_t depth,
                                 result_t& result) {
+        // NOTE: fixed_len leaf optimization disabled for simplicity
+        // All children are stored as pointers to nodes
+        
         // Build new child node
         slot_type* child;
         if (rest.empty()) {
