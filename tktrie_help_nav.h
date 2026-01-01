@@ -1,0 +1,326 @@
+#pragma once
+
+#include <string_view>
+#include <vector>
+#include <array>
+
+#include "tktrie_defines.h"
+#include "tktrie_help_common.h"
+
+namespace gteitelbaum {
+
+/**
+ * Navigation helper functions
+ */
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
+    using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
+    using slot_type = typename base::slot_type;
+    using node_view_t = typename base::node_view_t;
+    using dataptr_t = typename base::dataptr_t;
+    using path_entry_t = typename base::path_entry_t;
+
+    /**
+     * Find node for exact key match
+     * Sets hit_write if WRITE_BIT encountered (caller should retry)
+     * Returns pointer to data slot, or nullptr if not found
+     */
+    static slot_type* find_data_slot(slot_type* root, std::string_view key, 
+                                      bool& hit_write, size_t start_depth = 0) noexcept {
+        hit_write = false;
+        slot_type* cur = root;
+        size_t depth = start_depth;
+        
+        while (cur) {
+            node_view_t view(cur);
+            
+            if (view.has_skip()) {
+                std::string_view skip = view.skip_chars();
+                size_t match = base::match_skip(skip, key);
+                
+                if (match < skip.size()) {
+                    return nullptr;  // key diverges in skip
+                }
+                
+                key.remove_prefix(match);
+                depth += match;
+                
+                if (key.empty()) {
+                    // Key ends at skip
+                    if (view.has_skip_eos()) {
+                        return reinterpret_cast<slot_type*>(view.skip_eos_data());
+                    }
+                    return nullptr;
+                }
+            }
+            
+            if (key.empty()) {
+                if (view.has_eos()) {
+                    return reinterpret_cast<slot_type*>(view.eos_data());
+                }
+                return nullptr;
+            }
+            
+            // Find child
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            slot_type* child_slot = view.find_child(c);
+            if (!child_slot) return nullptr;
+            
+            uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            
+            if constexpr (THREADED) {
+                if (child_ptr & WRITE_BIT) {
+                    hit_write = true;
+                    return nullptr;
+                }
+                child_ptr &= PTR_MASK;
+            }
+            
+            // At leaf depth for fixed_len, child_slot contains dataptr
+            if constexpr (FIXED_LEN > 0) {
+                if (depth == FIXED_LEN - 1 && key.size() == 1) {
+                    return child_slot;  // This is the dataptr slot
+                }
+            }
+            
+            cur = reinterpret_cast<slot_type*>(child_ptr);
+            key.remove_prefix(1);
+            ++depth;
+        }
+        
+        return nullptr;
+    }
+
+    /**
+     * Check if key exists in trie
+     */
+    static bool contains(slot_type* root, std::string_view key, bool& hit_write) noexcept {
+        slot_type* data_slot = find_data_slot(root, key, hit_write);
+        if (!data_slot || hit_write) return false;
+        
+        // For threaded, need to properly read the data
+        if constexpr (THREADED) {
+            dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+            T dummy;
+            if (!dp->try_read(dummy)) {
+                hit_write = true;  // WRITE_BIT was set
+                return false;
+            }
+            return true;
+        } else {
+            dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+            return dp->has_data();
+        }
+    }
+
+    /**
+     * Read value at key
+     */
+    static bool read(slot_type* root, std::string_view key, T& out, bool& hit_write) noexcept {
+        slot_type* data_slot = find_data_slot(root, key, hit_write);
+        if (!data_slot || hit_write) return false;
+        
+        dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+        if (!dp->try_read(out)) {
+            if constexpr (THREADED) {
+                hit_write = true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Collect path with versions for optimistic concurrency
+     * Returns true if path found (even if key doesn't exist at end)
+     * Sets hit_write if WRITE_BIT encountered
+     */
+    template <typename PathContainer>
+    static bool collect_path(slot_type* root, std::string_view key,
+                             PathContainer& path, bool& hit_write,
+                             size_t start_depth = 0) noexcept {
+        hit_write = false;
+        slot_type* cur = root;
+        size_t depth = start_depth;
+        size_t path_idx = 0;
+        
+        if constexpr (FIXED_LEN == 0) {
+            path.clear();
+            path.reserve(16);
+        }
+        
+        while (cur) {
+            node_view_t view(cur);
+            uint32_t ver = view.version();
+            
+            // Add current node to path
+            if constexpr (FIXED_LEN == 0) {
+                path.push_back({cur, nullptr, ver, -1});
+            } else {
+                if (path_idx < path.size()) {
+                    path[path_idx] = {cur, nullptr, ver, -1};
+                }
+            }
+            
+            if (view.has_skip()) {
+                std::string_view skip = view.skip_chars();
+                size_t match = base::match_skip(skip, key);
+                
+                if (match < skip.size()) {
+                    // Key diverges in skip - this is an insertion point
+                    return true;
+                }
+                
+                key.remove_prefix(match);
+                depth += match;
+                
+                if (key.empty()) {
+                    // Key ends at skip - found or insertion point
+                    return true;
+                }
+            }
+            
+            if (key.empty()) {
+                return true;
+            }
+            
+            // Find child
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            slot_type* child_slot = view.find_child(c);
+            
+            if (!child_slot) {
+                // No child - this is an insertion point
+                return true;
+            }
+            
+            // Update path entry with child info
+            if constexpr (FIXED_LEN == 0) {
+                path.back().child_slot = child_slot;
+                
+                int idx = -1;
+                if (view.has_list()) {
+                    idx = view.get_list().offset(c) - 1;
+                } else if (view.has_pop()) {
+                    view.get_bitmap().find(c, &idx);
+                }
+                path.back().child_idx = idx;
+            } else {
+                if (path_idx < path.size()) {
+                    path[path_idx].child_slot = child_slot;
+                    
+                    int idx = -1;
+                    if (view.has_list()) {
+                        idx = view.get_list().offset(c) - 1;
+                    } else if (view.has_pop()) {
+                        view.get_bitmap().find(c, &idx);
+                    }
+                    path[path_idx].child_idx = idx;
+                }
+            }
+            
+            uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            
+            if constexpr (THREADED) {
+                if (child_ptr & WRITE_BIT) {
+                    hit_write = true;
+                    return false;
+                }
+                child_ptr &= PTR_MASK;
+            }
+            
+            // At leaf depth for fixed_len, we're done
+            if constexpr (FIXED_LEN > 0) {
+                if (depth == FIXED_LEN - 1) {
+                    ++path_idx;
+                    return true;
+                }
+            }
+            
+            cur = reinterpret_cast<slot_type*>(child_ptr);
+            key.remove_prefix(1);
+            ++depth;
+            ++path_idx;
+        }
+        
+        return true;
+    }
+
+    /**
+     * Verify that path versions haven't changed
+     */
+    template <typename PathContainer>
+    static bool verify_path(const PathContainer& path, size_t count) noexcept {
+        for (size_t i = 0; i < count; ++i) {
+            if (!path[i].node) continue;
+            node_view_t view(path[i].node);
+            if (view.version() != path[i].version) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Find first leaf in subtree (for iteration)
+     */
+    static slot_type* find_first_leaf(slot_type* node, std::string& key_out, 
+                                       bool& hit_write, size_t depth = 0) noexcept {
+        hit_write = false;
+        if (!node) return nullptr;
+        
+        while (true) {
+            node_view_t view(node);
+            
+            // Accumulate skip chars
+            if (view.has_skip()) {
+                key_out.append(view.skip_chars());
+                depth += view.skip_length();
+            }
+            
+            // Check for data
+            if (view.has_eos()) {
+                return reinterpret_cast<slot_type*>(view.eos_data());
+            }
+            if (view.has_skip_eos()) {
+                return reinterpret_cast<slot_type*>(view.skip_eos_data());
+            }
+            
+            // No data here, go to first child
+            if (view.child_count() == 0) {
+                return nullptr;
+            }
+            
+            unsigned char c;
+            if (view.has_list()) {
+                c = view.get_list().char_at(0);
+            } else {
+                c = view.get_bitmap().nth_char(0);
+            }
+            
+            key_out.push_back(static_cast<char>(c));
+            
+            slot_type* child_slot = view.find_child(c);
+            uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            
+            if constexpr (THREADED) {
+                if (child_ptr & WRITE_BIT) {
+                    hit_write = true;
+                    return nullptr;
+                }
+                child_ptr &= PTR_MASK;
+            }
+            
+            // For fixed_len at leaf depth
+            if constexpr (FIXED_LEN > 0) {
+                if (depth == FIXED_LEN - 1) {
+                    return child_slot;  // This is dataptr
+                }
+            }
+            
+            node = reinterpret_cast<slot_type*>(child_ptr);
+            ++depth;
+        }
+    }
+};
+
+}  // namespace gteitelbaum
