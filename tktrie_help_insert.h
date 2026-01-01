@@ -123,7 +123,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* child_slot = view.find_child(c);
         
         if (child_slot) {
-            // Child exists - recurse
+            // Child exists
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
             
             if constexpr (THREADED) {
@@ -134,8 +134,19 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 child_ptr &= PTR_MASK;
             }
             
-            // NOTE: fixed_len leaf optimization disabled
-            // All children are stored as pointers to nodes
+            // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+            if constexpr (FIXED_LEN > 0 && !THREADED) {
+                if (depth == FIXED_LEN - 1 && key.size() == 1) {
+                    // child_slot contains dataptr directly
+                    dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
+                    if (dp->has_data()) {
+                        result.already_exists = true;
+                        return result;
+                    }
+                    // Set data in existing slot - need to clone node
+                    return set_leaf_data(builder, node, c, std::forward<U>(value), depth, result);
+                }
+            }
             
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             result_t child_result;
@@ -469,20 +480,8 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                 unsigned char c,
                                 std::string_view rest,
                                 U&& value,
-                                size_t /*depth*/,
+                                size_t depth,
                                 result_t& result) {
-        // NOTE: fixed_len leaf optimization disabled for simplicity
-        // All children are stored as pointers to nodes
-        
-        // Build new child node
-        slot_type* child;
-        if (rest.empty()) {
-            child = builder.build_eos(std::forward<U>(value));
-        } else {
-            child = builder.build_skip_eos(rest, std::forward<U>(value));
-        }
-        result.new_nodes.push_back(child);
-        
         // Clone parent with new child added
         node_view_t view(node);
         auto children = base::extract_children(view);
@@ -509,6 +508,38 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             pos = 0;
         }
         
+        // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+        if constexpr (FIXED_LEN > 0 && !THREADED) {
+            if (depth == FIXED_LEN - 1 && rest.empty()) {
+                // Store dataptr inline (as 0 placeholder, will set after node built)
+                children.insert(children.begin() + pos, 0);
+                chars.insert(chars.begin() + pos, c);
+                
+                slot_type* new_parent = base::rebuild_node(builder, view, is_list, lst, bmp, children);
+                
+                // Now set the data in the new node's child slot
+                node_view_t new_view(new_parent);
+                slot_type* new_child_slot = new_view.find_child(c);
+                dataptr_t* dp = reinterpret_cast<dataptr_t*>(new_child_slot);
+                new (dp) dataptr_t();
+                dp->set(std::forward<U>(value));
+                
+                result.new_nodes.push_back(new_parent);
+                result.new_root = new_parent;
+                result.old_nodes.push_back(node);
+                return result;
+            }
+        }
+        
+        // Build new child node
+        slot_type* child;
+        if (rest.empty()) {
+            child = builder.build_eos(std::forward<U>(value));
+        } else {
+            child = builder.build_skip_eos(rest, std::forward<U>(value));
+        }
+        result.new_nodes.push_back(child);
+        
         children.insert(children.begin() + pos, reinterpret_cast<uint64_t>(child));
         chars.insert(chars.begin() + pos, c);
         
@@ -516,6 +547,38 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* new_parent = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_parent);
         result.new_root = new_parent;
+        result.old_nodes.push_back(node);
+        
+        return result;
+    }
+
+    /**
+     * Set data in leaf slot (FIXED_LEN non-threaded only)
+     * Used when child slot exists but contains empty dataptr
+     */
+    template <typename U>
+    static result_t& set_leaf_data(node_builder_t& builder,
+                                    slot_type* node,
+                                    unsigned char c,
+                                    U&& value,
+                                    size_t /*depth*/,
+                                    result_t& result) {
+        node_view_t view(node);
+        auto children = base::extract_children(view);
+        auto chars = base::get_child_chars(view);
+        
+        auto [is_list, lst, bmp] = base::build_child_structure(chars);
+        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
+        
+        // Set data in the new node's child slot
+        node_view_t new_view(new_node);
+        slot_type* child_slot = new_view.find_child(c);
+        dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
+        new (dp) dataptr_t();
+        dp->set(std::forward<U>(value));
+        
+        result.new_nodes.push_back(new_node);
+        result.new_root = new_node;
         result.old_nodes.push_back(node);
         
         return result;

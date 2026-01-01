@@ -70,11 +70,12 @@ private:
             child_ptr &= PTR_MASK;
         }
         
-        if constexpr (FIXED_LEN > 0) {
-            if (depth == FIXED_LEN - 1) {
+        // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+        if constexpr (FIXED_LEN > 0 && !THREADED) {
+            if (depth == FIXED_LEN - 1 && key.size() == 1) {
                 dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
                 if (!dp->has_data()) return result;
-                return remove_leaf_data(builder, node, c, depth, result);
+                return remove_leaf_data(builder, node, c, result);
             }
         }
         
@@ -238,7 +239,7 @@ private:
     }
 
     static result_t& remove_leaf_data(node_builder_t& builder, slot_type* node, unsigned char c,
-                                       size_t depth, result_t& result) {
+                                       result_t& result) {
         result.found = true;
         node_view_t view(node);
         auto children = base::extract_children(view);
@@ -246,7 +247,14 @@ private:
         
         int idx = base::find_char_index(chars, c);
         
-        if (idx >= 0) { children.erase(children.begin() + idx); chars.erase(chars.begin() + idx); }
+        // Destroy the dataptr before removing
+        if (idx >= 0) {
+            slot_type* child_slot = view.find_child(c);
+            dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
+            dp->~dataptr_t();
+            children.erase(children.begin() + idx);
+            chars.erase(chars.begin() + idx);
+        }
         
         if (children.empty()) { result.root_deleted = true; result.old_nodes.push_back(node); return result; }
         

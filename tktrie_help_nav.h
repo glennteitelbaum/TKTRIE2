@@ -76,8 +76,13 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 child_ptr &= PTR_MASK;
             }
             
-            // NOTE: fixed_len leaf optimization disabled
-            // All children are stored as pointers to nodes
+            // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+            if constexpr (FIXED_LEN > 0 && !THREADED) {
+                if (depth == FIXED_LEN - 1 && key.size() == 1) {
+                    // child_slot contains dataptr directly
+                    return child_slot;
+                }
+            }
             
             cur = reinterpret_cast<slot_type*>(child_ptr);
             key.remove_prefix(1);
@@ -224,8 +229,8 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 child_ptr &= PTR_MASK;
             }
             
-            // At leaf depth for fixed_len, we're done
-            if constexpr (FIXED_LEN > 0) {
+            // FIXED_LEN leaf optimization: non-threaded at leaf depth we're done
+            if constexpr (FIXED_LEN > 0 && !THREADED) {
                 if (depth == FIXED_LEN - 1) {
                     ++path_idx;
                     return true;
@@ -306,8 +311,8 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 child_ptr &= PTR_MASK;
             }
             
-            // For fixed_len at leaf depth
-            if constexpr (FIXED_LEN > 0) {
+            // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+            if constexpr (FIXED_LEN > 0 && !THREADED) {
                 if (depth == FIXED_LEN - 1) {
                     return child_slot;  // This is dataptr
                 }

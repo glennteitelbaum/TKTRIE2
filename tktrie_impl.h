@@ -481,10 +481,12 @@ private:
     // Implementation Details
     // =========================================================================
 
-    void delete_tree(slot_type* node) {
+    void delete_tree(slot_type* node, size_t depth = 0) {
         if (!node) return;
 
         node_view_t view(node);
+        
+        size_t skip_len = view.has_skip() ? view.skip_length() : 0;
         
         // Recursively delete children
         int num_children = view.child_count();
@@ -495,15 +497,19 @@ private:
                 child_ptr &= PTR_MASK;
             }
 
-            // For fixed_len at leaf depth, children are dataptr not nodes
-            if constexpr (fixed_len > 0) {
-                // We'd need depth tracking here - for simplicity, assume
-                // variable-length behavior and recurse
+            // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+            if constexpr (fixed_len > 0 && !THREADED) {
+                if (depth + skip_len == fixed_len - 1) {
+                    // Child is inline dataptr - destroy it
+                    dataptr_t* dp = reinterpret_cast<dataptr_t*>(&view.child_ptrs()[i]);
+                    dp->~dataptr_t();
+                    continue;
+                }
             }
 
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             if (child) {
-                delete_tree(child);
+                delete_tree(child, depth + skip_len + 1);
             }
         }
 

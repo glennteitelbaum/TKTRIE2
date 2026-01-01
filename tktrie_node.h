@@ -682,7 +682,7 @@ public:
     /**
      * Deep copy a node (recursively copies children)
      */
-    slot_type* deep_copy(slot_type* src) {
+    slot_type* deep_copy(slot_type* src, size_t depth = 0) {
         if (!src) return nullptr;
         
         node_view_t src_view(src);
@@ -702,8 +702,10 @@ public:
         }
         
         // Copy skip
+        size_t skip_len = 0;
         if (src_view.has_skip()) {
-            dst_view.set_skip_length(src_view.skip_length());
+            skip_len = src_view.skip_length();
+            dst_view.set_skip_length(skip_len);
             dst_view.set_skip_chars(src_view.skip_chars());
             
             // Deep copy SKIP_EOS data
@@ -722,21 +724,32 @@ public:
         
         // Recursively copy children
         int num_children = src_view.child_count();
+        size_t child_depth = depth + skip_len + 1;
+        
         for (int i = 0; i < num_children; ++i) {
             uint64_t child_ptr = src_view.get_child_ptr(i);
-            if constexpr (FIXED_LEN > 0) {
-                // At leaf level, children are dataptr, not nodes
-                // This needs depth tracking - for now just copy pointer
-                // The caller should handle leaf vs non-leaf distinction
-                dst_view.set_child_ptr(i, child_ptr);
-            } else {
-                slot_type* child = reinterpret_cast<slot_type*>(child_ptr & PTR_MASK);
-                if (child) {
-                    slot_type* child_copy = deep_copy(child);
-                    dst_view.set_child_ptr(i, reinterpret_cast<uint64_t>(child_copy));
-                } else {
-                    dst_view.set_child_ptr(i, 0);
+            
+            // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+            if constexpr (FIXED_LEN > 0 && !THREADED) {
+                if (depth + skip_len == FIXED_LEN - 1) {
+                    // Child is inline dataptr - deep copy it
+                    dataptr_t* src_dp = reinterpret_cast<dataptr_t*>(&src_view.child_ptrs()[i]);
+                    dataptr_t* dst_dp = reinterpret_cast<dataptr_t*>(&dst_view.child_ptrs()[i]);
+                    new (dst_dp) dataptr_t();
+                    dst_dp->deep_copy_from(*src_dp);
+                    continue;
                 }
+            }
+            
+            if constexpr (THREADED) {
+                child_ptr &= PTR_MASK;
+            }
+            slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
+            if (child) {
+                slot_type* child_copy = deep_copy(child, child_depth);
+                dst_view.set_child_ptr(i, reinterpret_cast<uint64_t>(child_copy));
+            } else {
+                dst_view.set_child_ptr(i, 0);
             }
         }
         
