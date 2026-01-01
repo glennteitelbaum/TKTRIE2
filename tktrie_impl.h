@@ -486,14 +486,19 @@ private:
     std::pair<iterator, bool> insert_threaded(const Key& key,
                                                const std::string& key_bytes,
                                                U&& value) {
-        std::vector<slot_type*> to_free;
-
-        {
-            std::lock_guard<mutex_type> lock(write_mutex_);
-
-            // Build path INSIDE lock
+        while (true) {
+            // Phase 1: Build new path OUTSIDE lock
             auto result = insert_t::build_insert_path(builder_, get_root(), key_bytes,
                                                        std::forward<U>(value));
+
+            if (result.hit_write || result.hit_read) {
+                // Another writer active, retry
+                for (auto* n : result.new_nodes) {
+                    builder_.deallocate_node(n);
+                }
+                cpu_pause();
+                continue;
+            }
 
             if (result.already_exists) {
                 for (auto* n : result.new_nodes) {
@@ -502,51 +507,128 @@ private:
                 return {find(key), false};
             }
 
-            // Set WRITE_BIT leaf→root on old path (blocks readers)
+            // Phase 2: Claim path with READ_BIT leaf→root
+            std::vector<slot_type*> claimed_slots;
+            bool claim_failed = false;
+            
+            // Iterate path in reverse (leaf to root)
             for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
                 node_view_t view(it->node);
                 slot_type* child_slot = view.find_child(it->child_char);
                 if (child_slot) {
-                    child_slot->fetch_or(WRITE_BIT, std::memory_order_release);
+                    uint64_t old_val = child_slot->load(std::memory_order_acquire);
+                    
+                    if (old_val & (READ_BIT | WRITE_BIT)) {
+                        claim_failed = true;
+                        break;
+                    }
+                    
+                    if (!child_slot->compare_exchange_strong(old_val, old_val | READ_BIT,
+                                                              std::memory_order_acq_rel,
+                                                              std::memory_order_acquire)) {
+                        claim_failed = true;
+                        break;
+                    }
+                    claimed_slots.push_back(child_slot);
                 }
             }
-
-            // Swap root
-            if (result.new_root) {
-                set_root(result.new_root);
+            
+            if (claim_failed) {
+                // Clear claims and retry
+                for (auto* slot : claimed_slots) {
+                    slot->fetch_and(~READ_BIT, std::memory_order_release);
+                }
+                for (auto* n : result.new_nodes) {
+                    builder_.deallocate_node(n);
+                }
+                cpu_pause();
+                continue;
             }
 
-            for (auto* n : result.new_nodes) {
+            std::vector<slot_type*> to_free;
+
+            {
+                std::lock_guard<mutex_type> lock(write_mutex_);
+
+                // Phase 3: Verify root unchanged
+                if (get_root() != result.expected_root) {
+                    for (auto* slot : claimed_slots) {
+                        slot->fetch_and(~READ_BIT, std::memory_order_release);
+                    }
+                    for (auto* n : result.new_nodes) {
+                        builder_.deallocate_node(n);
+                    }
+                    continue;
+                }
+
+                // Phase 4: Set WRITE_BIT leaf→root (blocks readers)
+                for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
+                    node_view_t view(it->node);
+                    slot_type* child_slot = view.find_child(it->child_char);
+                    if (child_slot) {
+                        child_slot->fetch_or(WRITE_BIT, std::memory_order_release);
+                    }
+                }
+
+                // Phase 5: Swap root
+                if (result.new_root) {
+                    set_root(result.new_root);
+                }
+
+                for (auto* n : result.new_nodes) {
+                    if (n) {
+                        node_view_t view(n);
+                        view.increment_version();
+                    }
+                }
+
+                elem_count_.fetch_add(1, std::memory_order_relaxed);
+                to_free = std::move(result.old_nodes);
+
+            }  // Lock released
+
+            // Phase 6: Clear READ_BIT claims
+            for (auto* slot : claimed_slots) {
+                slot->fetch_and(~READ_BIT, std::memory_order_release);
+            }
+
+            // Phase 7: Wait for READ_BITs and delete leaf→root
+            // old_nodes is ordered root→leaf, so reverse it
+            for (auto it = to_free.rbegin(); it != to_free.rend(); ++it) {
+                slot_type* n = *it;
                 if (n) {
                     node_view_t view(n);
-                    view.increment_version();
+                    
+                    // Wait for any READ_BIT on child pointers to clear
+                    // (another writer might be mid-claim on a descendant path)
+                    int child_count = view.child_count();
+                    for (int i = 0; i < child_count; ++i) {
+                        slot_type* child_slot = view.get_child_slot(i);
+                        if (child_slot) {
+                            while (child_slot->load(std::memory_order_acquire) & READ_BIT) {
+                                cpu_pause();
+                            }
+                        }
+                    }
+                    
+                    // Wait for dataptr READ_BIT to clear
+                    if (view.has_eos()) view.eos_data()->begin_write();
+                    if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
+                    
+                    builder_.deallocate_node(n);
                 }
             }
 
-            elem_count_.fetch_add(1, std::memory_order_relaxed);
-            to_free = std::move(result.old_nodes);
+            validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
-        }  // Lock released
-
-        // Dealloc OUTSIDE lock - wait for dataptr readers
-        for (auto* n : to_free) {
-            if (n) {
-                node_view_t view(n);
-                if (view.has_eos()) view.eos_data()->begin_write();
-                if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
-                builder_.deallocate_node(n);
+            T val;
+            if constexpr (std::is_rvalue_reference_v<U&&>) {
+                val = std::forward<U>(value);
+            } else {
+                val = value;
             }
+            return {iterator(this, key_bytes, val), true};
         }
-
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
-
-        T val;
-        if constexpr (std::is_rvalue_reference_v<U&&>) {
-            val = std::forward<U>(value);
-        } else {
-            val = value;
-        }
-        return {iterator(this, key_bytes, val), true};
     }
 
     bool erase_impl(const Key& key) {
@@ -593,13 +675,17 @@ private:
     }
 
     bool erase_threaded(const std::string& key_bytes) {
-        std::vector<slot_type*> to_free;
-
-        {
-            std::lock_guard<mutex_type> lock(write_mutex_);
-
-            // Build removal path INSIDE lock
+        while (true) {
+            // Phase 1: Build removal path OUTSIDE lock
             auto result = remove_t::build_remove_path(builder_, get_root(), key_bytes);
+
+            if (result.hit_write || result.hit_read) {
+                for (auto* n : result.new_nodes) {
+                    builder_.deallocate_node(n);
+                }
+                cpu_pause();
+                continue;
+            }
 
             if (!result.found) {
                 for (auto* n : result.new_nodes) {
@@ -608,40 +694,113 @@ private:
                 return false;
             }
 
-            // Set WRITE_BIT leaf→root
+            // Phase 2: Claim path with READ_BIT leaf→root
+            std::vector<slot_type*> claimed_slots;
+            bool claim_failed = false;
+            
             for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
                 node_view_t view(it->node);
                 slot_type* child_slot = view.find_child(it->child_char);
                 if (child_slot) {
-                    child_slot->fetch_or(WRITE_BIT, std::memory_order_release);
+                    uint64_t old_val = child_slot->load(std::memory_order_acquire);
+                    
+                    if (old_val & (READ_BIT | WRITE_BIT)) {
+                        claim_failed = true;
+                        break;
+                    }
+                    
+                    if (!child_slot->compare_exchange_strong(old_val, old_val | READ_BIT,
+                                                              std::memory_order_acq_rel,
+                                                              std::memory_order_acquire)) {
+                        claim_failed = true;
+                        break;
+                    }
+                    claimed_slots.push_back(child_slot);
+                }
+            }
+            
+            if (claim_failed) {
+                for (auto* slot : claimed_slots) {
+                    slot->fetch_and(~READ_BIT, std::memory_order_release);
+                }
+                for (auto* n : result.new_nodes) {
+                    builder_.deallocate_node(n);
+                }
+                cpu_pause();
+                continue;
+            }
+
+            std::vector<slot_type*> to_free;
+
+            {
+                std::lock_guard<mutex_type> lock(write_mutex_);
+
+                // Phase 3: Verify root unchanged
+                if (get_root() != result.expected_root) {
+                    for (auto* slot : claimed_slots) {
+                        slot->fetch_and(~READ_BIT, std::memory_order_release);
+                    }
+                    for (auto* n : result.new_nodes) {
+                        builder_.deallocate_node(n);
+                    }
+                    continue;
+                }
+
+                // Phase 4: Set WRITE_BIT leaf→root
+                for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
+                    node_view_t view(it->node);
+                    slot_type* child_slot = view.find_child(it->child_char);
+                    if (child_slot) {
+                        child_slot->fetch_or(WRITE_BIT, std::memory_order_release);
+                    }
+                }
+
+                // Phase 5: Swap root
+                if (result.root_deleted) {
+                    set_root(nullptr);
+                } else if (result.new_root) {
+                    set_root(result.new_root);
+                }
+
+                elem_count_.fetch_sub(1, std::memory_order_relaxed);
+                to_free = std::move(result.old_nodes);
+
+            }  // Lock released
+
+            // Phase 6: Clear READ_BIT claims
+            for (auto* slot : claimed_slots) {
+                slot->fetch_and(~READ_BIT, std::memory_order_release);
+            }
+
+            // Phase 7: Wait for READ_BITs and delete leaf→root
+            for (auto it = to_free.rbegin(); it != to_free.rend(); ++it) {
+                slot_type* n = *it;
+                if (n) {
+                    node_view_t view(n);
+                    
+                    // Wait for READ_BIT on child pointers to clear
+                    int child_count = view.child_count();
+                    for (int i = 0; i < child_count; ++i) {
+                        slot_type* child_slot = view.get_child_slot(i);
+                        if (child_slot) {
+                            while (child_slot->load(std::memory_order_acquire) & READ_BIT) {
+                                cpu_pause();
+                            }
+                        }
+                    }
+                    
+                    // Wait for dataptr READ_BIT to clear
+                    if (view.has_eos()) view.eos_data()->begin_write();
+                    if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
+                    
+                    builder_.deallocate_node(n);
                 }
             }
 
-            // Swap root
-            if (result.root_deleted) {
-                set_root(nullptr);
-            } else if (result.new_root) {
-                set_root(result.new_root);
-            }
+            validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
-            elem_count_.fetch_sub(1, std::memory_order_relaxed);
-            to_free = std::move(result.old_nodes);
-
-        }  // Lock released
-
-        // Dealloc OUTSIDE lock - wait for dataptr readers
-        for (auto* n : to_free) {
-            if (n) {
-                node_view_t view(n);
-                if (view.has_eos()) view.eos_data()->begin_write();
-                if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
-                builder_.deallocate_node(n);
-            }
+            return true;
         }
-
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
-
-        return true;
     }
 };
 

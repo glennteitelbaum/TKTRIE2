@@ -29,6 +29,7 @@ struct remove_result {
     std::vector<remove_path_step<THREADED>> path;       // path from root to leaf (for WRITE_BIT)
     bool found = false;                                 // key was found and removed
     bool hit_write = false;                             // encountered WRITE_BIT
+    bool hit_read = false;                              // encountered READ_BIT (another writer)
     bool root_deleted = false;                          // entire trie is now empty
 };
 
@@ -120,6 +121,10 @@ private:
                 result.hit_write = true;
                 return result;
             }
+            if (child_ptr & READ_BIT) {
+                result.hit_read = true;
+                return result;
+            }
             child_ptr &= PTR_MASK;
         }
         
@@ -139,13 +144,15 @@ private:
         result_t child_result;
         child_result.found = false;
         child_result.hit_write = false;
+        child_result.hit_read = false;
         child_result.root_deleted = false;
         
         remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
         
-        if (!child_result.found || child_result.hit_write) {
+        if (!child_result.found || child_result.hit_write || child_result.hit_read) {
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
+            result.hit_read = child_result.hit_read;
             return result;
         }
         

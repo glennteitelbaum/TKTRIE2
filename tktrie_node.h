@@ -222,6 +222,13 @@ public:
         return load_slot<THREADED>(&child_ptrs()[idx]);
     }
 
+    /**
+     * Get pointer to child slot (for waiting on READ_BIT)
+     */
+    slot_type* get_child_slot(int idx) noexcept {
+        return &child_ptrs()[idx];
+    }
+
     void set_child_ptr(int idx, uint64_t ptr) noexcept {
         store_slot<THREADED>(&child_ptrs()[idx], ptr);
     }

@@ -140,6 +140,10 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     result.hit_write = true;
                     return result;
                 }
+                if (child_ptr & READ_BIT) {
+                    result.hit_read = true;
+                    return result;
+                }
                 child_ptr &= PTR_MASK;
             }
             
@@ -150,13 +154,15 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             result_t child_result;
             child_result.already_exists = false;
             child_result.hit_write = false;
+            child_result.hit_read = false;
             
             insert_into_node(builder, child, key.substr(1), std::forward<U>(value),
                             depth + 1, child_result);
             
-            if (child_result.already_exists || child_result.hit_write) {
+            if (child_result.already_exists || child_result.hit_write || child_result.hit_read) {
                 result.already_exists = child_result.already_exists;
                 result.hit_write = child_result.hit_write;
+                result.hit_read = child_result.hit_read;
                 return result;
             }
             
