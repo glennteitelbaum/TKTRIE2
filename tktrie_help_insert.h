@@ -84,7 +84,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                        size_t depth,
                                        result_t& result) {
         node_view_t view(node);
-        uint64_t flags = view.flags();
+        (void)view.flags();  // Used implicitly through view methods
         
         // Handle skip sequence
         if (view.has_skip()) {
@@ -140,10 +140,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     result.hit_write = true;
                     return result;
                 }
-                if (child_ptr & READ_BIT) {
-                    result.hit_read = true;
-                    return result;
-                }
                 child_ptr &= PTR_MASK;
             }
             
@@ -154,15 +150,13 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             result_t child_result;
             child_result.already_exists = false;
             child_result.hit_write = false;
-            child_result.hit_read = false;
             
             insert_into_node(builder, child, key.substr(1), std::forward<U>(value),
                             depth + 1, child_result);
             
-            if (child_result.already_exists || child_result.hit_write || child_result.hit_read) {
+            if (child_result.already_exists || child_result.hit_write) {
                 result.already_exists = child_result.already_exists;
                 result.hit_write = child_result.hit_write;
-                result.hit_read = child_result.hit_read;
                 return result;
             }
             
@@ -188,7 +182,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                          slot_type* node,
                                          std::string_view key,
                                          U&& value,
-                                         size_t depth,
+                                         size_t /*depth*/,
                                          size_t match,
                                          result_t& result) {
         node_view_t view(node);
@@ -256,9 +250,9 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     template <typename U>
     static result_t& split_skip_prefix(node_builder_t& builder,
                                         slot_type* node,
-                                        std::string_view key,
+                                        std::string_view /*key*/,
                                         U&& value,
-                                        size_t depth,
+                                        size_t /*depth*/,
                                         size_t match,
                                         result_t& result) {
         node_view_t view(node);
@@ -484,7 +478,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                 unsigned char c,
                                 std::string_view rest,
                                 U&& value,
-                                size_t depth,
+                                size_t /*depth*/,
                                 result_t& result) {
         // NOTE: fixed_len leaf optimization disabled for simplicity
         // All children are stored as pointers to nodes

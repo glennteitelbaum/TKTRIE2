@@ -8,34 +8,24 @@
 
 namespace gteitelbaum {
 
-/**
- * Path step for WRITE_BIT setting (shared with insert)
- */
 template <bool THREADED>
 struct remove_path_step {
     slot_type_t<THREADED>* node;
     unsigned char child_char;
 };
 
-/**
- * Remove operation results
- */
 template <bool THREADED>
 struct remove_result {
-    slot_type_t<THREADED>* new_root = nullptr;          // new root if root changed (nullptr means delete root)
-    slot_type_t<THREADED>* expected_root = nullptr;     // root we built against
-    std::vector<slot_type_t<THREADED>*> new_nodes;      // newly allocated nodes
-    std::vector<slot_type_t<THREADED>*> old_nodes;      // nodes to delete
-    std::vector<remove_path_step<THREADED>> path;       // path from root to leaf (for WRITE_BIT)
-    bool found = false;                                 // key was found and removed
-    bool hit_write = false;                             // encountered WRITE_BIT
-    bool hit_read = false;                              // encountered READ_BIT (another writer)
-    bool root_deleted = false;                          // entire trie is now empty
+    slot_type_t<THREADED>* new_root = nullptr;
+    slot_type_t<THREADED>* expected_root = nullptr;
+    std::vector<slot_type_t<THREADED>*> new_nodes;
+    std::vector<slot_type_t<THREADED>*> old_nodes;
+    std::vector<remove_path_step<THREADED>> path;
+    bool found = false;
+    bool hit_write = false;
+    bool root_deleted = false;
 };
 
-/**
- * Remove helper functions
- */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
@@ -46,227 +36,131 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using result_t = remove_result<THREADED>;
     using path_step_t = remove_path_step<THREADED>;
 
-    /**
-     * Build new path with key removed
-     */
-    static result_t build_remove_path(node_builder_t& builder,
-                                       slot_type* root,
-                                       std::string_view key,
-                                       size_t depth = 0) {
+    static result_t build_remove_path(node_builder_t& builder, slot_type* root,
+                                       std::string_view key, size_t depth = 0) {
         result_t result;
-        result.new_root = nullptr;
-        result.expected_root = root;  // Record root we're building against
-        result.found = false;
-        result.hit_write = false;
-        result.root_deleted = false;
-        
-        if (!root) {
-            return result;
-        }
-        
+        result.expected_root = root;
+        if (!root) return result;
         return remove_from_node(builder, root, key, depth, result);
     }
 
 private:
-    static result_t& remove_from_node(node_builder_t& builder,
-                                       slot_type* node,
-                                       std::string_view key,
-                                       size_t depth,
-                                       result_t& result) {
+    static result_t& remove_from_node(node_builder_t& builder, slot_type* node,
+                                       std::string_view key, size_t depth, result_t& result) {
         node_view_t view(node);
         
         if (view.has_skip()) {
             std::string_view skip = view.skip_chars();
             size_t match = base::match_skip(skip, key);
-            
-            if (match < skip.size()) {
-                // Key doesn't match skip - not found
-                return result;
-            }
-            
+            if (match < skip.size()) return result;
             key.remove_prefix(match);
             depth += match;
-            
             if (key.empty()) {
-                // Key ends at skip_eos
-                if (!view.has_skip_eos()) {
-                    return result;  // Not found
-                }
-                // Remove skip_eos
+                if (!view.has_skip_eos()) return result;
                 return remove_skip_eos(builder, node, result);
             }
         }
         
         if (key.empty()) {
-            // Key ends at this node
-            if (!view.has_eos()) {
-                return result;  // Not found
-            }
-            // Remove EOS
+            if (!view.has_eos()) return result;
             return remove_eos(builder, node, result);
         }
         
-        // Key continues - find child
         unsigned char c = static_cast<unsigned char>(key[0]);
         slot_type* child_slot = view.find_child(c);
-        
-        if (!child_slot) {
-            return result;  // Not found
-        }
+        if (!child_slot) return result;
         
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
-        
         if constexpr (THREADED) {
-            if (child_ptr & WRITE_BIT) {
-                result.hit_write = true;
-                return result;
-            }
-            if (child_ptr & READ_BIT) {
-                result.hit_read = true;
-                return result;
-            }
+            if (child_ptr & WRITE_BIT) { result.hit_write = true; return result; }
             child_ptr &= PTR_MASK;
         }
         
-        // For fixed_len at leaf depth, child is dataptr
         if constexpr (FIXED_LEN > 0) {
             if (depth == FIXED_LEN - 1) {
                 dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
-                if (!dp->has_data()) {
-                    return result;  // Not found
-                }
-                // Remove data and potentially collapse node
+                if (!dp->has_data()) return result;
                 return remove_leaf_data(builder, node, c, depth, result);
             }
         }
         
         slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
         result_t child_result;
-        child_result.found = false;
-        child_result.hit_write = false;
-        child_result.hit_read = false;
-        child_result.root_deleted = false;
-        
         remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
         
-        if (!child_result.found || child_result.hit_write || child_result.hit_read) {
+        if (!child_result.found || child_result.hit_write) {
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
-            result.hit_read = child_result.hit_read;
             return result;
         }
         
-        // Record path step: this node and char we descended through
-        // Child's path is already recorded, add our step at front (root-to-leaf order)
         result.path.push_back({node, c});
-        for (auto& step : child_result.path) {
-            result.path.push_back(step);
-        }
+        for (auto& step : child_result.path) result.path.push_back(step);
         
-        // Child was modified
-        if (child_result.root_deleted) {
-            // Child is now empty - remove it from this node
+        if (child_result.root_deleted)
             return remove_child(builder, node, c, child_result, result);
-        } else {
-            // Child was modified but not empty - update pointer
-            return clone_with_updated_child(builder, node, c, child_result.new_root,
-                                            child_result, result);
-        }
+        return clone_with_updated_child(builder, node, c, child_result.new_root, child_result, result);
     }
 
-    static result_t& remove_eos(node_builder_t& builder,
-                                 slot_type* node,
-                                 result_t& result) {
+    static result_t& remove_eos(node_builder_t& builder, slot_type* node, result_t& result) {
         node_view_t view(node);
         result.found = true;
         
-        // Check if node becomes empty
-        bool has_skip = view.has_skip();
-        bool has_skip_eos = view.has_skip_eos();
+        bool has_skip = view.has_skip(), has_skip_eos = view.has_skip_eos();
         bool has_children = view.child_count() > 0;
         
         if (!has_skip_eos && !has_children) {
-            // Node is now empty
             result.root_deleted = true;
             result.old_nodes.push_back(node);
             return result;
         }
         
-        // Rebuild node without EOS
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         
         slot_type* new_node;
-        
         if (has_skip && has_skip_eos) {
-            T skip_eos_val;
-            view.skip_eos_data()->try_read(skip_eos_val);
+            T skip_eos_val; view.skip_eos_data()->try_read(skip_eos_val);
             std::string_view skip = view.skip_chars();
-            
             if (has_children) {
-                if (is_list) {
-                    new_node = builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
-                } else {
-                    new_node = builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-                }
+                new_node = is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
+                                   : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
             } else {
                 new_node = builder.build_skip_eos(skip, std::move(skip_eos_val));
             }
         } else if (has_skip) {
             std::string_view skip = view.skip_chars();
             if (has_children) {
-                if (is_list) {
-                    new_node = builder.build_skip_list(skip, lst, children);
-                } else {
-                    new_node = builder.build_skip_pop(skip, bmp, children);
-                }
+                new_node = is_list ? builder.build_skip_list(skip, lst, children)
+                                   : builder.build_skip_pop(skip, bmp, children);
             } else {
-                // Skip without data or children - can we collapse?
-                // For now just create empty root
-                result.root_deleted = true;
-                result.old_nodes.push_back(node);
-                return result;
+                result.root_deleted = true; result.old_nodes.push_back(node); return result;
             }
         } else {
             if (has_children) {
-                if (is_list) {
-                    new_node = builder.build_list(lst, children);
-                } else {
-                    new_node = builder.build_pop(bmp, children);
-                }
+                new_node = is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
             } else {
-                result.root_deleted = true;
-                result.old_nodes.push_back(node);
-                return result;
+                result.root_deleted = true; result.old_nodes.push_back(node); return result;
             }
         }
         
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
-        
-        // Try to collapse if single child with no data
         try_collapse(builder, result);
-        
         return result;
     }
 
-    static result_t& remove_skip_eos(node_builder_t& builder,
-                                      slot_type* node,
-                                      result_t& result) {
+    static result_t& remove_skip_eos(node_builder_t& builder, slot_type* node, result_t& result) {
         node_view_t view(node);
         result.found = true;
         
-        bool has_eos = view.has_eos();
-        bool has_children = view.child_count() > 0;
+        bool has_eos = view.has_eos(), has_children = view.child_count() > 0;
         std::string_view skip = view.skip_chars();
         
         if (!has_eos && !has_children) {
-            // Node is now empty
-            result.root_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
+            result.root_deleted = true; result.old_nodes.push_back(node); return result;
         }
         
         auto children = base::extract_children(view);
@@ -274,357 +168,175 @@ private:
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         
         slot_type* new_node;
-        
         if (has_eos) {
-            T eos_val;
-            view.eos_data()->try_read(eos_val);
-            
+            T eos_val; view.eos_data()->try_read(eos_val);
             if (has_children) {
-                // EOS + skip (no skip_eos) + children - need to restructure
-                // Actually: EOS, then skip to children doesn't make sense
-                // For now, just remove skip entirely (data at root, children immediate)
-                if (is_list) {
-                    new_node = builder.build_eos_list(std::move(eos_val), lst, children);
-                } else {
-                    new_node = builder.build_eos_pop(std::move(eos_val), bmp, children);
-                }
+                new_node = is_list ? builder.build_eos_list(std::move(eos_val), lst, children)
+                                   : builder.build_eos_pop(std::move(eos_val), bmp, children);
             } else {
                 new_node = builder.build_eos(std::move(eos_val));
             }
         } else {
-            // Just skip + children
             if (has_children) {
-                if (is_list) {
-                    new_node = builder.build_skip_list(skip, lst, children);
-                } else {
-                    new_node = builder.build_skip_pop(skip, bmp, children);
-                }
+                new_node = is_list ? builder.build_skip_list(skip, lst, children)
+                                   : builder.build_skip_pop(skip, bmp, children);
             } else {
-                result.root_deleted = true;
-                result.old_nodes.push_back(node);
-                return result;
+                result.root_deleted = true; result.old_nodes.push_back(node); return result;
             }
         }
         
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
-        
         try_collapse(builder, result);
-        
         return result;
     }
 
-    static result_t& remove_child(node_builder_t& builder,
-                                   slot_type* node,
-                                   unsigned char c,
-                                   result_t& child_result,
-                                   result_t& result) {
-        // Merge child result
-        for (auto* n : child_result.new_nodes) {
-            result.new_nodes.push_back(n);
-        }
-        for (auto* n : child_result.old_nodes) {
-            result.old_nodes.push_back(n);
-        }
+    static result_t& remove_child(node_builder_t& builder, slot_type* node, unsigned char c,
+                                   result_t& child_result, result_t& result) {
+        for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
+        for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
         result.found = true;
         
         node_view_t view(node);
-        
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        // Find and remove child
         int idx = -1;
-        for (size_t i = 0; i < chars.size(); ++i) {
-            if (chars[i] == c) {
-                idx = static_cast<int>(i);
-                break;
-            }
-        }
+        for (size_t i = 0; i < chars.size(); ++i) if (chars[i] == c) { idx = static_cast<int>(i); break; }
+        if (idx >= 0) { children.erase(children.begin() + idx); chars.erase(chars.begin() + idx); }
         
-        if (idx >= 0) {
-            children.erase(children.begin() + idx);
-            chars.erase(chars.begin() + idx);
-        }
-        
-        // Check if node becomes empty or needs collapsing
-        bool has_eos = view.has_eos();
-        bool has_skip = view.has_skip();
-        bool has_skip_eos = view.has_skip_eos();
-        
+        bool has_eos = view.has_eos(), has_skip_eos = view.has_skip_eos();
+        (void)view.has_skip();  // Used indirectly via rebuild_with_children
         if (children.empty() && !has_eos && !has_skip_eos) {
-            result.root_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
-        
-        // Rebuild node without this child
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        
-        slot_type* new_node = rebuild_without_child(builder, view, is_list, lst, bmp, children);
-        
-        result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
-        result.old_nodes.push_back(node);
-        
-        try_collapse(builder, result);
-        
-        return result;
-    }
-
-    static result_t& clone_with_updated_child(node_builder_t& builder,
-                                               slot_type* node,
-                                               unsigned char c,
-                                               slot_type* new_child,
-                                               result_t& child_result,
-                                               result_t& result) {
-        // Merge child result
-        for (auto* n : child_result.new_nodes) {
-            result.new_nodes.push_back(n);
-        }
-        for (auto* n : child_result.old_nodes) {
-            result.old_nodes.push_back(n);
-        }
-        result.found = true;
-        
-        node_view_t view(node);
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-        
-        // Find and update child
-        int idx = -1;
-        for (size_t i = 0; i < chars.size(); ++i) {
-            if (chars[i] == c) {
-                idx = static_cast<int>(i);
-                break;
-            }
-        }
-        
-        if (idx >= 0) {
-            children[idx] = reinterpret_cast<uint64_t>(new_child);
+            result.root_deleted = true; result.old_nodes.push_back(node); return result;
         }
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         slot_type* new_node = rebuild_with_children(builder, view, is_list, lst, bmp, children);
-        
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
-        
+        try_collapse(builder, result);
         return result;
     }
 
-    static result_t& remove_leaf_data(node_builder_t& builder,
-                                       slot_type* node,
-                                       unsigned char c,
-                                       size_t depth,
-                                       result_t& result) {
+    static result_t& clone_with_updated_child(node_builder_t& builder, slot_type* node, unsigned char c,
+                                               slot_type* new_child, result_t& child_result, result_t& result) {
+        for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
+        for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
         result.found = true;
         
         node_view_t view(node);
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        // Find and remove child
         int idx = -1;
-        for (size_t i = 0; i < chars.size(); ++i) {
-            if (chars[i] == c) {
-                idx = static_cast<int>(i);
-                break;
-            }
-        }
-        
-        if (idx >= 0) {
-            children.erase(children.begin() + idx);
-            chars.erase(chars.begin() + idx);
-        }
-        
-        if (children.empty()) {
-            result.root_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
+        for (size_t i = 0; i < chars.size(); ++i) if (chars[i] == c) { idx = static_cast<int>(i); break; }
+        if (idx >= 0) children[idx] = reinterpret_cast<uint64_t>(new_child);
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = rebuild_without_child(builder, view, is_list, lst, bmp, children);
-        
+        slot_type* new_node = rebuild_with_children(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_root = new_node;
         result.old_nodes.push_back(node);
-        
         return result;
     }
 
-    static slot_type* rebuild_without_child(node_builder_t& builder,
-                                             node_view_t& view,
-                                             bool is_list,
-                                             small_list& lst,
-                                             popcount_bitmap& bmp,
-                                             const std::vector<uint64_t>& children) {
-        return rebuild_with_children(builder, view, is_list, lst, bmp, children);
+    static result_t& remove_leaf_data(node_builder_t& builder, slot_type* node, unsigned char c,
+                                       size_t depth, result_t& result) {
+        result.found = true;
+        node_view_t view(node);
+        auto children = base::extract_children(view);
+        auto chars = base::get_child_chars(view);
+        
+        int idx = -1;
+        for (size_t i = 0; i < chars.size(); ++i) if (chars[i] == c) { idx = static_cast<int>(i); break; }
+        if (idx >= 0) { children.erase(children.begin() + idx); chars.erase(chars.begin() + idx); }
+        
+        if (children.empty()) { result.root_deleted = true; result.old_nodes.push_back(node); return result; }
+        
+        auto [is_list, lst, bmp] = base::build_child_structure(chars);
+        slot_type* new_node = rebuild_with_children(builder, view, is_list, lst, bmp, children);
+        result.new_nodes.push_back(new_node);
+        result.new_root = new_node;
+        result.old_nodes.push_back(node);
+        return result;
     }
 
-    static slot_type* rebuild_with_children(node_builder_t& builder,
-                                             node_view_t& view,
-                                             bool is_list,
-                                             small_list& lst,
-                                             popcount_bitmap& bmp,
+    static slot_type* rebuild_with_children(node_builder_t& builder, node_view_t& view,
+                                             bool is_list, small_list& lst, popcount_bitmap& bmp,
                                              const std::vector<uint64_t>& children) {
-        bool has_eos = view.has_eos();
-        bool has_skip = view.has_skip();
-        bool has_skip_eos = view.has_skip_eos();
-        
+        bool has_eos = view.has_eos(), has_skip = view.has_skip(), has_skip_eos = view.has_skip_eos();
         T eos_val, skip_eos_val;
         if (has_eos) view.eos_data()->try_read(eos_val);
         if (has_skip_eos) view.skip_eos_data()->try_read(skip_eos_val);
         std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
         
         if (children.empty()) {
-            if (has_eos && has_skip && has_skip_eos) {
-                return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
-            } else if (has_eos) {
-                return builder.build_eos(std::move(eos_val));
-            } else if (has_skip && has_skip_eos) {
-                return builder.build_skip_eos(skip, std::move(skip_eos_val));
-            } else {
-                return builder.build_empty_root();
-            }
+            if (has_eos && has_skip && has_skip_eos) return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
+            if (has_eos) return builder.build_eos(std::move(eos_val));
+            if (has_skip && has_skip_eos) return builder.build_skip_eos(skip, std::move(skip_eos_val));
+            return builder.build_empty_root();
         }
         
         if (has_eos && has_skip && has_skip_eos) {
-            if (is_list) {
-                return builder.build_eos_skip_eos_list(std::move(eos_val), skip,
-                                                       std::move(skip_eos_val), lst, children);
-            } else {
-                return builder.build_eos_skip_eos_pop(std::move(eos_val), skip,
-                                                      std::move(skip_eos_val), bmp, children);
-            }
-        } else if (has_eos && has_skip) {
-            if (is_list) {
-                return builder.build_skip_list(skip, lst, children);
-            } else {
-                return builder.build_skip_pop(skip, bmp, children);
-            }
+            return is_list ? builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children)
+                           : builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
         } else if (has_skip && has_skip_eos) {
-            if (is_list) {
-                return builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
-            } else {
-                return builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-            }
+            return is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
+                           : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
         } else if (has_skip) {
-            if (is_list) {
-                return builder.build_skip_list(skip, lst, children);
-            } else {
-                return builder.build_skip_pop(skip, bmp, children);
-            }
+            return is_list ? builder.build_skip_list(skip, lst, children) : builder.build_skip_pop(skip, bmp, children);
         } else if (has_eos) {
-            if (is_list) {
-                return builder.build_eos_list(std::move(eos_val), lst, children);
-            } else {
-                return builder.build_eos_pop(std::move(eos_val), bmp, children);
-            }
-        } else {
-            if (is_list) {
-                return builder.build_list(lst, children);
-            } else {
-                return builder.build_pop(bmp, children);
-            }
+            return is_list ? builder.build_eos_list(std::move(eos_val), lst, children) : builder.build_eos_pop(std::move(eos_val), bmp, children);
         }
+        return is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
     }
 
-    /**
-     * Try to collapse a node with single child
-     * If node has no data and exactly one child, merge skip sequences
-     */
     static void try_collapse(node_builder_t& builder, result_t& result) {
         if (!result.new_root) return;
-        
         node_view_t view(result.new_root);
+        if (view.has_eos() || view.has_skip_eos() || view.child_count() != 1) return;
         
-        // Only collapse if: no EOS, no SKIP_EOS, exactly 1 child
-        if (view.has_eos() || view.has_skip_eos()) return;
-        if (view.child_count() != 1) return;
-        
-        // Get the single child
         uint64_t child_ptr = view.get_child_ptr(0);
-        if constexpr (THREADED) {
-            child_ptr &= PTR_MASK;
-        }
+        if constexpr (THREADED) child_ptr &= PTR_MASK;
         slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
         if (!child) return;
         
-        // Get the character leading to child
-        unsigned char c;
-        if (view.has_list()) {
-            c = view.get_list().char_at(0);
-        } else {
-            c = view.get_bitmap().nth_char(0);
-        }
-        
-        // Build new skip: parent's skip + char + child's skip
+        unsigned char c = view.has_list() ? view.get_list().char_at(0) : view.get_bitmap().nth_char(0);
         std::string new_skip;
-        if (view.has_skip()) {
-            new_skip = std::string(view.skip_chars());
-        }
+        if (view.has_skip()) new_skip = std::string(view.skip_chars());
         new_skip.push_back(static_cast<char>(c));
         
         node_view_t child_view(child);
-        if (child_view.has_skip()) {
-            new_skip.append(child_view.skip_chars());
-        }
+        if (child_view.has_skip()) new_skip.append(child_view.skip_chars());
         
-        // Build collapsed node using child's structure
         auto children = base::extract_children(child_view);
         auto chars = base::get_child_chars(child_view);
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         
-        bool child_has_eos = child_view.has_eos();
-        bool child_has_skip_eos = child_view.has_skip_eos();
-        
+        bool child_has_eos = child_view.has_eos(), child_has_skip_eos = child_view.has_skip_eos();
         T eos_val, skip_eos_val;
         if (child_has_eos) child_view.eos_data()->try_read(eos_val);
         if (child_has_skip_eos) child_view.skip_eos_data()->try_read(skip_eos_val);
         
         slot_type* collapsed;
-        
         if (children.empty()) {
-            if (child_has_eos && child_has_skip_eos) {
-                collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, 
-                                                       std::move(skip_eos_val));
-            } else if (child_has_eos) {
-                collapsed = builder.build_skip_eos(new_skip, std::move(eos_val));
-            } else if (child_has_skip_eos) {
-                collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
-            } else {
-                // No data anywhere - shouldn't happen
-                return;
-            }
+            if (child_has_eos && child_has_skip_eos) collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
+            else if (child_has_eos) collapsed = builder.build_skip_eos(new_skip, std::move(eos_val));
+            else if (child_has_skip_eos) collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
+            else return;
         } else {
-            // Has children
-            if (child_has_eos && child_has_skip_eos) {
-                // Complex case - skip
-                return;
-            } else if (child_has_eos) {
-                collapsed = builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
-            } else if (child_has_skip_eos) {
-                if (is_list) {
-                    collapsed = builder.build_skip_eos_list(new_skip, std::move(skip_eos_val), lst, children);
-                } else {
-                    collapsed = builder.build_skip_eos_pop(new_skip, std::move(skip_eos_val), bmp, children);
-                }
-            } else {
-                if (is_list) {
-                    collapsed = builder.build_skip_list(new_skip, lst, children);
-                } else {
-                    collapsed = builder.build_skip_pop(new_skip, bmp, children);
-                }
-            }
+            if (child_has_eos && child_has_skip_eos) return;
+            else if (child_has_eos) collapsed = builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
+            else if (child_has_skip_eos) collapsed = is_list ? builder.build_skip_eos_list(new_skip, std::move(skip_eos_val), lst, children)
+                                                              : builder.build_skip_eos_pop(new_skip, std::move(skip_eos_val), bmp, children);
+            else collapsed = is_list ? builder.build_skip_list(new_skip, lst, children) : builder.build_skip_pop(new_skip, bmp, children);
         }
         
-        // Replace result's new_root with collapsed node
-        // Move old new_root to old_nodes
         result.old_nodes.push_back(result.new_root);
+        result.old_nodes.push_back(child);  // Child is absorbed into collapsed node
         result.new_root = collapsed;
         result.new_nodes.push_back(collapsed);
     }

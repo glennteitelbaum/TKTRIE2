@@ -8,8 +8,6 @@
 
 #include "tktrie_defines.h"
 #include "tktrie_dataptr.h"
-#include "tktrie_small_list.h"
-#include "tktrie_popcount.h"
 
 namespace gteitelbaum {
 
@@ -220,13 +218,6 @@ public:
      */
     uint64_t get_child_ptr(int idx) const noexcept {
         return load_slot<THREADED>(&child_ptrs()[idx]);
-    }
-
-    /**
-     * Get pointer to child slot (for waiting on READ_BIT)
-     */
-    slot_type* get_child_slot(int idx) noexcept {
-        return &child_ptrs()[idx];
     }
 
     void set_child_ptr(int idx, uint64_t ptr) noexcept {
