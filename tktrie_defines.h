@@ -43,9 +43,7 @@ static constexpr uint64_t FLAG_LIST     = 1ULL << 60;
 static constexpr uint64_t FLAG_POP      = 1ULL << 59;
 
 static constexpr uint64_t FLAGS_MASK    = 0xF800000000000000ULL;
-static constexpr uint64_t VERSION_MASK  = 0x07FFFFFF'F8000000ULL;
-static constexpr uint64_t SIZE_MASK     = 0x00000000'07FFFFFFULL;
-static constexpr int VERSION_SHIFT      = 27;
+static constexpr uint64_t SIZE_MASK     = 0x07FFFFFFFFFFFFFFULL;  // 59 bits for size
 
 // Pointer bit flags for concurrency
 static constexpr uint64_t WRITE_BIT = 1ULL << 63;
@@ -123,32 +121,17 @@ KTRIE_FORCE_INLINE uint64_t from_char_array(const std::array<char, 8>& arr) noex
     return from_big_endian(be);
 }
 
-// Header manipulation
-KTRIE_FORCE_INLINE uint64_t make_header(uint64_t flags, uint32_t version, uint32_t size) noexcept {
-    return (flags & FLAGS_MASK) | 
-           ((static_cast<uint64_t>(version) << VERSION_SHIFT) & VERSION_MASK) |
-           (static_cast<uint64_t>(size) & SIZE_MASK);
+// Header manipulation (version removed - COW uses pointer identity)
+KTRIE_FORCE_INLINE uint64_t make_header(uint64_t flags, uint32_t size) noexcept {
+    return (flags & FLAGS_MASK) | (static_cast<uint64_t>(size) & SIZE_MASK);
 }
 
 KTRIE_FORCE_INLINE uint64_t get_flags(uint64_t header) noexcept {
     return header & FLAGS_MASK;
 }
 
-KTRIE_FORCE_INLINE uint32_t get_version(uint64_t header) noexcept {
-    return static_cast<uint32_t>((header & VERSION_MASK) >> VERSION_SHIFT);
-}
-
 KTRIE_FORCE_INLINE uint32_t get_size(uint64_t header) noexcept {
     return static_cast<uint32_t>(header & SIZE_MASK);
-}
-
-KTRIE_FORCE_INLINE uint64_t set_version(uint64_t header, uint32_t version) noexcept {
-    return (header & ~VERSION_MASK) | ((static_cast<uint64_t>(version) << VERSION_SHIFT) & VERSION_MASK);
-}
-
-KTRIE_FORCE_INLINE uint64_t increment_version(uint64_t header) noexcept {
-    uint32_t ver = get_version(header);
-    return set_version(header, ver + 1);
 }
 
 // Empty mutex for non-threaded mode

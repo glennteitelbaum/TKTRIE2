@@ -172,13 +172,16 @@ public:
         bits_.store(v, std::memory_order_relaxed);
     }
 
-    // Deep copy for trie copy constructor
-    void deep_copy_from(const dataptr& other) {
-        T* other_ptr = get_ptr(other.bits_.load(std::memory_order_relaxed));
-        if (other_ptr) {
-            set(*other_ptr);
-            end_write();
+    // Deep copy for trie copy constructor - acts as reader
+    // Returns false if WRITE_BIT encountered (caller should retry)
+    bool deep_copy_from(const dataptr& other) {
+        T value;
+        if (!const_cast<dataptr&>(other).try_read(value)) {
+            return false;  // WRITE_BIT set, caller should retry
         }
+        set(std::move(value));
+        end_write();
+        return true;
     }
 };
 

@@ -12,23 +12,17 @@
 namespace gteitelbaum {
 
 /**
- * Path entry for tracking traversal
- */
-template <bool THREADED>
-struct path_entry {
-    slot_type_t<THREADED>* node;
-    slot_type_t<THREADED>* child_slot;  // slot we followed (nullptr for leaf)
-    uint32_t version;
-    int child_idx;
-};
-
-/**
- * Path step for WRITE_BIT setting during insert/remove
+ * Path step for tracking traversal and verification
+ * Used by both insert and remove for:
+ * 1. Verification: compare expected_ptr to current value
+ * 2. Setting WRITE_BIT/READ_BIT on old path
  */
 template <bool THREADED>
 struct path_step {
-    slot_type_t<THREADED>* node;
-    unsigned char child_char;
+    slot_type_t<THREADED>* parent_node;    // Parent node containing the slot
+    slot_type_t<THREADED>* child_slot;     // Slot we followed (in parent node)
+    uint64_t expected_ptr;                  // Pointer value we saw (with bits masked)
+    unsigned char child_char;               // Character leading to child
 };
 
 /**
@@ -40,7 +34,6 @@ struct trie_helpers {
     using node_view_t = node_view<T, THREADED, Allocator, FIXED_LEN>;
     using node_builder_t = node_builder<T, THREADED, Allocator, FIXED_LEN>;
     using dataptr_t = dataptr<T, THREADED, Allocator>;
-    using path_entry_t = path_entry<THREADED>;
     using path_step_t = path_step<THREADED>;
 
     /**
@@ -264,7 +257,7 @@ struct trie_debug {
         if (!node) { os << std::string(indent_level * 2, ' ') << prefix << "(null)\n"; return; }
         node_view_t view(node);
         std::string indent(indent_level * 2, ' ');
-        os << indent << prefix << "NODE[flags=" << flags_to_string(view.flags()) << " ver=" << view.version() << " size=" << view.size() << " depth=" << depth << "]\n";
+        os << indent << prefix << "NODE[flags=" << flags_to_string(view.flags()) << " size=" << view.size() << " depth=" << depth << "]\n";
         if (view.has_eos()) { os << indent << "  EOS: "; T val; os << (view.eos_data()->try_read(val) ? "(has data)" : "(no data)") << "\n"; }
         if (view.has_skip()) {
             os << indent << "  SKIP[" << view.skip_length() << "]: \"" << string_to_printable(view.skip_chars()) << "\"\n";

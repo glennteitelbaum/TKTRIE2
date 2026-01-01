@@ -131,8 +131,13 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     result.hit_write = true;
                     return result;
                 }
-                child_ptr &= PTR_MASK;
+                if (child_ptr & READ_BIT) {
+                    result.hit_read = true;
+                    return result;
+                }
             }
+            
+            uint64_t clean_ptr = child_ptr & PTR_MASK;
             
             // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
             if constexpr (FIXED_LEN > 0 && !THREADED) {
@@ -148,23 +153,25 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 }
             }
             
-            slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
+            slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
             result_t child_result;
             child_result.already_exists = false;
             child_result.hit_write = false;
+            child_result.hit_read = false;
             
             insert_into_node(builder, child, key.substr(1), std::forward<U>(value),
                             depth + 1, child_result);
             
-            if (child_result.already_exists || child_result.hit_write) {
+            if (child_result.already_exists || child_result.hit_write || child_result.hit_read) {
                 result.already_exists = child_result.already_exists;
                 result.hit_write = child_result.hit_write;
+                result.hit_read = child_result.hit_read;
                 return result;
             }
             
-            // Record path step: this node and the char we descended through
-            // Child's path is already recorded, we add our step at the front (root to leaf order)
-            result.path.push_back({node, c});
+            // Record path step with slot and expected pointer for verification
+            // Add our step first, then child's path (root to leaf order)
+            result.path.push_back({node, child_slot, clean_ptr, c});
             for (auto& step : child_result.path) {
                 result.path.push_back(step);
             }

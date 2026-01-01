@@ -35,7 +35,6 @@ public:
     const slot_type* raw() const noexcept { return arr_; }
 
     uint64_t flags() const noexcept { return get_flags(header()); }
-    uint32_t version() const noexcept { return get_version(header()); }
     uint32_t size() const noexcept { return get_size(header()); }
 
     bool has_eos() const noexcept { return (flags() & FLAG_EOS) != 0; }
@@ -46,11 +45,6 @@ public:
 
     void set_header(uint64_t h) noexcept {
         store_slot<THREADED>(&arr_[0], h);
-    }
-
-    void increment_version() noexcept {
-        uint64_t h = header();
-        store_slot<THREADED>(&arr_[0], gteitelbaum::increment_version(h));
     }
 
     // Compute offset to various sections based on flags
@@ -301,7 +295,7 @@ public:
         size_t sz = calc_size(true, false, 0, false, false, false, 0);
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_EOS, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_EOS, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -323,7 +317,7 @@ public:
         size_t sz = calc_size(false, true, skip.size(), true, false, false, 0);
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_SKIP | FLAG_SKIP_EOS, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_SKIP | FLAG_SKIP_EOS, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -348,7 +342,7 @@ public:
         size_t sz = calc_size(false, false, 0, false, true, false, lst.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_LIST, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_LIST, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -371,7 +365,7 @@ public:
         size_t sz = calc_size(false, false, 0, false, false, true, bmp.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_POP, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_POP, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -394,7 +388,7 @@ public:
         size_t sz = calc_size(true, false, 0, false, true, false, lst.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_EOS | FLAG_LIST, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_EOS | FLAG_LIST, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -422,7 +416,7 @@ public:
         size_t sz = calc_size(true, false, 0, false, false, true, bmp.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_EOS | FLAG_POP, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_EOS | FLAG_POP, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -451,7 +445,7 @@ public:
         size_t sz = calc_size(false, true, skip.size(), false, true, false, lst.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_SKIP | FLAG_LIST, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_SKIP | FLAG_LIST, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -477,7 +471,7 @@ public:
         size_t sz = calc_size(false, true, skip.size(), false, false, true, bmp.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_SKIP | FLAG_POP, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_SKIP | FLAG_POP, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -504,7 +498,7 @@ public:
         size_t sz = calc_size(false, true, skip.size(), true, true, false, lst.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_SKIP | FLAG_SKIP_EOS | FLAG_LIST, 0, 
+        uint64_t header = make_header(FLAG_SKIP | FLAG_SKIP_EOS | FLAG_LIST, 
                                       static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
@@ -538,8 +532,7 @@ public:
         size_t sz = calc_size(false, true, skip.size(), true, false, true, bmp.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_SKIP | FLAG_SKIP_EOS | FLAG_POP, 0,
-                                      static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_SKIP | FLAG_SKIP_EOS | FLAG_POP, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -571,8 +564,7 @@ public:
         size_t sz = calc_size(true, true, skip.size(), true, false, false, 0);
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, 0,
-                                      static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -603,8 +595,7 @@ public:
         size_t sz = calc_size(true, true, skip.size(), true, true, false, lst.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS | FLAG_LIST, 0,
-                                      static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS | FLAG_LIST, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -641,8 +632,7 @@ public:
         size_t sz = calc_size(true, true, skip.size(), true, false, true, bmp.count());
         slot_type* node = allocate_node(sz);
         
-        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS | FLAG_POP, 0,
-                                      static_cast<uint32_t>(sz));
+        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS | FLAG_POP, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
@@ -674,13 +664,17 @@ public:
     slot_type* build_empty_root() {
         size_t sz = 1;  // just header
         slot_type* node = allocate_node(sz);
-        uint64_t header = make_header(0, 0, static_cast<uint32_t>(sz));
+        uint64_t header = make_header(0, static_cast<uint32_t>(sz));
         store_slot<THREADED>(&node[0], header);
         return node;
     }
 
     /**
      * Deep copy a node (recursively copies children)
+     */
+    /**
+     * Deep copy a node (recursively copies children)
+     * For THREADED: returns nullptr if WRITE_BIT encountered (caller should retry)
      */
     slot_type* deep_copy(slot_type* src, size_t depth = 0) {
         if (!src) return nullptr;
@@ -690,15 +684,28 @@ public:
         
         slot_type* dst = allocate_node(sz);
         
-        // Copy header
-        store_slot<THREADED>(&dst[0], load_slot<THREADED>(&src[0]));
+        // Copy header (mask off control bits for THREADED)
+        uint64_t header = load_slot<THREADED>(&src[0]);
+        if constexpr (THREADED) {
+            header &= ~(WRITE_BIT | READ_BIT);
+        }
+        store_slot<THREADED>(&dst[0], header);
         
         node_view_t dst_view(dst);
         
         // Deep copy EOS data
         if (src_view.has_eos()) {
             new (dst_view.eos_data()) dataptr_t();
-            dst_view.eos_data()->deep_copy_from(*src_view.eos_data());
+            if constexpr (THREADED) {
+                if (!dst_view.eos_data()->deep_copy_from(*src_view.eos_data())) {
+                    // WRITE_BIT encountered - clean up and signal retry
+                    dst_view.eos_data()->~dataptr_t();
+                    deallocate_node(dst);
+                    return nullptr;
+                }
+            } else {
+                dst_view.eos_data()->deep_copy_from(*src_view.eos_data());
+            }
         }
         
         // Copy skip
@@ -711,7 +718,17 @@ public:
             // Deep copy SKIP_EOS data
             if (src_view.has_skip_eos()) {
                 new (dst_view.skip_eos_data()) dataptr_t();
-                dst_view.skip_eos_data()->deep_copy_from(*src_view.skip_eos_data());
+                if constexpr (THREADED) {
+                    if (!dst_view.skip_eos_data()->deep_copy_from(*src_view.skip_eos_data())) {
+                        // Clean up and signal retry
+                        dst_view.skip_eos_data()->~dataptr_t();
+                        if (src_view.has_eos()) dst_view.eos_data()->~dataptr_t();
+                        deallocate_node(dst);
+                        return nullptr;
+                    }
+                } else {
+                    dst_view.skip_eos_data()->deep_copy_from(*src_view.skip_eos_data());
+                }
             }
         }
         
@@ -742,11 +759,24 @@ public:
             }
             
             if constexpr (THREADED) {
+                // Check for WRITE_BIT on child pointer
+                if (child_ptr & WRITE_BIT) {
+                    // Clean up partially built node and signal retry
+                    cleanup_partial_copy(dst, i);
+                    return nullptr;
+                }
                 child_ptr &= PTR_MASK;
             }
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             if (child) {
                 slot_type* child_copy = deep_copy(child, child_depth);
+                if constexpr (THREADED) {
+                    if (!child_copy) {
+                        // Child copy failed - clean up and signal retry
+                        cleanup_partial_copy(dst, i);
+                        return nullptr;
+                    }
+                }
                 dst_view.set_child_ptr(i, reinterpret_cast<uint64_t>(child_copy));
             } else {
                 dst_view.set_child_ptr(i, 0);
@@ -754,6 +784,30 @@ public:
         }
         
         return dst;
+    }
+
+private:
+    // Helper to clean up partially copied node during failed deep_copy
+    void cleanup_partial_copy(slot_type* node, int copied_children) {
+        node_view_t view(node);
+        
+        // Clean up dataptrs
+        if (view.has_eos()) view.eos_data()->~dataptr_t();
+        if (view.has_skip_eos()) view.skip_eos_data()->~dataptr_t();
+        
+        // Recursively delete already-copied children
+        for (int i = 0; i < copied_children; ++i) {
+            uint64_t child_ptr = view.get_child_ptr(i);
+            if constexpr (THREADED) {
+                child_ptr &= PTR_MASK;
+            }
+            slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
+            if (child) {
+                deallocate_node(child);
+            }
+        }
+        
+        deallocate_node(node);
     }
 };
 

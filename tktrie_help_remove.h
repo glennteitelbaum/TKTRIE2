@@ -17,6 +17,7 @@ struct remove_result {
     std::vector<path_step<THREADED>> path;
     bool found = false;
     bool hit_write = false;
+    bool hit_read = false;
     bool root_deleted = false;
 };
 
@@ -67,8 +68,10 @@ private:
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
         if constexpr (THREADED) {
             if (child_ptr & WRITE_BIT) { result.hit_write = true; return result; }
-            child_ptr &= PTR_MASK;
+            if (child_ptr & READ_BIT) { result.hit_read = true; return result; }
         }
+        
+        uint64_t clean_ptr = child_ptr & PTR_MASK;
         
         // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
         if constexpr (FIXED_LEN > 0 && !THREADED) {
@@ -79,17 +82,20 @@ private:
             }
         }
         
-        slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
+        slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
         result_t child_result;
+        child_result.hit_read = false;
         remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
         
-        if (!child_result.found || child_result.hit_write) {
+        if (!child_result.found || child_result.hit_write || child_result.hit_read) {
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
+            result.hit_read = child_result.hit_read;
             return result;
         }
         
-        result.path.push_back({node, c});
+        // Record path step with slot and expected pointer for verification
+        result.path.push_back({node, child_slot, clean_ptr, c});
         for (auto& step : child_result.path) result.path.push_back(step);
         
         if (child_result.root_deleted)
