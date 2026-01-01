@@ -491,7 +491,7 @@ private:
         {
             std::lock_guard<mutex_type> lock(write_mutex_);
 
-            // Build path INSIDE lock (safe from other writers)
+            // Build path INSIDE lock
             auto result = insert_t::build_insert_path(builder_, get_root(), key_bytes,
                                                        std::forward<U>(value));
 
@@ -502,7 +502,7 @@ private:
                 return {find(key), false};
             }
 
-            // Set WRITE_BIT leaf→root on old path
+            // Set WRITE_BIT leaf→root on old path (blocks readers)
             for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
                 node_view_t view(it->node);
                 slot_type* child_slot = view.find_child(it->child_char);
@@ -516,7 +516,6 @@ private:
                 set_root(result.new_root);
             }
 
-            // Increment versions
             for (auto* n : result.new_nodes) {
                 if (n) {
                     node_view_t view(n);
@@ -529,7 +528,7 @@ private:
 
         }  // Lock released
 
-        // Dealloc OUTSIDE lock - wait for readers via dataptr protocol
+        // Dealloc OUTSIDE lock - wait for dataptr readers
         for (auto* n : to_free) {
             if (n) {
                 node_view_t view(n);
@@ -630,7 +629,7 @@ private:
 
         }  // Lock released
 
-        // Dealloc OUTSIDE lock - wait for readers
+        // Dealloc OUTSIDE lock - wait for dataptr readers
         for (auto* n : to_free) {
             if (n) {
                 node_view_t view(n);

@@ -30,6 +30,7 @@ struct insert_result {
     std::vector<path_step<THREADED>> path;          // path from root to leaf (for WRITE_BIT)
     bool already_exists = false;                    // key already existed
     bool hit_write = false;                         // encountered WRITE_BIT
+    bool hit_read = false;                          // encountered READ_BIT (another writer)
 };
 
 /**
@@ -75,7 +76,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         return insert_into_node(builder, root, key, std::forward<U>(value), depth, result);
     }
 
-private:
     template <typename U>
     static result_t& insert_into_node(node_builder_t& builder,
                                        slot_type* node,

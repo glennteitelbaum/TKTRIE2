@@ -48,7 +48,7 @@ static constexpr int VERSION_SHIFT      = 27;
 // Pointer bit flags for concurrency
 static constexpr uint64_t WRITE_BIT = 1ULL << 63;
 static constexpr uint64_t READ_BIT  = 1ULL << 62;
-static constexpr uint64_t PTR_MASK  = (1ULL << 62) - 1;
+static constexpr uint64_t PTR_MASK  = ~(WRITE_BIT | READ_BIT);  // masks off both control bits
 
 // Byteswap - C++23 has std::byteswap, provide fallback for C++20
 template <typename T>
