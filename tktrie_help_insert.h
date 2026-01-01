@@ -10,15 +10,26 @@
 namespace gteitelbaum {
 
 /**
+ * Path step for WRITE_BIT setting
+ */
+template <bool THREADED>
+struct path_step {
+    slot_type_t<THREADED>* node;
+    unsigned char child_char;
+};
+
+/**
  * Insert operation results
  */
 template <bool THREADED>
 struct insert_result {
-    slot_type_t<THREADED>* new_root;          // new root if root changed
+    slot_type_t<THREADED>* new_root = nullptr;     // new root if root changed
+    slot_type_t<THREADED>* expected_root = nullptr; // root we built against (for verification)
     std::vector<slot_type_t<THREADED>*> new_nodes;  // newly allocated nodes
     std::vector<slot_type_t<THREADED>*> old_nodes;  // nodes to delete
-    bool already_exists;                       // key already existed
-    bool hit_write;                            // encountered WRITE_BIT
+    std::vector<path_step<THREADED>> path;          // path from root to leaf (for WRITE_BIT)
+    bool already_exists = false;                    // key already existed
+    bool hit_write = false;                         // encountered WRITE_BIT
 };
 
 /**
@@ -32,6 +43,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using node_builder_t = typename base::node_builder_t;
     using dataptr_t = typename base::dataptr_t;
     using result_t = insert_result<THREADED>;
+    using path_step_t = path_step<THREADED>;
 
     /**
      * Build new path for insertion
@@ -45,6 +57,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                        size_t depth = 0) {
         result_t result;
         result.new_root = nullptr;
+        result.expected_root = root;  // Record root we're building against
         result.already_exists = false;
         result.hit_write = false;
         
@@ -147,11 +160,18 @@ private:
                 return result;
             }
             
+            // Record path step: this node and the char we descended through
+            // Child's path is already recorded, we add our step at the front (root to leaf order)
+            result.path.push_back({node, c});
+            for (auto& step : child_result.path) {
+                result.path.push_back(step);
+            }
+            
             // Child was modified - need to clone this node with new child pointer
             return clone_with_new_child(builder, node, c, child_result.new_root, 
                                         child_result, result);
         } else {
-            // No child - add new child
+            // No child - add new child (no path to record - new nodes don't need WRITE_BIT)
             return add_child(builder, node, c, key.substr(1), std::forward<U>(value),
                             depth, result);
         }

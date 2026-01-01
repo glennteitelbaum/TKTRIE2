@@ -9,16 +9,27 @@
 namespace gteitelbaum {
 
 /**
+ * Path step for WRITE_BIT setting (shared with insert)
+ */
+template <bool THREADED>
+struct remove_path_step {
+    slot_type_t<THREADED>* node;
+    unsigned char child_char;
+};
+
+/**
  * Remove operation results
  */
 template <bool THREADED>
 struct remove_result {
-    slot_type_t<THREADED>* new_root;          // new root if root changed (nullptr means delete root)
-    std::vector<slot_type_t<THREADED>*> new_nodes;  // newly allocated nodes
-    std::vector<slot_type_t<THREADED>*> old_nodes;  // nodes to delete
-    bool found;                                // key was found and removed
-    bool hit_write;                            // encountered WRITE_BIT
-    bool root_deleted;                         // entire trie is now empty
+    slot_type_t<THREADED>* new_root = nullptr;          // new root if root changed (nullptr means delete root)
+    slot_type_t<THREADED>* expected_root = nullptr;     // root we built against
+    std::vector<slot_type_t<THREADED>*> new_nodes;      // newly allocated nodes
+    std::vector<slot_type_t<THREADED>*> old_nodes;      // nodes to delete
+    std::vector<remove_path_step<THREADED>> path;       // path from root to leaf (for WRITE_BIT)
+    bool found = false;                                 // key was found and removed
+    bool hit_write = false;                             // encountered WRITE_BIT
+    bool root_deleted = false;                          // entire trie is now empty
 };
 
 /**
@@ -32,6 +43,7 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using node_builder_t = typename base::node_builder_t;
     using dataptr_t = typename base::dataptr_t;
     using result_t = remove_result<THREADED>;
+    using path_step_t = remove_path_step<THREADED>;
 
     /**
      * Build new path with key removed
@@ -42,6 +54,7 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                        size_t depth = 0) {
         result_t result;
         result.new_root = nullptr;
+        result.expected_root = root;  // Record root we're building against
         result.found = false;
         result.hit_write = false;
         result.root_deleted = false;
@@ -134,6 +147,13 @@ private:
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
             return result;
+        }
+        
+        // Record path step: this node and char we descended through
+        // Child's path is already recorded, add our step at front (root-to-leaf order)
+        result.path.push_back({node, c});
+        for (auto& step : child_result.path) {
+            result.path.push_back(step);
         }
         
         // Child was modified

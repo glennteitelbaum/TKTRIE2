@@ -486,38 +486,55 @@ private:
     std::pair<iterator, bool> insert_threaded(const Key& key,
                                                const std::string& key_bytes,
                                                U&& value) {
-        // For now, fully serialize all writes
-        // TODO: Implement proper optimistic concurrency with safe memory reclamation
-        std::lock_guard<mutex_type> lock(write_mutex_);
-        
-        auto result = insert_t::build_insert_path(builder_, get_root(), key_bytes,
-                                                   std::forward<U>(value));
+        std::vector<slot_type*> to_free;
 
-        if (result.already_exists) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
+        {
+            std::lock_guard<mutex_type> lock(write_mutex_);
+
+            // Build path INSIDE lock (safe from other writers)
+            auto result = insert_t::build_insert_path(builder_, get_root(), key_bytes,
+                                                       std::forward<U>(value));
+
+            if (result.already_exists) {
+                for (auto* n : result.new_nodes) {
+                    builder_.deallocate_node(n);
+                }
+                return {find(key), false};
             }
-            return {find(key), false};
-        }
 
-        // Update root
-        if (result.new_root) {
-            set_root(result.new_root);
-        }
+            // Set WRITE_BIT leaf→root on old path
+            for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
+                node_view_t view(it->node);
+                slot_type* child_slot = view.find_child(it->child_char);
+                if (child_slot) {
+                    child_slot->fetch_or(WRITE_BIT, std::memory_order_release);
+                }
+            }
 
-        // Increment versions on new nodes
-        for (auto* n : result.new_nodes) {
+            // Swap root
+            if (result.new_root) {
+                set_root(result.new_root);
+            }
+
+            // Increment versions
+            for (auto* n : result.new_nodes) {
+                if (n) {
+                    node_view_t view(n);
+                    view.increment_version();
+                }
+            }
+
+            elem_count_.fetch_add(1, std::memory_order_relaxed);
+            to_free = std::move(result.old_nodes);
+
+        }  // Lock released
+
+        // Dealloc OUTSIDE lock - wait for readers via dataptr protocol
+        for (auto* n : to_free) {
             if (n) {
                 node_view_t view(n);
-                view.increment_version();
-            }
-        }
-
-        elem_count_.fetch_add(1, std::memory_order_relaxed);
-
-        // Cleanup old nodes
-        for (auto* n : result.old_nodes) {
-            if (n && n != result.new_root) {
+                if (view.has_eos()) view.eos_data()->begin_write();
+                if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
                 builder_.deallocate_node(n);
             }
         }
@@ -577,31 +594,48 @@ private:
     }
 
     bool erase_threaded(const std::string& key_bytes) {
-        // For now, fully serialize all writes
-        // TODO: Implement proper optimistic concurrency with safe memory reclamation
-        std::lock_guard<mutex_type> lock(write_mutex_);
-        
-        auto result = remove_t::build_remove_path(builder_, get_root(), key_bytes);
+        std::vector<slot_type*> to_free;
 
-        if (!result.found) {
-            for (auto* n : result.new_nodes) {
-                builder_.deallocate_node(n);
+        {
+            std::lock_guard<mutex_type> lock(write_mutex_);
+
+            // Build removal path INSIDE lock
+            auto result = remove_t::build_remove_path(builder_, get_root(), key_bytes);
+
+            if (!result.found) {
+                for (auto* n : result.new_nodes) {
+                    builder_.deallocate_node(n);
+                }
+                return false;
             }
-            return false;
-        }
 
-        // Update root
-        if (result.root_deleted) {
-            set_root(nullptr);
-        } else if (result.new_root) {
-            set_root(result.new_root);
-        }
+            // Set WRITE_BIT leaf→root
+            for (auto it = result.path.rbegin(); it != result.path.rend(); ++it) {
+                node_view_t view(it->node);
+                slot_type* child_slot = view.find_child(it->child_char);
+                if (child_slot) {
+                    child_slot->fetch_or(WRITE_BIT, std::memory_order_release);
+                }
+            }
 
-        elem_count_.fetch_sub(1, std::memory_order_relaxed);
+            // Swap root
+            if (result.root_deleted) {
+                set_root(nullptr);
+            } else if (result.new_root) {
+                set_root(result.new_root);
+            }
 
-        // Cleanup old nodes
-        for (auto* n : result.old_nodes) {
-            if (n && n != result.new_root) {
+            elem_count_.fetch_sub(1, std::memory_order_relaxed);
+            to_free = std::move(result.old_nodes);
+
+        }  // Lock released
+
+        // Dealloc OUTSIDE lock - wait for readers
+        for (auto* n : to_free) {
+            if (n) {
+                node_view_t view(n);
+                if (view.has_eos()) view.eos_data()->begin_write();
+                if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
                 builder_.deallocate_node(n);
             }
         }
