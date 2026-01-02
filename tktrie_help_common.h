@@ -64,17 +64,16 @@ struct trie_helpers {
 
     /**
      * Extract child pointers from a node as vector
-     * For FULL nodes, only extracts non-null pointers
+     * For FULL nodes, returns 256-element vector indexed by character
+     * For LIST/POP nodes, returns children in structure order
      */
     static std::vector<uint64_t> extract_children(node_view_t& view) {
         std::vector<uint64_t> children;
         if (view.has_full()) {
-            // FULL: extract non-null pointers
+            // FULL: return all 256 slots (direct indexed)
+            children.resize(256);
             for (int i = 0; i < 256; ++i) {
-                uint64_t ptr = view.get_child_ptr(i);
-                if (ptr != 0) {
-                    children.push_back(ptr);
-                }
+                children[i] = view.get_child_ptr(i);
             }
         } else {
             int count = view.child_count();
@@ -160,8 +159,10 @@ struct trie_helpers {
         } else if (view.has_pop()) {
             popcount_bitmap bmp = view.get_bitmap();
             for (int i = 0; i < bmp.count(); ++i) {
-                if (view.get_child_ptr(i) != 0) {
-                    chars.push_back(bmp.nth_char(i));
+                unsigned char ch = bmp.nth_char(i);
+                uint64_t ptr = view.get_child_ptr(i);
+                if (ptr != 0) {
+                    chars.push_back(ch);
                 }
             }
         }
@@ -210,6 +211,9 @@ struct trie_helpers {
     /**
      * Rebuild node with given children - shared by insert and remove helpers
      * node_type: 0=LIST, 1=POP, 2=FULL
+     * 
+     * For FULL nodes (node_type==2): children must be 256-element vector indexed by character
+     * For LIST/POP nodes: children is in structure order matching chars
      */
     static slot_type* rebuild_node(node_builder_t& builder,
                                     node_view_t& view,
@@ -225,37 +229,52 @@ struct trie_helpers {
         if (flags & FLAG_SKIP_EOS) view.skip_eos_data()->try_read(skip_eos_val);
         std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
         
-        if (children.empty()) {
-            // 3 flag bits = 8 combos, but SKIP_EOS requires SKIP
-            switch (mk_flag_switch(flags, MASK)) {
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK):
-                    return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
-                    return builder.build_eos_skip(std::move(eos_val), skip);
-                case mk_flag_switch(FLAG_EOS, MASK):
-                    return builder.build_eos(std::move(eos_val));
-                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
-                    return builder.build_skip_eos(skip, std::move(skip_eos_val));
-                case mk_flag_switch(FLAG_SKIP, MASK):  // SKIP with no data - degenerate but handle it
-                case mk_flag_switch(0, MASK):
-                    return builder.build_empty_root();
-                // Invalid: SKIP_EOS without SKIP
-                case mk_flag_switch(FLAG_SKIP_EOS, MASK):
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
-                default:
-                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
-                    __builtin_unreachable();
+        if (children.empty() || (node_type == 2 && children.size() == 256)) {
+            // Check if FULL node with all zeros
+            bool all_zero = true;
+            if (node_type == 2) {
+                for (int i = 0; i < 256; ++i) {
+                    if (children[i] != 0) {
+                        all_zero = false;
+                        break;
+                    }
+                }
+            } else {
+                all_zero = children.empty();
+            }
+            
+            if (all_zero) {
+                // 3 flag bits = 8 combos, but SKIP_EOS requires SKIP
+                switch (mk_flag_switch(flags, MASK)) {
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK):
+                        return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
+                        return builder.build_eos_skip(std::move(eos_val), skip);
+                    case mk_flag_switch(FLAG_EOS, MASK):
+                        return builder.build_eos(std::move(eos_val));
+                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
+                        return builder.build_skip_eos(skip, std::move(skip_eos_val));
+                    case mk_flag_switch(FLAG_SKIP, MASK):  // SKIP with no data - degenerate but handle it
+                    case mk_flag_switch(0, MASK):
+                        return builder.build_empty_root();
+                    // Invalid: SKIP_EOS without SKIP
+                    case mk_flag_switch(FLAG_SKIP_EOS, MASK):
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
+                    default:
+                        KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
+                        __builtin_unreachable();
+                }
             }
         }
         
-        // Handle FULL nodes
+        // Handle FULL nodes - children is already 256-element direct-indexed
         if (node_type == 2) {
-            // FULL node: flags must not have SKIP (FULL nodes don't support skip currently)
-            // Build EOS | FULL or just FULL
+            KTRIE_DEBUG_ASSERT(children.size() == 256);
+            // FULL nodes don't support SKIP currently
             if (flags & FLAG_EOS) {
-                return builder.build_eos_full(std::move(eos_val), bmp, children);
+                return builder.build_eos_full(std::move(eos_val), children);
             } else {
-                return builder.build_full(bmp, children);
+                return builder.build_full(children);
             }
         }
         

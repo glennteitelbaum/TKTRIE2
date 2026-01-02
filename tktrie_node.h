@@ -486,9 +486,11 @@ public:
 
     /**
      * Build FULL node (256 direct-indexed children, no data)
-     * Expands from bitmap representation to 256 slots
+     * Expects children as pre-expanded 256-element vector indexed by character
      */
-    slot_type* build_full(popcount_bitmap bmp, const std::vector<uint64_t>& children) {
+    slot_type* build_full(const std::vector<uint64_t>& children) {
+        KTRIE_DEBUG_ASSERT(children.size() == 256);
+        
         size_t sz = calc_size(false, false, 0, false, false, false, true, 0);
         slot_type* node = allocate_node(sz);
         
@@ -496,13 +498,9 @@ public:
         store_slot<THREADED>(&node[0], header);
         
         node_view_t view(node);
-        // Expand bitmap+children to 256 direct slots
-        int child_idx = 0;
+        // Children are already in direct-indexed format
         for (int c = 0; c < 256; ++c) {
-            if (bmp.contains(static_cast<unsigned char>(c))) {
-                view.set_child_ptr(c, children[child_idx++]);
-            }
-            // Non-present chars already 0 from allocate_node
+            view.set_child_ptr(c, children[c]);
         }
         
         return node;
@@ -510,9 +508,12 @@ public:
 
     /**
      * Build EOS | FULL node (data here + 256 direct-indexed children)
+     * Expects children as pre-expanded 256-element vector indexed by character
      */
     template <typename U>
-    slot_type* build_eos_full(U&& value, popcount_bitmap bmp, const std::vector<uint64_t>& children) {
+    slot_type* build_eos_full(U&& value, const std::vector<uint64_t>& children) {
+        KTRIE_DEBUG_ASSERT(children.size() == 256);
+        
         size_t sz = calc_size(true, false, 0, false, false, false, true, 0);
         slot_type* node = allocate_node(sz);
         
@@ -525,12 +526,9 @@ public:
         view.eos_data()->set(std::forward<U>(value));
         view.eos_data()->end_write();
         
-        // Expand bitmap+children to 256 direct slots
-        int child_idx = 0;
+        // Children are already in direct-indexed format
         for (int c = 0; c < 256; ++c) {
-            if (bmp.contains(static_cast<unsigned char>(c))) {
-                view.set_child_ptr(c, children[child_idx++]);
-            }
+            view.set_child_ptr(c, children[c]);
         }
         
         return node;

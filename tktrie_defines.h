@@ -47,7 +47,7 @@ static constexpr uint64_t FLAGS_MASK    = 0xFC00000000000000ULL;  // 6 flag bits
 static constexpr uint64_t SIZE_MASK     = 0x03FFFFFFFFFFFFFFULL;  // 58 bits for size
 
 // Thresholds for node type transitions
-static constexpr int FULL_THRESHOLD = 196;  // POP > this → FULL
+static constexpr int FULL_THRESHOLD = 176;  // POP > this → FULL (0xB0)
 static constexpr int LIST_MAX = 7;          // LIST can hold at most 7
 
 // Pointer bit flags for concurrency (kept for compatibility, no longer used)

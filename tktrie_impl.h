@@ -289,7 +289,7 @@ public:
         }
         
         if constexpr (THREADED) {
-            auto guard = get_ebr_slot().guard();
+            auto guard = get_ebr_slot().get_guard();
             slot_type* root = get_root();
             return nav_t::contains(root, key_bytes);
         } else {
@@ -308,7 +308,7 @@ public:
         T value;
         
         if constexpr (THREADED) {
-            auto guard = get_ebr_slot().guard();
+            auto guard = get_ebr_slot().get_guard();
             slot_type* root = get_root();
             bool found = nav_t::read(root, key_bytes, value);
             if (found) {
@@ -365,7 +365,7 @@ public:
 
     iterator begin() const {
         if constexpr (THREADED) {
-            auto guard = get_ebr_slot().guard();
+            auto guard = get_ebr_slot().get_guard();
             slot_type* root = get_root();
             if (!root) return end();
             
@@ -542,7 +542,7 @@ private:
             // Step 1: OUTSIDE LOCK - traverse and build new tree (COW)
             // EBR guard protects us from use-after-free during traversal
             auto& slot = get_ebr_slot();
-            auto guard = slot.guard();
+            auto guard = slot.get_guard();
             
             auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), key_bytes,
                                                        std::forward<U>(value));
@@ -654,7 +654,7 @@ private:
             // Step 1: OUTSIDE LOCK - traverse and build new tree (COW)
             // EBR guard protects us from use-after-free during traversal
             auto& slot = get_ebr_slot();
-            auto guard = slot.guard();
+            auto guard = slot.get_guard();
             
             auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), key_bytes);
 

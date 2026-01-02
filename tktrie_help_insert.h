@@ -204,19 +204,39 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                              result_t& result) {
         node_view_t view(node);
         
-        // Get current children
-        auto children = base::extract_children(view);
+        // Get current children and chars
+        auto old_children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        // Find and replace the modified child
-        int idx = base::find_char_index(chars, c);
-        if (idx >= 0) {
-            children[idx] = reinterpret_cast<uint64_t>(result.new_subtree);
+        // For FULL nodes, old_children is already 256-element, update directly
+        if (view.has_full()) {
+            old_children[c] = reinterpret_cast<uint64_t>(result.new_subtree);
+            
+            // Rebuild as FULL (children already in correct format)
+            slot_type* new_node;
+            if (view.has_eos()) {
+                T eos_val;
+                view.eos_data()->try_read(eos_val);
+                new_node = builder.build_eos_full(std::move(eos_val), old_children);
+            } else {
+                new_node = builder.build_full(old_children);
+            }
+            
+            result.new_nodes.push_back(new_node);
+            result.old_nodes.push_back(node);
+            result.new_subtree = new_node;
+            return result;
         }
         
-        // Rebuild with new child pointer
+        // For LIST/POP: find and replace the modified child
+        int idx = base::find_char_index(chars, c);
+        if (idx >= 0) {
+            old_children[idx] = reinterpret_cast<uint64_t>(result.new_subtree);
+        }
+        
+        // Rebuild with same structure (no transition needed, just updating pointer)
         auto [node_type, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, old_children);
         
         result.new_nodes.push_back(new_node);
         result.old_nodes.push_back(node);
@@ -410,7 +430,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         }
         
         bool has_new_skip = !new_skip.empty();
-        bool has_children = !children.empty();
+        bool has_children = view.has_full() ? (view.live_child_count() > 0) : !children.empty();
         
         if (!has_children) {
             switch (mk_switch(has_new_skip, has_eos)) {
@@ -427,10 +447,10 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         
         auto [node_type, lst, bmp] = base::build_child_structure(chars);
         
-        // FULL nodes with skip not currently supported
+        // FULL nodes: children is already 256-element
         if (node_type == 2) {
-            return has_eos ? builder.build_eos_full(std::move(eos_val), bmp, children)
-                           : builder.build_full(bmp, children);
+            return has_eos ? builder.build_eos_full(std::move(eos_val), children)
+                           : builder.build_full(children);
         }
         
         bool is_list = (node_type == 0);
@@ -476,7 +496,9 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         
         slot_type* new_node;
         
-        if (children.empty()) {
+        bool has_children = view.has_full() ? (view.live_child_count() > 0) : !children.empty();
+        
+        if (!has_children) {
             switch (mk_flag_switch(flags, MASK)) {
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     new_node = builder.build_eos_skip_eos(std::forward<U>(value), skip, std::move(skip_eos_val));
@@ -495,9 +517,9 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         } else {
             auto [node_type, lst, bmp] = base::build_child_structure(chars);
             
-            // FULL nodes can't have SKIP (not supported currently)
+            // FULL nodes: children is already 256-element
             if (node_type == 2) {
-                new_node = builder.build_eos_full(std::forward<U>(value), bmp, children);
+                new_node = builder.build_eos_full(std::forward<U>(value), children);
             } else {
                 bool is_list = (node_type == 0);
                 switch (mk_flag_switch(flags, MASK, is_list)) {
@@ -555,7 +577,9 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         
         slot_type* new_node;
         
-        if (children.empty()) {
+        bool has_children = view.has_full() ? (view.live_child_count() > 0) : !children.empty();
+        
+        if (!has_children) {
             switch (mk_flag_switch(flags, MASK)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
                     new_node = builder.build_eos_skip_eos(std::move(eos_val), skip, std::forward<U>(value));
@@ -636,7 +660,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     // Copy old children to their correct positions
                     if (view.has_full()) {
                         for (int i = 0; i < 256; ++i) {
-                            new_children[i] = view.get_child_ptr(i);
+                            new_children[i] = old_children[i];
                         }
                     } else {
                         for (size_t i = 0; i < old_chars.size(); ++i) {
@@ -682,20 +706,22 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         std::vector<uint64_t> new_children;
         
         if (node_type == 2) {
-            // FULL node - 256 direct slots
+            // FULL node - 256 direct slots indexed by character
             new_children.resize(256, 0);
             
             // Copy old children to their correct positions
             if (view.has_full()) {
+                // Source is already FULL - direct copy
                 for (int i = 0; i < 256; ++i) {
-                    new_children[i] = view.get_child_ptr(i);
+                    new_children[i] = old_children[i];
                 }
             } else {
+                // Source is LIST or POP - map to character positions
                 for (size_t i = 0; i < old_chars.size(); ++i) {
                     new_children[old_chars[i]] = old_children[i];
                 }
             }
-            // Add new child
+            // Add new child at its character position
             new_children[c] = reinterpret_cast<uint64_t>(child_node);
         } else if (node_type == 1) {
             // POP node - insert at bitmap position

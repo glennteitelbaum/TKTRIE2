@@ -155,7 +155,27 @@ private:
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        // Find and replace the modified child
+        // For FULL nodes, children is already 256-element, update directly
+        if (view.has_full()) {
+            children[c] = reinterpret_cast<uint64_t>(new_child);
+            
+            // Rebuild as FULL
+            slot_type* new_node;
+            if (view.has_eos()) {
+                T eos_val;
+                view.eos_data()->try_read(eos_val);
+                new_node = builder.build_eos_full(std::move(eos_val), children);
+            } else {
+                new_node = builder.build_full(children);
+            }
+            
+            result.new_nodes.push_back(new_node);
+            result.old_nodes.push_back(node);
+            result.new_subtree = new_node;
+            return result;
+        }
+        
+        // For LIST/POP: find and replace the modified child
         int idx = base::find_char_index(chars, c);
         if (idx >= 0) {
             children[idx] = reinterpret_cast<uint64_t>(new_child);
@@ -182,7 +202,7 @@ private:
         uint64_t flags = view.flags();
         constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS;
         
-        bool has_children = view.child_count() > 0;
+        bool has_children = view.has_full() ? (view.live_child_count() > 0) : (view.child_count() > 0);
         
         // If no other data, delete this subtree
         if (!(flags & FLAG_SKIP_EOS) && !has_children) {
@@ -211,13 +231,10 @@ private:
         if (has_children) {
             auto [node_type, lst, bmp] = base::build_child_structure(chars);
             
-            // FULL nodes with SKIP not supported
+            // FULL nodes
             if (node_type == 2) {
-                if (flags & FLAG_SKIP_EOS) {
-                    new_node = builder.build_full(bmp, children);  // Just FULL, no EOS now
-                } else {
-                    new_node = builder.build_full(bmp, children);
-                }
+                // Just FULL, no EOS now
+                new_node = builder.build_full(children);
             } else {
                 bool is_list = (node_type == 0);
                 switch (mk_flag_switch(flags, MASK, is_list)) {
@@ -276,7 +293,7 @@ private:
         uint64_t flags = view.flags();
         constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS;
         
-        bool has_children = view.child_count() > 0;
+        bool has_children = view.has_full() ? (view.live_child_count() > 0) : (view.child_count() > 0);
         std::string_view skip = view.skip_chars();
         
         if (!(flags & FLAG_EOS) && !has_children) {
@@ -296,12 +313,12 @@ private:
         if (has_children) {
             auto [node_type, lst, bmp] = base::build_child_structure(chars);
             
-            // FULL nodes with SKIP not supported - just build without SKIP_EOS
+            // FULL nodes
             if (node_type == 2) {
                 if (flags & FLAG_EOS) {
-                    new_node = builder.build_eos_full(std::move(eos_val), bmp, children);
+                    new_node = builder.build_eos_full(std::move(eos_val), children);
                 } else {
-                    new_node = builder.build_full(bmp, children);
+                    new_node = builder.build_full(children);
                 }
             } else {
                 bool is_list = (node_type == 0);
@@ -360,6 +377,44 @@ private:
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
+        // For FULL nodes: just set the slot to 0, don't remove from chars/children
+        if (view.has_full()) {
+            children[c] = 0;  // Clear the slot
+            
+            // Count remaining live children
+            int live_count = 0;
+            for (int i = 0; i < 256; ++i) {
+                if (children[i] != 0) ++live_count;
+            }
+            
+            bool has_eos = view.has_eos(), has_skip_eos = view.has_skip_eos();
+            
+            // If no live children and no data, delete this subtree
+            if (live_count == 0 && !has_eos && !has_skip_eos) {
+                result.subtree_deleted = true;
+                result.old_nodes.push_back(node);
+                return result;
+            }
+            
+            // Rebuild as FULL (or could downgrade to POP if live_count <= FULL_THRESHOLD)
+            // For now, keep as FULL for simplicity
+            slot_type* new_node;
+            if (has_eos) {
+                T eos_val;
+                view.eos_data()->try_read(eos_val);
+                new_node = builder.build_eos_full(std::move(eos_val), children);
+            } else {
+                new_node = builder.build_full(children);
+            }
+            
+            result.new_nodes.push_back(new_node);
+            result.new_subtree = new_node;
+            result.old_nodes.push_back(node);
+            try_collapse(builder, result);
+            return result;
+        }
+        
+        // For LIST/POP: remove the child
         int idx = base::find_char_index(chars, c);
         if (idx >= 0) {
             children.erase(children.begin() + idx);
@@ -395,6 +450,39 @@ private:
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
+        // For FULL nodes
+        if (view.has_full()) {
+            slot_type* child_slot = view.find_child(c);
+            dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
+            dp->~dataptr_t();
+            children[c] = 0;
+            
+            int live_count = 0;
+            for (int i = 0; i < 256; ++i) {
+                if (children[i] != 0) ++live_count;
+            }
+            
+            if (live_count == 0) {
+                result.subtree_deleted = true;
+                result.old_nodes.push_back(node);
+                return result;
+            }
+            
+            slot_type* new_node;
+            if (view.has_eos()) {
+                T eos_val;
+                view.eos_data()->try_read(eos_val);
+                new_node = builder.build_eos_full(std::move(eos_val), children);
+            } else {
+                new_node = builder.build_full(children);
+            }
+            
+            result.new_nodes.push_back(new_node);
+            result.new_subtree = new_node;
+            result.old_nodes.push_back(node);
+            return result;
+        }
+        
         int idx = base::find_char_index(chars, c);
         if (idx >= 0) {
             slot_type* child_slot = view.find_child(c);
@@ -424,13 +512,40 @@ private:
     static void try_collapse(node_builder_t& builder, result_t& result) {
         if (!result.new_subtree) return;
         node_view_t view(result.new_subtree);
-        if (view.has_eos() || view.has_skip_eos() || view.child_count() != 1) return;
+        if (view.has_eos() || view.has_skip_eos()) return;
         
-        uint64_t child_ptr = view.get_child_ptr(0);
+        // For FULL nodes, check live child count
+        int live_count;
+        if (view.has_full()) {
+            live_count = view.live_child_count();
+        } else {
+            live_count = view.child_count();
+        }
+        
+        if (live_count != 1) return;
+        
+        // Find the single child
+        unsigned char c = 0;
+        uint64_t child_ptr = 0;
+        if (view.has_full()) {
+            for (int i = 0; i < 256; ++i) {
+                if (view.get_child_ptr(i) != 0) {
+                    c = static_cast<unsigned char>(i);
+                    child_ptr = view.get_child_ptr(i);
+                    break;
+                }
+            }
+        } else if (view.has_list()) {
+            c = view.get_list().char_at(0);
+            child_ptr = view.get_child_ptr(0);
+        } else if (view.has_pop()) {
+            c = view.get_bitmap().nth_char(0);
+            child_ptr = view.get_child_ptr(0);
+        }
+        
         slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
         if (!child) return;
         
-        unsigned char c = view.has_list() ? view.get_list().char_at(0) : view.get_bitmap().nth_char(0);
         std::string new_skip;
         if (view.has_skip()) new_skip = std::string(view.skip_chars());
         new_skip.push_back(static_cast<char>(c));
@@ -448,8 +563,10 @@ private:
         if (child_flags & FLAG_EOS) child_view.eos_data()->try_read(eos_val);
         if (child_flags & FLAG_SKIP_EOS) child_view.skip_eos_data()->try_read(skip_eos_val);
         
+        bool has_children = child_view.has_full() ? (child_view.live_child_count() > 0) : !children.empty();
+        
         slot_type* collapsed;
-        if (children.empty()) {
+        if (!has_children) {
             switch (mk_flag_switch(child_flags, MASK)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
                     collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
