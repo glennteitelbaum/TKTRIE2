@@ -174,6 +174,7 @@ struct trie_helpers {
         if (children.empty()) {
             if (has_eos && has_skip && has_skip_eos) 
                 return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
+            if (has_eos && has_skip) return builder.build_eos_skip(std::move(eos_val), skip);
             if (has_eos) return builder.build_eos(std::move(eos_val));
             if (has_skip && has_skip_eos) return builder.build_skip_eos(skip, std::move(skip_eos_val));
             return builder.build_empty_root();
@@ -183,7 +184,8 @@ struct trie_helpers {
             return is_list ? builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children)
                            : builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
         } else if (has_eos && has_skip) {
-            return is_list ? builder.build_skip_list(skip, lst, children) : builder.build_skip_pop(skip, bmp, children);
+            return is_list ? builder.build_eos_skip_list(std::move(eos_val), skip, lst, children)
+                           : builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
         } else if (has_skip && has_skip_eos) {
             return is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
                            : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);

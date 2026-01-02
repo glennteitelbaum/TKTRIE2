@@ -659,6 +659,95 @@ public:
     }
 
     /**
+     * Build EOS | SKIP node (data here, path compression, no skip_eos, no children)
+     */
+    template <typename U>
+    slot_type* build_eos_skip(U&& eos_value, std::string_view skip) {
+        KTRIE_DEBUG_ASSERT(!skip.empty());
+        
+        size_t sz = calc_size(true, true, skip.size(), false, false, false, 0);
+        slot_type* node = allocate_node(sz);
+        
+        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP, static_cast<uint32_t>(sz));
+        store_slot<THREADED>(&node[0], header);
+        
+        node_view_t view(node);
+        new (view.eos_data()) dataptr_t();
+        view.eos_data()->begin_write();
+        view.eos_data()->set(std::forward<U>(eos_value));
+        view.eos_data()->end_write();
+        
+        view.set_skip_length(skip.size());
+        view.set_skip_chars(skip);
+        
+        return node;
+    }
+
+    /**
+     * Build EOS | SKIP | LIST node (data here, path compression, 1-7 children)
+     */
+    template <typename U>
+    slot_type* build_eos_skip_list(U&& eos_value, std::string_view skip,
+                                    small_list lst, const std::vector<uint64_t>& children) {
+        KTRIE_DEBUG_ASSERT(!skip.empty());
+        KTRIE_DEBUG_ASSERT(lst.count() == static_cast<int>(children.size()));
+        
+        size_t sz = calc_size(true, true, skip.size(), false, true, false, lst.count());
+        slot_type* node = allocate_node(sz);
+        
+        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_LIST, static_cast<uint32_t>(sz));
+        store_slot<THREADED>(&node[0], header);
+        
+        node_view_t view(node);
+        new (view.eos_data()) dataptr_t();
+        view.eos_data()->begin_write();
+        view.eos_data()->set(std::forward<U>(eos_value));
+        view.eos_data()->end_write();
+        
+        view.set_skip_length(skip.size());
+        view.set_skip_chars(skip);
+        view.set_list(lst);
+        
+        for (size_t i = 0; i < children.size(); ++i) {
+            view.set_child_ptr(static_cast<int>(i), children[i]);
+        }
+        
+        return node;
+    }
+
+    /**
+     * Build EOS | SKIP | POP node (data here, path compression, 8+ children)
+     */
+    template <typename U>
+    slot_type* build_eos_skip_pop(U&& eos_value, std::string_view skip,
+                                   popcount_bitmap bmp, const std::vector<uint64_t>& children) {
+        KTRIE_DEBUG_ASSERT(!skip.empty());
+        KTRIE_DEBUG_ASSERT(bmp.count() == static_cast<int>(children.size()));
+        
+        size_t sz = calc_size(true, true, skip.size(), false, false, true, bmp.count());
+        slot_type* node = allocate_node(sz);
+        
+        uint64_t header = make_header(FLAG_EOS | FLAG_SKIP | FLAG_POP, static_cast<uint32_t>(sz));
+        store_slot<THREADED>(&node[0], header);
+        
+        node_view_t view(node);
+        new (view.eos_data()) dataptr_t();
+        view.eos_data()->begin_write();
+        view.eos_data()->set(std::forward<U>(eos_value));
+        view.eos_data()->end_write();
+        
+        view.set_skip_length(skip.size());
+        view.set_skip_chars(skip);
+        view.set_bitmap(bmp);
+        
+        for (size_t i = 0; i < children.size(); ++i) {
+            view.set_child_ptr(static_cast<int>(i), children[i]);
+        }
+        
+        return node;
+    }
+
+    /**
      * Build empty root node
      */
     slot_type* build_empty_root() {

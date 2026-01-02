@@ -237,9 +237,11 @@ private:
         if (has_eos) {
             T eos_val; view.eos_data()->try_read(eos_val);
             if (has_children) {
-                new_node = is_list ? builder.build_eos_list(std::move(eos_val), lst, children)
-                                   : builder.build_eos_pop(std::move(eos_val), bmp, children);
+                // Keep the skip - children hang off the end of it
+                new_node = is_list ? builder.build_eos_skip_list(std::move(eos_val), skip, lst, children)
+                                   : builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
             } else {
+                // No children and no skip_eos - skip is pointless, just keep EOS
                 new_node = builder.build_eos(std::move(eos_val));
             }
         } else {

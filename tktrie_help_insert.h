@@ -251,7 +251,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     if (view.has_eos()) {
                         T eos_val;
                         view.eos_data()->try_read(eos_val);
-                        branch = builder.build_skip_list(common, lst, children);
+                        branch = builder.build_eos_skip_list(std::move(eos_val), common, lst, children);
                     } else {
                         branch = builder.build_skip_list(common, lst, children);
                     }
@@ -313,7 +313,13 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 branch = builder.build_list(lst, children);
             }
         } else {
-            branch = builder.build_skip_list(common, lst, children);
+            if (view.has_eos()) {
+                T eos_val;
+                view.eos_data()->try_read(eos_val);
+                branch = builder.build_eos_skip_list(std::move(eos_val), common, lst, children);
+            } else {
+                branch = builder.build_skip_list(common, lst, children);
+            }
         }
         result.new_nodes.push_back(branch);
         
@@ -477,7 +483,17 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     }
                 }
             } else {
-                new_node = builder.build_eos(std::forward<U>(value));
+                // has_skip but no skip_eos - preserve skip and children
+                if (children.empty()) {
+                    new_node = builder.build_eos_skip(std::forward<U>(value), skip);
+                } else {
+                    auto [is_list, lst, bmp] = base::build_child_structure(chars);
+                    if (is_list) {
+                        new_node = builder.build_eos_skip_list(std::forward<U>(value), skip, lst, children);
+                    } else {
+                        new_node = builder.build_eos_skip_pop(std::forward<U>(value), skip, bmp, children);
+                    }
+                }
             }
         } else {
             if (children.empty()) {
