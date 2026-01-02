@@ -14,14 +14,14 @@ namespace gteitelbaum {
 /**
  * Path step for tracking traversal and verification
  * Used by both insert and remove for:
- * 1. Verification: compare expected_ptr to current value
- * 2. Setting WRITE_BIT/READ_BIT on old path
+ * 1. Verification: compare expected_ptr to current slot value (full value including bits)
+ * 2. Setting WRITE_BIT/READ_BIT on old path slots
  */
 template <bool THREADED>
 struct path_step {
     slot_type_t<THREADED>* parent_node;    // Parent node containing the slot
     slot_type_t<THREADED>* child_slot;     // Slot we followed (in parent node)
-    uint64_t expected_ptr;                  // Pointer value we saw (with bits masked)
+    uint64_t expected_ptr;                  // Full slot value we saw (including any bits)
     unsigned char child_char;               // Character leading to child
 };
 

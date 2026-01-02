@@ -139,6 +139,15 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             
             uint64_t clean_ptr = child_ptr & PTR_MASK;
             
+            // Double-check slot unchanged before dereferencing (race protection)
+            if constexpr (THREADED) {
+                uint64_t recheck = load_slot<THREADED>(child_slot);
+                if (recheck != child_ptr) {
+                    result.hit_write = true;  // Slot changed, need restart
+                    return result;
+                }
+            }
+            
             // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
             if constexpr (FIXED_LEN > 0 && !THREADED) {
                 if (depth == FIXED_LEN - 1 && key.size() == 1) {
@@ -170,8 +179,9 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             }
             
             // Record path step with slot and expected pointer for verification
+            // Store full pointer value (including bits) for exact comparison
             // Add our step first, then child's path (root to leaf order)
-            result.path.push_back({node, child_slot, clean_ptr, c});
+            result.path.push_back({node, child_slot, child_ptr, c});
             for (auto& step : child_result.path) {
                 result.path.push_back(step);
             }
