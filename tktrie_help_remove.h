@@ -16,6 +16,7 @@ namespace gteitelbaum {
  * - target_slot: the single slot to atomically update (null = update root)
  * - expected_ptr: expected current value in target_slot for verification
  * - old_nodes: only the nodes being replaced (NOT ancestors)
+ * - read_locked_slots: slots where we set READ_BIT during traversal (THREADED only)
  */
 template <bool THREADED>
 struct remove_result {
@@ -24,6 +25,7 @@ struct remove_result {
     uint64_t expected_ptr = 0;                       // Expected value in target_slot
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;   // Only replaced nodes, not ancestors
+    std::vector<slot_type_t<THREADED>*> read_locked_slots;  // Slots with READ_BIT set
     bool found = false;
     bool hit_write = false;
     bool hit_read = false;
@@ -32,11 +34,29 @@ struct remove_result {
     remove_result() {
         new_nodes.reserve(16);
         old_nodes.reserve(16);
+        if constexpr (THREADED) {
+            read_locked_slots.reserve(16);
+        }
+    }
+    
+    // Clear READ_BITs we set (call after commit or on abort)
+    void clear_read_locks() noexcept {
+        if constexpr (THREADED) {
+            for (auto* slot : read_locked_slots) {
+                fetch_and_slot<THREADED>(slot, ~READ_BIT);
+            }
+            read_locked_slots.clear();
+        }
     }
 };
 
 /**
  * Remove helper functions - atomic slot update approach
+ * 
+ * THREADED writer protocol:
+ * - Set READ_BIT on each slot we traverse through
+ * - If we see READ_BIT or WRITE_BIT already set, abort (another writer is here)
+ * - After commit, clear READ_BITs we set (except target_slot which is updated)
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -48,12 +68,67 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using result_t = remove_result<THREADED>;
 
     /**
-     * Build remove operation
+     * Try to acquire READ_BIT on a slot for writer traversal
+     * Returns the clean pointer value, or sets hit_read/hit_write and returns 0
      */
-    static result_t build_remove_path(node_builder_t& builder, slot_type* root,
+    static uint64_t try_read_lock_slot(slot_type* slot, result_t& result) noexcept {
+        if constexpr (THREADED) {
+            // Try to set READ_BIT
+            uint64_t old_val = fetch_or_slot<THREADED>(slot, READ_BIT);
+            
+            // If WRITE_BIT or READ_BIT was already set, another writer is here
+            if (old_val & WRITE_BIT) {
+                // Clear our READ_BIT and abort
+                fetch_and_slot<THREADED>(slot, ~READ_BIT);
+                result.hit_write = true;
+                return 0;
+            }
+            if (old_val & READ_BIT) {
+                // READ_BIT was already set by another writer
+                // Clear our addition and abort
+                fetch_and_slot<THREADED>(slot, ~READ_BIT);
+                result.hit_read = true;
+                return 0;
+            }
+            
+            // Successfully acquired READ_BIT, track it
+            result.read_locked_slots.push_back(slot);
+            return old_val & PTR_MASK;
+        } else {
+            return load_slot<THREADED>(slot);
+        }
+    }
+
+    /**
+     * Build remove operation
+     * @param builder Node builder
+     * @param root_slot Pointer to root slot (for READ_BIT protection in THREADED mode)
+     * @param root Current root node
+     * @param key Key to remove
+     * @param depth Current depth
+     */
+    static result_t build_remove_path(node_builder_t& builder, 
+                                       slot_type* root_slot,
+                                       slot_type* root,
                                        std::string_view key, size_t depth = 0) {
         result_t result;
         if (!root) return result;  // Key not found
+        
+        // For THREADED: acquire READ_BIT on root_slot before traversing
+        if constexpr (THREADED) {
+            uint64_t old_val = fetch_or_slot<THREADED>(root_slot, READ_BIT);
+            if (old_val & WRITE_BIT) {
+                fetch_and_slot<THREADED>(root_slot, ~READ_BIT);
+                result.hit_write = true;
+                return result;
+            }
+            if (old_val & READ_BIT) {
+                fetch_and_slot<THREADED>(root_slot, ~READ_BIT);
+                result.hit_read = true;
+                return result;
+            }
+            result.read_locked_slots.push_back(root_slot);
+        }
         
         result.expected_ptr = reinterpret_cast<uint64_t>(root);
         return remove_from_node(builder, root, nullptr, result.expected_ptr, key, depth, result);
@@ -92,15 +167,11 @@ private:
         slot_type* child_slot = view.find_child(c);
         if (!child_slot) return result;  // Key not found
         
-        uint64_t child_ptr = load_slot<THREADED>(child_slot);
-        if constexpr (THREADED) {
-            if (child_ptr & WRITE_BIT) { result.hit_write = true; return result; }
-            if (child_ptr & READ_BIT) { result.hit_read = true; return result; }
-            uint64_t recheck = load_slot<THREADED>(child_slot);
-            if (recheck != child_ptr) { result.hit_write = true; return result; }
+        // Try to acquire READ_BIT for traversal
+        uint64_t clean_ptr = try_read_lock_slot(child_slot, result);
+        if (result.hit_write || result.hit_read) {
+            return result;
         }
-        
-        uint64_t clean_ptr = child_ptr & PTR_MASK;
         
         // FIXED_LEN leaf optimization
         if constexpr (FIXED_LEN > 0 && !THREADED) {
@@ -112,20 +183,34 @@ private:
         }
         
         // Recurse into child
+        // Note: for THREADED, slot now has READ_BIT set, so expected value is (clean_ptr | READ_BIT)
         slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
+        uint64_t child_slot_value = THREADED ? (clean_ptr | READ_BIT) : clean_ptr;
         result_t child_result;
-        remove_from_node(builder, child, child_slot, child_ptr, key.substr(1), depth + 1, child_result);
+        remove_from_node(builder, child, child_slot, child_slot_value, key.substr(1), depth + 1, child_result);
         
         if (!child_result.found || child_result.hit_write || child_result.hit_read) {
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
             result.hit_read = child_result.hit_read;
+            // Propagate read locks for cleanup on abort
+            if constexpr (THREADED) {
+                for (auto* s : child_result.read_locked_slots) {
+                    result.read_locked_slots.push_back(s);
+                }
+            }
             return result;
         }
         
         // Child operation succeeded
         if (child_result.subtree_deleted) {
             // Child subtree should be removed - rebuild this node without that child
+            // Propagate read locks
+            if constexpr (THREADED) {
+                for (auto* s : child_result.read_locked_slots) {
+                    result.read_locked_slots.push_back(s);
+                }
+            }
             return remove_child(builder, node, parent_slot, parent_slot_value, c, child_result, result);
         } else {
             // Child was modified - just propagate the result up
@@ -136,6 +221,11 @@ private:
             result.expected_ptr = child_result.expected_ptr;
             for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
             for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
+            if constexpr (THREADED) {
+                for (auto* s : child_result.read_locked_slots) {
+                    result.read_locked_slots.push_back(s);
+                }
+            }
             return result;
         }
     }
