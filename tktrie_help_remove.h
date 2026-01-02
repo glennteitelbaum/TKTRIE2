@@ -8,25 +8,36 @@
 
 namespace gteitelbaum {
 
+/**
+ * Remove operation results
+ * 
+ * Atomic slot update approach (same as insert):
+ * - new_subtree: the rebuilt node/subtree to install (or null if deleting)
+ * - target_slot: the single slot to atomically update (null = update root)
+ * - expected_ptr: expected current value in target_slot for verification
+ * - old_nodes: only the nodes being replaced (NOT ancestors)
+ */
 template <bool THREADED>
 struct remove_result {
-    slot_type_t<THREADED>* new_root = nullptr;
-    slot_type_t<THREADED>* expected_root = nullptr;
+    slot_type_t<THREADED>* new_subtree = nullptr;   // What to install (null = delete)
+    slot_type_t<THREADED>* target_slot = nullptr;   // Where to install (null = root)
+    uint64_t expected_ptr = 0;                       // Expected value in target_slot
     std::vector<slot_type_t<THREADED>*> new_nodes;
-    std::vector<slot_type_t<THREADED>*> old_nodes;
-    std::vector<path_step<THREADED>> path;
+    std::vector<slot_type_t<THREADED>*> old_nodes;   // Only replaced nodes, not ancestors
     bool found = false;
     bool hit_write = false;
     bool hit_read = false;
-    bool root_deleted = false;
+    bool subtree_deleted = false;                    // True if subtree should be removed
     
     remove_result() {
         new_nodes.reserve(16);
         old_nodes.reserve(16);
-        path.reserve(16);
     }
 };
 
+/**
+ * Remove helper functions - atomic slot update approach
+ */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
@@ -35,72 +46,75 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using node_builder_t = typename base::node_builder_t;
     using dataptr_t = typename base::dataptr_t;
     using result_t = remove_result<THREADED>;
-    using path_step_t = typename base::path_step_t;
 
+    /**
+     * Build remove operation
+     */
     static result_t build_remove_path(node_builder_t& builder, slot_type* root,
                                        std::string_view key, size_t depth = 0) {
         result_t result;
-        result.expected_root = root;
-        if (!root) return result;
-        return remove_from_node(builder, root, key, depth, result);
+        if (!root) return result;  // Key not found
+        
+        result.expected_ptr = reinterpret_cast<uint64_t>(root);
+        return remove_from_node(builder, root, nullptr, result.expected_ptr, key, depth, result);
     }
 
 private:
+    /**
+     * Remove from node
+     * @param node Current node
+     * @param parent_slot Slot pointing to this node (null = root)
+     * @param parent_slot_value Current value in parent_slot
+     */
     static result_t& remove_from_node(node_builder_t& builder, slot_type* node,
+                                       slot_type* parent_slot, uint64_t parent_slot_value,
                                        std::string_view key, size_t depth, result_t& result) {
         node_view_t view(node);
         
         if (view.has_skip()) {
             std::string_view skip = view.skip_chars();
             size_t match = base::match_skip(skip, key);
-            if (match < skip.size()) return result;
+            if (match < skip.size()) return result;  // Key not found
             key.remove_prefix(match);
             depth += match;
             if (key.empty()) {
-                if (!view.has_skip_eos()) return result;
-                return remove_skip_eos(builder, node, result);
+                if (!view.has_skip_eos()) return result;  // Key not found
+                return remove_skip_eos(builder, node, parent_slot, parent_slot_value, result);
             }
         }
         
         if (key.empty()) {
-            if (!view.has_eos()) return result;
-            return remove_eos(builder, node, result);
+            if (!view.has_eos()) return result;  // Key not found
+            return remove_eos(builder, node, parent_slot, parent_slot_value, result);
         }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
         slot_type* child_slot = view.find_child(c);
-        if (!child_slot) return result;
+        if (!child_slot) return result;  // Key not found
         
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
         if constexpr (THREADED) {
             if (child_ptr & WRITE_BIT) { result.hit_write = true; return result; }
             if (child_ptr & READ_BIT) { result.hit_read = true; return result; }
+            uint64_t recheck = load_slot<THREADED>(child_slot);
+            if (recheck != child_ptr) { result.hit_write = true; return result; }
         }
         
         uint64_t clean_ptr = child_ptr & PTR_MASK;
         
-        // Double-check slot unchanged before dereferencing (race protection)
-        if constexpr (THREADED) {
-            uint64_t recheck = load_slot<THREADED>(child_slot);
-            if (recheck != child_ptr) {
-                result.hit_write = true;  // Slot changed, need restart
-                return result;
-            }
-        }
-        
-        // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
+        // FIXED_LEN leaf optimization
         if constexpr (FIXED_LEN > 0 && !THREADED) {
             if (depth == FIXED_LEN - 1 && key.size() == 1) {
                 dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
                 if (!dp->has_data()) return result;
-                return remove_leaf_data(builder, node, c, result);
+                return remove_leaf_data(builder, node, parent_slot, parent_slot_value, c, result);
             }
         }
         
+        // Recurse into child
         slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
         result_t child_result;
-        child_result.hit_read = false;
-        remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
+        remove_from_node(builder, child, child_slot, child_ptr, key.substr(1), depth + 1, child_result);
         
         if (!child_result.found || child_result.hit_write || child_result.hit_read) {
             result.found = child_result.found;
@@ -109,28 +123,45 @@ private:
             return result;
         }
         
-        // Record path step with slot and full expected pointer for verification
-        result.path.push_back({node, child_slot, child_ptr, c});
-        for (auto& step : child_result.path) result.path.push_back(step);
-        
-        if (child_result.root_deleted)
-            return remove_child(builder, node, c, child_result, result);
-        return clone_with_updated_child(builder, node, c, child_result.new_root, child_result, result);
+        // Child operation succeeded
+        if (child_result.subtree_deleted) {
+            // Child subtree should be removed - rebuild this node without that child
+            return remove_child(builder, node, parent_slot, parent_slot_value, c, child_result, result);
+        } else {
+            // Child was modified - just propagate the result up
+            // The target_slot is already set to child_slot by the child
+            result.found = true;
+            result.new_subtree = child_result.new_subtree;
+            result.target_slot = child_result.target_slot;
+            result.expected_ptr = child_result.expected_ptr;
+            for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
+            for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
+            return result;
+        }
     }
 
-    static result_t& remove_eos(node_builder_t& builder, slot_type* node, result_t& result) {
+    /**
+     * Remove EOS from node
+     */
+    static result_t& remove_eos(node_builder_t& builder, slot_type* node,
+                                 slot_type* parent_slot, uint64_t parent_slot_value,
+                                 result_t& result) {
         node_view_t view(node);
         result.found = true;
         
         bool has_skip = view.has_skip(), has_skip_eos = view.has_skip_eos();
         bool has_children = view.child_count() > 0;
         
+        // If no other data, delete this subtree
         if (!has_skip_eos && !has_children) {
-            result.root_deleted = true;
+            result.subtree_deleted = true;
+            result.target_slot = parent_slot;
+            result.expected_ptr = parent_slot_value;
             result.old_nodes.push_back(node);
             return result;
         }
         
+        // Rebuild node without EOS
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
@@ -151,24 +182,39 @@ private:
                 new_node = is_list ? builder.build_skip_list(skip, lst, children)
                                    : builder.build_skip_pop(skip, bmp, children);
             } else {
-                result.root_deleted = true; result.old_nodes.push_back(node); return result;
+                result.subtree_deleted = true;
+                result.target_slot = parent_slot;
+                result.expected_ptr = parent_slot_value;
+                result.old_nodes.push_back(node);
+                return result;
             }
         } else {
             if (has_children) {
                 new_node = is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
             } else {
-                result.root_deleted = true; result.old_nodes.push_back(node); return result;
+                result.subtree_deleted = true;
+                result.target_slot = parent_slot;
+                result.expected_ptr = parent_slot_value;
+                result.old_nodes.push_back(node);
+                return result;
             }
         }
         
         result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
+        result.new_subtree = new_node;
+        result.target_slot = parent_slot;
+        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
     }
 
-    static result_t& remove_skip_eos(node_builder_t& builder, slot_type* node, result_t& result) {
+    /**
+     * Remove skip_eos from node
+     */
+    static result_t& remove_skip_eos(node_builder_t& builder, slot_type* node,
+                                      slot_type* parent_slot, uint64_t parent_slot_value,
+                                      result_t& result) {
         node_view_t view(node);
         result.found = true;
         
@@ -176,7 +222,11 @@ private:
         std::string_view skip = view.skip_chars();
         
         if (!has_eos && !has_children) {
-            result.root_deleted = true; result.old_nodes.push_back(node); return result;
+            result.subtree_deleted = true;
+            result.target_slot = parent_slot;
+            result.expected_ptr = parent_slot_value;
+            result.old_nodes.push_back(node);
+            return result;
         }
         
         auto children = base::extract_children(view);
@@ -197,19 +247,29 @@ private:
                 new_node = is_list ? builder.build_skip_list(skip, lst, children)
                                    : builder.build_skip_pop(skip, bmp, children);
             } else {
-                result.root_deleted = true; result.old_nodes.push_back(node); return result;
+                result.subtree_deleted = true;
+                result.target_slot = parent_slot;
+                result.expected_ptr = parent_slot_value;
+                result.old_nodes.push_back(node);
+                return result;
             }
         }
         
         result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
+        result.new_subtree = new_node;
+        result.target_slot = parent_slot;
+        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
     }
 
-    static result_t& remove_child(node_builder_t& builder, slot_type* node, unsigned char c,
-                                   result_t& child_result, result_t& result) {
+    /**
+     * Remove child from node (child subtree was deleted)
+     */
+    static result_t& remove_child(node_builder_t& builder, slot_type* node,
+                                   slot_type* parent_slot, uint64_t parent_slot_value,
+                                   unsigned char c, result_t& child_result, result_t& result) {
         for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
         for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
         result.found = true;
@@ -219,67 +279,46 @@ private:
         auto chars = base::get_child_chars(view);
         
         int idx = base::find_char_index(chars, c);
-        
-        if (idx >= 0) { children.erase(children.begin() + idx); chars.erase(chars.begin() + idx); }
-        
-        bool has_eos = view.has_eos(), has_skip_eos = view.has_skip_eos();
-        (void)view.has_skip();  // Used indirectly via base::rebuild_node
-        if (children.empty() && !has_eos && !has_skip_eos) {
-            result.root_deleted = true; result.old_nodes.push_back(node); return result;
+        if (idx >= 0) {
+            children.erase(children.begin() + idx);
+            chars.erase(chars.begin() + idx);
         }
         
+        bool has_eos = view.has_eos(), has_skip_eos = view.has_skip_eos();
+        
+        // If no other data/children, delete this subtree too
+        if (children.empty() && !has_eos && !has_skip_eos) {
+            result.subtree_deleted = true;
+            result.target_slot = parent_slot;
+            result.expected_ptr = parent_slot_value;
+            result.old_nodes.push_back(node);
+            return result;
+        }
+        
+        // Rebuild node without that child
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
+        result.new_subtree = new_node;
+        result.target_slot = parent_slot;
+        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
     }
 
-    static result_t& clone_with_updated_child(node_builder_t& builder, slot_type* node, unsigned char c,
-                                               slot_type* new_child, result_t& child_result, result_t& result) {
-        for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
-        for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
-        result.found = true;
-        
-        if constexpr (THREADED) {
-            // THREADED mode: Must rebuild parent node (can't modify in place)
-            node_view_t view(node);
-            auto children = base::extract_children(view);
-            auto chars = base::get_child_chars(view);
-            
-            int idx = base::find_char_index(chars, c);
-            if (idx >= 0) children[idx] = reinterpret_cast<uint64_t>(new_child);
-            
-            auto [is_list, lst, bmp] = base::build_child_structure(chars);
-            slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
-            result.new_nodes.push_back(new_node);
-            result.new_root = new_node;
-            result.old_nodes.push_back(node);
-        } else {
-            // Non-threaded: Update child slot in place - no need to rebuild parent node
-            node_view_t view(node);
-            slot_type* child_slot = view.find_child(c);
-            store_slot<THREADED>(child_slot, reinterpret_cast<uint64_t>(new_child));
-            
-            // Parent node is NOT replaced - just modified in place
-            result.new_root = node;
-            // Don't add node to old_nodes since we're keeping it
-        }
-        return result;
-    }
-
-    static result_t& remove_leaf_data(node_builder_t& builder, slot_type* node, unsigned char c,
-                                       result_t& result) {
+    /**
+     * Remove leaf data (FIXED_LEN non-threaded only)
+     */
+    static result_t& remove_leaf_data(node_builder_t& builder, slot_type* node,
+                                       slot_type* parent_slot, uint64_t parent_slot_value,
+                                       unsigned char c, result_t& result) {
         result.found = true;
         node_view_t view(node);
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
         int idx = base::find_char_index(chars, c);
-        
-        // Destroy the dataptr before removing
         if (idx >= 0) {
             slot_type* child_slot = view.find_child(c);
             dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
@@ -288,19 +327,30 @@ private:
             chars.erase(chars.begin() + idx);
         }
         
-        if (children.empty()) { result.root_deleted = true; result.old_nodes.push_back(node); return result; }
+        if (children.empty()) {
+            result.subtree_deleted = true;
+            result.target_slot = parent_slot;
+            result.expected_ptr = parent_slot_value;
+            result.old_nodes.push_back(node);
+            return result;
+        }
         
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
+        result.new_subtree = new_node;
+        result.target_slot = parent_slot;
+        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
 
+    /**
+     * Try to collapse single-child nodes into skip sequence
+     */
     static void try_collapse(node_builder_t& builder, result_t& result) {
-        if (!result.new_root) return;
-        node_view_t view(result.new_root);
+        if (!result.new_subtree) return;
+        node_view_t view(result.new_subtree);
         if (view.has_eos() || view.has_skip_eos() || view.child_count() != 1) return;
         
         uint64_t child_ptr = view.get_child_ptr(0);
@@ -327,21 +377,32 @@ private:
         
         slot_type* collapsed;
         if (children.empty()) {
-            if (child_has_eos && child_has_skip_eos) collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
-            else if (child_has_eos) collapsed = builder.build_skip_eos(new_skip, std::move(eos_val));
-            else if (child_has_skip_eos) collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
-            else return;
+            if (child_has_eos && child_has_skip_eos) {
+                collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
+            } else if (child_has_eos) {
+                collapsed = builder.build_skip_eos(new_skip, std::move(eos_val));
+            } else if (child_has_skip_eos) {
+                collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
+            } else {
+                return;  // Can't collapse empty node
+            }
         } else {
-            if (child_has_eos && child_has_skip_eos) return;
-            else if (child_has_eos) collapsed = builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
-            else if (child_has_skip_eos) collapsed = is_list ? builder.build_skip_eos_list(new_skip, std::move(skip_eos_val), lst, children)
-                                                              : builder.build_skip_eos_pop(new_skip, std::move(skip_eos_val), bmp, children);
-            else collapsed = is_list ? builder.build_skip_list(new_skip, lst, children) : builder.build_skip_pop(new_skip, bmp, children);
+            if (child_has_eos && child_has_skip_eos) return;  // Too complex to collapse
+            else if (child_has_eos) {
+                collapsed = builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
+            } else if (child_has_skip_eos) {
+                collapsed = is_list ? builder.build_skip_eos_list(new_skip, std::move(skip_eos_val), lst, children)
+                                    : builder.build_skip_eos_pop(new_skip, std::move(skip_eos_val), bmp, children);
+            } else {
+                collapsed = is_list ? builder.build_skip_list(new_skip, lst, children) 
+                                    : builder.build_skip_pop(new_skip, bmp, children);
+            }
         }
         
-        result.old_nodes.push_back(result.new_root);
-        result.old_nodes.push_back(child);  // Child is absorbed into collapsed node
-        result.new_root = collapsed;
+        // Replace new_subtree with collapsed version
+        result.old_nodes.push_back(result.new_subtree);
+        result.old_nodes.push_back(child);  // Child absorbed into collapsed
+        result.new_subtree = collapsed;
         result.new_nodes.push_back(collapsed);
     }
 };
