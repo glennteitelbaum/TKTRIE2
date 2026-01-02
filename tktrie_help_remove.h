@@ -106,6 +106,9 @@ private:
         
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
         
+        // Check for null pointer (deleted child or empty FULL slot)
+        if (child_ptr == 0) return result;  // Key not found
+        
         // FIXED_LEN leaf optimization
         if constexpr (FIXED_LEN > 0 && !THREADED) {
             if (depth == FIXED_LEN - 1 && key.size() == 1) {
@@ -159,8 +162,8 @@ private:
         }
         
         // Rebuild with new child pointer
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
+        auto [node_type, lst, bmp] = base::build_child_structure(chars);
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
         
         result.new_nodes.push_back(new_node);
         result.old_nodes.push_back(node);
@@ -206,39 +209,50 @@ private:
         slot_type* new_node;
         
         if (has_children) {
-            auto [is_list, lst, bmp] = base::build_child_structure(chars);
-            switch (mk_flag_switch(flags, MASK, is_list)) {
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
-                    new_node = builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
-                    new_node = builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
-                    new_node = builder.build_skip_list(skip, lst, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
-                    new_node = builder.build_skip_pop(skip, bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS, MASK, true):
-                    new_node = builder.build_list(lst, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS, MASK, false):
-                    new_node = builder.build_pop(bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
-                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
-                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
-                case mk_flag_switch(FLAG_SKIP, MASK, true):
-                case mk_flag_switch(FLAG_SKIP, MASK, false):
-                case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
-                case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
-                case mk_flag_switch(0, MASK, true):
-                case mk_flag_switch(0, MASK, false):
-                default:
-                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination in remove_eos");
-                    __builtin_unreachable();
+            auto [node_type, lst, bmp] = base::build_child_structure(chars);
+            
+            // FULL nodes with SKIP not supported
+            if (node_type == 2) {
+                if (flags & FLAG_SKIP_EOS) {
+                    new_node = builder.build_full(bmp, children);  // Just FULL, no EOS now
+                } else {
+                    new_node = builder.build_full(bmp, children);
+                }
+            } else {
+                bool is_list = (node_type == 0);
+                switch (mk_flag_switch(flags, MASK, is_list)) {
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
+                        new_node = builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
+                        new_node = builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
+                        new_node = builder.build_skip_list(skip, lst, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
+                        new_node = builder.build_skip_pop(skip, bmp, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS, MASK, true):
+                        new_node = builder.build_list(lst, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS, MASK, false):
+                        new_node = builder.build_pop(bmp, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
+                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
+                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
+                    case mk_flag_switch(FLAG_SKIP, MASK, true):
+                    case mk_flag_switch(FLAG_SKIP, MASK, false):
+                    case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+                    case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+                    case mk_flag_switch(0, MASK, true):
+                    case mk_flag_switch(0, MASK, false):
+                    default:
+                        KTRIE_DEBUG_ASSERT(false && "Invalid flag combination in remove_eos");
+                        __builtin_unreachable();
+                }
             }
         } else {
             // No children - must have SKIP_EOS (checked above)
@@ -280,35 +294,46 @@ private:
         slot_type* new_node;
         
         if (has_children) {
-            auto [is_list, lst, bmp] = base::build_child_structure(chars);
-            switch (mk_flag_switch(flags, MASK, is_list)) {
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
-                    new_node = builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
-                    new_node = builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
-                    new_node = builder.build_skip_list(skip, lst, children);
-                    break;
-                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
-                    new_node = builder.build_skip_pop(skip, bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
-                case mk_flag_switch(FLAG_EOS, MASK, true):
-                case mk_flag_switch(FLAG_EOS, MASK, false):
-                case mk_flag_switch(FLAG_SKIP, MASK, true):
-                case mk_flag_switch(FLAG_SKIP, MASK, false):
-                case mk_flag_switch(0, MASK, true):
-                case mk_flag_switch(0, MASK, false):
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
-                case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
-                case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
-                default:
-                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination in remove_skip_eos");
-                    __builtin_unreachable();
+            auto [node_type, lst, bmp] = base::build_child_structure(chars);
+            
+            // FULL nodes with SKIP not supported - just build without SKIP_EOS
+            if (node_type == 2) {
+                if (flags & FLAG_EOS) {
+                    new_node = builder.build_eos_full(std::move(eos_val), bmp, children);
+                } else {
+                    new_node = builder.build_full(bmp, children);
+                }
+            } else {
+                bool is_list = (node_type == 0);
+                switch (mk_flag_switch(flags, MASK, is_list)) {
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
+                        new_node = builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
+                        new_node = builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
+                        break;
+                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
+                        new_node = builder.build_skip_list(skip, lst, children);
+                        break;
+                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
+                        new_node = builder.build_skip_pop(skip, bmp, children);
+                        break;
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
+                    case mk_flag_switch(FLAG_EOS, MASK, true):
+                    case mk_flag_switch(FLAG_EOS, MASK, false):
+                    case mk_flag_switch(FLAG_SKIP, MASK, true):
+                    case mk_flag_switch(FLAG_SKIP, MASK, false):
+                    case mk_flag_switch(0, MASK, true):
+                    case mk_flag_switch(0, MASK, false):
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
+                    case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
+                    case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+                    case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+                    default:
+                        KTRIE_DEBUG_ASSERT(false && "Invalid flag combination in remove_skip_eos");
+                        __builtin_unreachable();
+                }
             }
         } else {
             // No children - if has EOS, skip is pointless
@@ -351,8 +376,8 @@ private:
         }
         
         // Rebuild node without that child
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
+        auto [node_type, lst, bmp] = base::build_child_structure(chars);
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.old_nodes.push_back(node);
@@ -385,8 +410,8 @@ private:
             return result;
         }
         
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
+        auto [node_type, lst, bmp] = base::build_child_structure(chars);
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.old_nodes.push_back(node);
@@ -439,7 +464,12 @@ private:
                     return;  // Can't collapse empty node
             }
         } else {
-            auto [is_list, lst, bmp] = base::build_child_structure(chars);
+            auto [node_type, lst, bmp] = base::build_child_structure(chars);
+            
+            // Can't collapse into FULL nodes with skip
+            if (node_type == 2) return;
+            
+            bool is_list = (node_type == 0);
             switch (mk_flag_switch(child_flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):

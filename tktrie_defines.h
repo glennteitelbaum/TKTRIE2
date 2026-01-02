@@ -41,11 +41,16 @@ static constexpr uint64_t FLAG_SKIP     = 1ULL << 62;
 static constexpr uint64_t FLAG_SKIP_EOS = 1ULL << 61;
 static constexpr uint64_t FLAG_LIST     = 1ULL << 60;
 static constexpr uint64_t FLAG_POP      = 1ULL << 59;
+static constexpr uint64_t FLAG_FULL     = 1ULL << 58;  // 256-child direct-indexed node
 
-static constexpr uint64_t FLAGS_MASK    = 0xF800000000000000ULL;
-static constexpr uint64_t SIZE_MASK     = 0x07FFFFFFFFFFFFFFULL;  // 59 bits for size
+static constexpr uint64_t FLAGS_MASK    = 0xFC00000000000000ULL;  // 6 flag bits
+static constexpr uint64_t SIZE_MASK     = 0x03FFFFFFFFFFFFFFULL;  // 58 bits for size
 
-// Pointer bit flags for concurrency
+// Thresholds for node type transitions
+static constexpr int FULL_THRESHOLD = 196;  // POP > this → FULL
+static constexpr int LIST_MAX = 7;          // LIST can hold at most 7
+
+// Pointer bit flags for concurrency (kept for compatibility, no longer used)
 static constexpr uint64_t WRITE_BIT = 1ULL << 63;
 static constexpr uint64_t READ_BIT  = 1ULL << 62;
 static constexpr uint64_t PTR_MASK  = ~(WRITE_BIT | READ_BIT);  // masks off both control bits
@@ -260,13 +265,17 @@ KTRIE_FORCE_INLINE constexpr size_t bytes_to_words(size_t bytes) noexcept {
 // =============================================================================
 
 /**
- * Compact sorted character list for small branch points (1-7 children)
+ * Compact character list for small branch points (1-7 children)
  * 
  * Memory Layout (64 bits, big-endian):
  * ┌────────────────────────────────────────────────────────────┬────────┐
- * │              Sorted characters (up to 7 bytes)             │ count  │
+ * │              Characters (up to 7 bytes, unsorted)          │ count  │
  * └────────────────────────────────────────────────────────────┴────────┘
- *   bytes 0-6 (characters in sorted order)                       byte 7
+ *   bytes 0-6 (characters, positions stable)                     byte 7
+ * 
+ * Characters are NOT sorted. Positions are stable - a deleted child 
+ * leaves its char in place (with null ptr in node). This allows O(1)
+ * atomic deletes and re-inserts without COW.
  */
 class small_list {
     uint64_t n_;
@@ -278,8 +287,8 @@ public:
     
     explicit small_list(uint64_t x) noexcept : n_{x} {}
     
+    // Two-char constructor (no sorting needed)
     small_list(unsigned char c1, unsigned char c2) noexcept : n_{0} {
-        if (c1 > c2) std::swap(c1, c2);
         auto arr = to_char_array(0ULL);
         arr[0] = static_cast<char>(c1);
         arr[1] = static_cast<char>(c2);
@@ -311,7 +320,7 @@ public:
 
     /**
      * Find 1-based offset of a character (0 if not found)
-     * Uses SWAR zero-byte detection
+     * Uses SWAR zero-byte detection - works for unsorted list
      */
     KTRIE_FORCE_INLINE int offset(unsigned char c) const noexcept {
         constexpr uint64_t rep = 0x01'01'01'01'01'01'01'00ULL;  // exclude count byte
@@ -328,79 +337,43 @@ public:
     }
 
     /**
-     * Find insertion position for a character (0-based index where it should go)
-     * Uses SWAR unsigned byte comparison
+     * Add character at end (unsorted append)
+     * Returns position where char was placed
      */
-    KTRIE_FORCE_INLINE int insert_pos(unsigned char c) const noexcept {
+    int add(unsigned char c) noexcept {
         int len = count();
-        if (len == 0) return 0;
+        KTRIE_DEBUG_ASSERT(len < max_count);
         
-        constexpr uint64_t h = 0x80'80'80'80'80'80'80'80ULL;
-        constexpr uint64_t m = 0x7F'7F'7F'7F'7F'7F'7F'7FULL;
-        constexpr uint64_t REP = 0x01'01'01'01'01'01'01'01ULL;
-        
-        // Create mask for valid positions (top 'len' bytes in big-endian)
-        uint64_t valid_mask = ~0ULL << (8 * (8 - len));
-        
-        uint64_t chars = n_ & valid_mask;
-        uint64_t rep_x = (REP * static_cast<uint64_t>(c)) & valid_mask;
-        
-        // SWAR unsigned comparison: chars[i] < c for each byte
-        uint64_t diff_high = (chars ^ rep_x) & h;
-        uint64_t B_high_wins = rep_x & diff_high;
-        uint64_t same_high = ~diff_high & h;
-        uint64_t low_chars = chars & m;
-        uint64_t low_x = rep_x & m;
-        uint64_t low_cmp = ~((low_chars | h) - low_x) & h;
-        
-        uint64_t lt = (B_high_wins | (same_high & low_cmp)) & valid_mask;
-        
-        return std::popcount(lt);
-    }
-
-    /**
-     * Insert character in sorted order, returns insertion position
-     * Caller must ensure len < max_count
-     */
-    int insert(int len, unsigned char c) noexcept {
-        KTRIE_DEBUG_ASSERT(len >= 0 && len < max_count);
-        
-        if (len == 0) {
-            auto arr = to_char_array(0ULL);
-            arr[0] = static_cast<char>(c);
-            arr[7] = 1;
-            n_ = from_char_array(arr);
-            return 0;
-        }
-        
-        int pos = insert_pos(c);
-        
-        // Shift bytes to make room using array manipulation
         auto arr = to_char_array(n_);
-        for (int i = len; i > pos; --i) {
-            arr[i] = arr[i - 1];
-        }
-        arr[pos] = static_cast<char>(c);
+        arr[len] = static_cast<char>(c);
         arr[7] = static_cast<char>(len + 1);
         n_ = from_char_array(arr);
         
-        return pos;
+        return len;
     }
 
     /**
-     * Remove character at position, shifts remaining down
+     * Get characters in sorted order (for iteration)
+     * Returns array and count of valid chars
      */
-    void remove_at(int pos) noexcept {
+    std::pair<std::array<uint8_t, max_count>, int> sorted_chars() const noexcept {
+        std::array<uint8_t, max_count> chars{};
         int len = count();
-        KTRIE_DEBUG_ASSERT(pos >= 0 && pos < len);
-        
         auto arr = to_char_array(n_);
-        for (int i = pos; i < len - 1; ++i) {
-            arr[i] = arr[i + 1];
+        for (int i = 0; i < len; ++i) {
+            chars[i] = static_cast<uint8_t>(arr[i]);
         }
-        arr[len - 1] = 0;
-        arr[7] = static_cast<char>(len - 1);
-        n_ = from_char_array(arr);
+        // Simple insertion sort for up to 7 elements
+        for (int i = 1; i < len; ++i) {
+            uint8_t key = chars[i];
+            int j = i - 1;
+            while (j >= 0 && chars[j] > key) {
+                chars[j + 1] = chars[j];
+                --j;
+            }
+            chars[j + 1] = key;
+        }
+        return {chars, len};
     }
 
     std::string to_string() const {

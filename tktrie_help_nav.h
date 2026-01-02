@@ -12,10 +12,11 @@ namespace gteitelbaum {
 /**
  * Navigation helper functions (READER operations)
  * 
- * With COW + EBR:
+ * With COW + EBR + atomic deletes:
  * - Readers are protected by EBR epoch - old nodes won't be freed while readers active
- * - Data is immutable once published (COW)
- * - No WRITE_BIT/READ_BIT coordination needed
+ * - Child pointers may be null (deleted) - check after loading
+ * - FULL nodes: slot always exists, but value may be null
+ * - LIST/POP nodes: slot exists only if char in structure, but value may be null
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -66,6 +67,9 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             // Find child
             unsigned char c = static_cast<unsigned char>(key[0]);
             slot_type* child_slot = view.find_child(c);
+            
+            // For LIST/POP: nullptr means char not in structure
+            // For FULL: always returns a slot, but value may be null
             if (!child_slot) return nullptr;
             
             // FIXED_LEN leaf optimization: non-threaded stores dataptr inline at leaf depth
@@ -75,8 +79,10 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 }
             }
             
-            // Load child pointer
+            // Load child pointer - may be null (deleted)
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            if (child_ptr == 0) return nullptr;  // Deleted child
+            
             cur = reinterpret_cast<slot_type*>(child_ptr);
             
             key.remove_prefix(1);
@@ -110,6 +116,7 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
     /**
      * Find first leaf in subtree (for iteration)
+     * Skips null (deleted) children
      */
     static slot_type* find_first_leaf(slot_type* node, std::string& key_out, 
                                        size_t depth = 0) noexcept {
@@ -132,21 +139,49 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 return reinterpret_cast<slot_type*>(view.skip_eos_data());
             }
             
-            // No data here, go to first child
-            if (view.child_count() == 0) {
-                return nullptr;
+            // Find first non-null child
+            slot_type* child_slot = nullptr;
+            unsigned char c = 0;
+            
+            if (view.has_full()) {
+                // FULL: scan 256 slots for first non-null
+                for (int i = 0; i < 256; ++i) {
+                    uint64_t ptr = load_slot<THREADED>(&view.child_ptrs()[i]);
+                    if (ptr != 0) {
+                        c = static_cast<unsigned char>(i);
+                        child_slot = &view.child_ptrs()[i];
+                        break;
+                    }
+                }
+            } else if (view.has_list()) {
+                // LIST: scan chars in order, find first non-null ptr
+                auto [sorted, count] = view.get_list().sorted_chars();
+                for (int i = 0; i < count; ++i) {
+                    slot_type* slot = view.find_child(sorted[i]);
+                    uint64_t ptr = load_slot<THREADED>(slot);
+                    if (ptr != 0) {
+                        c = sorted[i];
+                        child_slot = slot;
+                        break;
+                    }
+                }
+            } else if (view.has_pop()) {
+                // POP: iterate bitmap in order
+                popcount_bitmap bmp = view.get_bitmap();
+                for (int i = 0; i < bmp.count(); ++i) {
+                    unsigned char ch = bmp.nth_char(i);
+                    uint64_t ptr = view.get_child_ptr(i);
+                    if (ptr != 0) {
+                        c = ch;
+                        child_slot = &view.child_ptrs()[i];
+                        break;
+                    }
+                }
             }
             
-            unsigned char c;
-            if (view.has_list()) {
-                c = view.get_list().char_at(0);
-            } else {
-                c = view.get_bitmap().nth_char(0);
-            }
+            if (!child_slot) return nullptr;  // No live children
             
             key_out.push_back(static_cast<char>(c));
-            
-            slot_type* child_slot = view.find_child(c);
             
             // FIXED_LEN leaf optimization
             if constexpr (FIXED_LEN > 0 && !THREADED) {

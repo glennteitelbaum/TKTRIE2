@@ -84,6 +84,7 @@ public:
 
     size_t child_ptrs_offset() const noexcept {
         size_t off = children_header_offset();
+        if (has_full()) return off;  // No header for FULL, direct 256 slots
         if (has_list()) off += 1;  // small_list
         else if (has_pop()) off += 4;  // bitmap
         return off;
@@ -109,6 +110,8 @@ public:
         KTRIE_DEBUG_ASSERT(has_skip_eos());
         return reinterpret_cast<const dataptr_t*>(&arr_[skip_eos_offset()]);
     }
+
+    bool has_full() const noexcept { return (flags() & FLAG_FULL) != 0; }
 
     // Skip accessors
     size_t skip_length() const noexcept {
@@ -179,16 +182,51 @@ public:
     }
 
     int child_count() const noexcept {
+        if (has_full()) return 256;
         if (has_list()) return get_list().count();
         if (has_pop()) return get_bitmap().count();
+        return 0;
+    }
+    
+    /**
+     * Count non-null children (for deciding transitions)
+     */
+    int live_child_count() const noexcept {
+        if (has_full()) {
+            int count = 0;
+            for (int i = 0; i < 256; ++i) {
+                if (load_slot<THREADED>(&child_ptrs()[i]) != 0) ++count;
+            }
+            return count;
+        }
+        if (has_list()) {
+            small_list lst = get_list();
+            int count = 0;
+            for (int i = 0; i < lst.count(); ++i) {
+                if (load_slot<THREADED>(&child_ptrs()[i]) != 0) ++count;
+            }
+            return count;
+        }
+        if (has_pop()) {
+            popcount_bitmap bmp = get_bitmap();
+            int count = 0;
+            for (int i = 0; i < bmp.count(); ++i) {
+                if (load_slot<THREADED>(&child_ptrs()[i]) != 0) ++count;
+            }
+            return count;
+        }
         return 0;
     }
 
     /**
      * Find child slot for character
-     * Returns nullptr if not found
+     * Returns nullptr if char not in structure (not same as null ptr value!)
      */
     slot_type* find_child(unsigned char c) noexcept {
+        if (has_full()) {
+            // Direct indexed - slot always exists
+            return &child_ptrs()[c];
+        }
         if (has_list()) {
             small_list lst = get_list();
             int off = lst.offset(c);
@@ -273,7 +311,7 @@ public:
      */
     static size_t calc_size(bool has_eos, bool has_skip, size_t skip_len, 
                             bool has_skip_eos, bool has_list, bool has_pop,
-                            int child_count) noexcept {
+                            bool has_full, int child_count) noexcept {
         size_t sz = 1;  // header
         if (has_eos) sz += 1;
         if (has_skip) {
@@ -281,10 +319,22 @@ public:
             sz += bytes_to_words(skip_len);
             if (has_skip_eos) sz += 1;
         }
-        if (has_list) sz += 1;
-        else if (has_pop) sz += 4;
-        sz += child_count;
+        if (has_full) {
+            sz += 256;  // 256 direct-indexed child slots
+        } else {
+            if (has_list) sz += 1;
+            else if (has_pop) sz += 4;
+            sz += child_count;
+        }
         return sz;
+    }
+    
+    // Convenience overload for non-FULL nodes
+    static size_t calc_size(bool has_eos, bool has_skip, size_t skip_len, 
+                            bool has_skip_eos, bool has_list, bool has_pop,
+                            int child_count) noexcept {
+        return calc_size(has_eos, has_skip, skip_len, has_skip_eos, 
+                         has_list, has_pop, false, child_count);
     }
 
     /**
@@ -429,6 +479,58 @@ public:
         
         for (size_t i = 0; i < children.size(); ++i) {
             view.set_child_ptr(static_cast<int>(i), children[i]);
+        }
+        
+        return node;
+    }
+
+    /**
+     * Build FULL node (256 direct-indexed children, no data)
+     * Expands from bitmap representation to 256 slots
+     */
+    slot_type* build_full(popcount_bitmap bmp, const std::vector<uint64_t>& children) {
+        size_t sz = calc_size(false, false, 0, false, false, false, true, 0);
+        slot_type* node = allocate_node(sz);
+        
+        uint64_t header = make_header(FLAG_FULL, static_cast<uint32_t>(sz));
+        store_slot<THREADED>(&node[0], header);
+        
+        node_view_t view(node);
+        // Expand bitmap+children to 256 direct slots
+        int child_idx = 0;
+        for (int c = 0; c < 256; ++c) {
+            if (bmp.contains(static_cast<unsigned char>(c))) {
+                view.set_child_ptr(c, children[child_idx++]);
+            }
+            // Non-present chars already 0 from allocate_node
+        }
+        
+        return node;
+    }
+
+    /**
+     * Build EOS | FULL node (data here + 256 direct-indexed children)
+     */
+    template <typename U>
+    slot_type* build_eos_full(U&& value, popcount_bitmap bmp, const std::vector<uint64_t>& children) {
+        size_t sz = calc_size(true, false, 0, false, false, false, true, 0);
+        slot_type* node = allocate_node(sz);
+        
+        uint64_t header = make_header(FLAG_EOS | FLAG_FULL, static_cast<uint32_t>(sz));
+        store_slot<THREADED>(&node[0], header);
+        
+        node_view_t view(node);
+        new (view.eos_data()) dataptr_t();
+        view.eos_data()->begin_write();
+        view.eos_data()->set(std::forward<U>(value));
+        view.eos_data()->end_write();
+        
+        // Expand bitmap+children to 256 direct slots
+        int child_idx = 0;
+        for (int c = 0; c < 256; ++c) {
+            if (bmp.contains(static_cast<unsigned char>(c))) {
+                view.set_child_ptr(c, children[child_idx++]);
+            }
         }
         
         return node;

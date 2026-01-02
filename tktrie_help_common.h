@@ -64,23 +64,66 @@ struct trie_helpers {
 
     /**
      * Extract child pointers from a node as vector
+     * For FULL nodes, only extracts non-null pointers
      */
     static std::vector<uint64_t> extract_children(node_view_t& view) {
         std::vector<uint64_t> children;
-        int count = view.child_count();
-        children.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            children.push_back(view.get_child_ptr(i));
+        if (view.has_full()) {
+            // FULL: extract non-null pointers
+            for (int i = 0; i < 256; ++i) {
+                uint64_t ptr = view.get_child_ptr(i);
+                if (ptr != 0) {
+                    children.push_back(ptr);
+                }
+            }
+        } else {
+            int count = view.child_count();
+            children.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                children.push_back(view.get_child_ptr(i));
+            }
+        }
+        return children;
+    }
+    
+    /**
+     * Extract non-null child pointers (for transitions)
+     */
+    static std::vector<uint64_t> extract_live_children(node_view_t& view) {
+        std::vector<uint64_t> children;
+        if (view.has_full()) {
+            for (int i = 0; i < 256; ++i) {
+                uint64_t ptr = view.get_child_ptr(i);
+                if (ptr != 0) {
+                    children.push_back(ptr);
+                }
+            }
+        } else {
+            int count = view.child_count();
+            for (int i = 0; i < count; ++i) {
+                uint64_t ptr = view.get_child_ptr(i);
+                if (ptr != 0) {
+                    children.push_back(ptr);
+                }
+            }
         }
         return children;
     }
 
     /**
      * Get all characters from node's child structure
+     * For FULL nodes, only returns chars with non-null pointers
      */
     static std::vector<unsigned char> get_child_chars(node_view_t& view) {
         std::vector<unsigned char> chars;
-        if (view.has_list()) {
+        if (view.has_full()) {
+            // FULL: scan all 256 slots for non-null
+            for (int i = 0; i < 256; ++i) {
+                if (view.get_child_ptr(i) != 0) {
+                    chars.push_back(static_cast<unsigned char>(i));
+                }
+            }
+        } else if (view.has_list()) {
             small_list lst = view.get_list();
             chars.reserve(lst.count());
             for (int i = 0; i < lst.count(); ++i) {
@@ -95,25 +138,62 @@ struct trie_helpers {
         }
         return chars;
     }
+    
+    /**
+     * Get chars with non-null pointers (for transitions)
+     */
+    static std::vector<unsigned char> get_live_child_chars(node_view_t& view) {
+        std::vector<unsigned char> chars;
+        if (view.has_full()) {
+            for (int i = 0; i < 256; ++i) {
+                if (view.get_child_ptr(i) != 0) {
+                    chars.push_back(static_cast<unsigned char>(i));
+                }
+            }
+        } else if (view.has_list()) {
+            small_list lst = view.get_list();
+            for (int i = 0; i < lst.count(); ++i) {
+                if (view.get_child_ptr(i) != 0) {
+                    chars.push_back(lst.char_at(i));
+                }
+            }
+        } else if (view.has_pop()) {
+            popcount_bitmap bmp = view.get_bitmap();
+            for (int i = 0; i < bmp.count(); ++i) {
+                if (view.get_child_ptr(i) != 0) {
+                    chars.push_back(bmp.nth_char(i));
+                }
+            }
+        }
+        return chars;
+    }
 
     /**
      * Build appropriate children structure based on count
-     * Returns (is_list, small_list or empty, bitmap or empty)
+     * Returns (node_type, small_list, bitmap) where node_type is:
+     * 0 = LIST, 1 = POP, 2 = FULL
      */
-    static std::tuple<bool, small_list, popcount_bitmap> 
+    static std::tuple<int, small_list, popcount_bitmap> 
     build_child_structure(const std::vector<unsigned char>& chars) {
-        if (chars.size() <= 7) {
+        if (chars.size() <= static_cast<size_t>(LIST_MAX)) {
             small_list lst;
             for (size_t i = 0; i < chars.size(); ++i) {
-                lst.insert(static_cast<int>(i), chars[i]);
+                lst.add(chars[i]);
             }
-            return {true, lst, popcount_bitmap()};
-        } else {
+            return {0, lst, popcount_bitmap()};
+        } else if (chars.size() <= static_cast<size_t>(FULL_THRESHOLD)) {
             popcount_bitmap bmp;
             for (auto c : chars) {
                 bmp.set(c);
             }
-            return {false, small_list(), bmp};
+            return {1, small_list(), bmp};
+        } else {
+            // > FULL_THRESHOLD: use FULL
+            popcount_bitmap bmp;
+            for (auto c : chars) {
+                bmp.set(c);
+            }
+            return {2, small_list(), bmp};
         }
     }
 
@@ -128,32 +208,12 @@ struct trie_helpers {
     }
 
     /**
-     * Insert a character into child structure, returns new index
-     */
-    static int insert_child_char(small_list& lst, popcount_bitmap& bmp, 
-                                  bool& is_list, unsigned char c) {
-        if (is_list) {
-            if (lst.count() < small_list::max_count) {
-                return lst.insert(lst.count(), c);
-            } else {
-                // Convert list to bitmap
-                for (int i = 0; i < lst.count(); ++i) {
-                    bmp.set(lst.char_at(i));
-                }
-                is_list = false;
-                return bmp.set(c);
-            }
-        } else {
-            return bmp.set(c);
-        }
-    }
-
-    /**
      * Rebuild node with given children - shared by insert and remove helpers
+     * node_type: 0=LIST, 1=POP, 2=FULL
      */
     static slot_type* rebuild_node(node_builder_t& builder,
                                     node_view_t& view,
-                                    bool is_list,
+                                    int node_type,
                                     small_list& lst,
                                     popcount_bitmap& bmp,
                                     const std::vector<uint64_t>& children) {
@@ -187,6 +247,19 @@ struct trie_helpers {
                     __builtin_unreachable();
             }
         }
+        
+        // Handle FULL nodes
+        if (node_type == 2) {
+            // FULL node: flags must not have SKIP (FULL nodes don't support skip currently)
+            // Build EOS | FULL or just FULL
+            if (flags & FLAG_EOS) {
+                return builder.build_eos_full(std::move(eos_val), bmp, children);
+            } else {
+                return builder.build_full(bmp, children);
+            }
+        }
+        
+        bool is_list = (node_type == 0);
         
         // 3 flag bits + is_list = 16 combos, but SKIP_EOS requires SKIP
         switch (mk_flag_switch(flags, MASK, is_list)) {
@@ -262,6 +335,7 @@ struct trie_debug {
         if (flags & FLAG_SKIP_EOS) result += "SKIP_EOS|";
         if (flags & FLAG_LIST) result += "LIST|";
         if (flags & FLAG_POP) result += "POP|";
+        if (flags & FLAG_FULL) result += "FULL|";
         if (!result.empty()) result.pop_back();
         else result = "NONE";
         return result;
@@ -277,7 +351,18 @@ struct trie_debug {
             os << indent << "  SKIP[" << view.skip_length() << "]: \"" << string_to_printable(view.skip_chars()) << "\"\n";
             if (view.has_skip_eos()) { os << indent << "  SKIP_EOS: "; T val; os << (view.skip_eos_data()->try_read(val) ? "(has data)" : "(no data)") << "\n"; }
         }
-        if (view.has_list()) {
+        if (view.has_full()) {
+            int live = view.live_child_count();
+            os << indent << "  FULL[" << live << " live children]\n";
+            for (int i = 0; i < 256; ++i) {
+                uint64_t child_ptr = view.get_child_ptr(i);
+                if (child_ptr == 0) continue;
+                unsigned char c = static_cast<unsigned char>(i);
+                std::string child_prefix = byte_to_string(c) + " -> ";
+                if constexpr (FIXED_LEN > 0) { if (depth + view.skip_length() >= FIXED_LEN - 1) { os << indent << "    " << child_prefix << "(leaf)\n"; continue; } }
+                pretty_print_node(reinterpret_cast<slot_type*>(child_ptr), os, indent_level + 2, child_prefix, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
+            }
+        } else if (view.has_list()) {
             small_list lst = view.get_list();
             os << indent << "  LIST[" << lst.count() << "]: ";
             for (int i = 0; i < lst.count(); ++i) os << byte_to_string(lst.char_at(i)) << " ";
@@ -285,6 +370,7 @@ struct trie_debug {
             for (int i = 0; i < lst.count(); ++i) {
                 unsigned char c = lst.char_at(i);
                 uint64_t child_ptr = view.get_child_ptr(i);
+                if (child_ptr == 0) { os << indent << "    " << byte_to_string(c) << " -> (deleted)\n"; continue; }
                 std::string child_prefix = byte_to_string(c) + " -> ";
                 if constexpr (FIXED_LEN > 0) { if (depth + view.skip_length() >= FIXED_LEN - 1) { os << indent << "    " << child_prefix << "(leaf)\n"; continue; } }
                 pretty_print_node(reinterpret_cast<slot_type*>(child_ptr), os, indent_level + 2, child_prefix, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
@@ -295,6 +381,7 @@ struct trie_debug {
             for (int i = 0; i < bmp.count(); ++i) {
                 unsigned char c = bmp.nth_char(i);
                 uint64_t child_ptr = view.get_child_ptr(i);
+                if (child_ptr == 0) { os << indent << "    " << byte_to_string(c) << " -> (deleted)\n"; continue; }
                 std::string child_prefix = byte_to_string(c) + " -> ";
                 if constexpr (FIXED_LEN > 0) { if (depth + view.skip_length() >= FIXED_LEN - 1) { os << indent << "    " << child_prefix << "(leaf)\n"; continue; } }
                 pretty_print_node(reinterpret_cast<slot_type*>(child_ptr), os, indent_level + 2, child_prefix, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
@@ -307,14 +394,30 @@ struct trie_debug {
         node_view_t view(node);
         uint64_t flags = view.flags();
         if ((flags & FLAG_LIST) && (flags & FLAG_POP)) return "LIST and POP both set";
+        if ((flags & FLAG_LIST) && (flags & FLAG_FULL)) return "LIST and FULL both set";
+        if ((flags & FLAG_POP) && (flags & FLAG_FULL)) return "POP and FULL both set";
         if ((flags & FLAG_SKIP_EOS) && !(flags & FLAG_SKIP)) return "SKIP_EOS without SKIP";
         if ((flags & FLAG_SKIP) && view.skip_length() == 0) return "SKIP with length 0";
-        int num_children = view.child_count();
-        for (int i = 0; i < num_children; ++i) {
-            uint64_t child_ptr = view.get_child_ptr(i);
-            if constexpr (FIXED_LEN > 0) { if (depth + (view.has_skip() ? view.skip_length() : 0) + 1 >= FIXED_LEN) continue; }
-            slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
-            if (child) { std::string err = validate_node(child, depth + (view.has_skip() ? view.skip_length() : 0) + 1); if (!err.empty()) return err; }
+        
+        if (view.has_full()) {
+            for (int i = 0; i < 256; ++i) {
+                uint64_t child_ptr = view.get_child_ptr(i);
+                if (child_ptr == 0) continue;
+                if constexpr (FIXED_LEN > 0) { if (depth + (view.has_skip() ? view.skip_length() : 0) + 1 >= FIXED_LEN) continue; }
+                slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
+                std::string err = validate_node(child, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
+                if (!err.empty()) return err;
+            }
+        } else {
+            int num_children = view.child_count();
+            for (int i = 0; i < num_children; ++i) {
+                uint64_t child_ptr = view.get_child_ptr(i);
+                if (child_ptr == 0) continue;  // Deleted child
+                if constexpr (FIXED_LEN > 0) { if (depth + (view.has_skip() ? view.skip_length() : 0) + 1 >= FIXED_LEN) continue; }
+                slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
+                std::string err = validate_node(child, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
+                if (!err.empty()) return err;
+            }
         }
         return "";
     }
