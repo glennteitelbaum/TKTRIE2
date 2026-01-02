@@ -457,54 +457,50 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                               U&& value,
                               result_t& result) {
         node_view_t view(node);
+        uint64_t flags = view.flags();
         
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
+        T skip_eos_val;
+        if (flags & FLAG_SKIP_EOS) view.skip_eos_data()->try_read(skip_eos_val);
+        std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
+        
         slot_type* new_node;
         
-        if (view.has_skip()) {
-            std::string_view skip = view.skip_chars();
-            if (view.has_skip_eos()) {
-                T skip_eos_val;
-                view.skip_eos_data()->try_read(skip_eos_val);
-                
-                if (children.empty()) {
-                    new_node = builder.build_eos_skip_eos(std::forward<U>(value), skip, 
-                                                          std::move(skip_eos_val));
-                } else {
-                    auto [is_list, lst, bmp] = base::build_child_structure(chars);
-                    if (is_list) {
-                        new_node = builder.build_eos_skip_eos_list(std::forward<U>(value), skip,
-                                                                   std::move(skip_eos_val), lst, children);
-                    } else {
-                        new_node = builder.build_eos_skip_eos_pop(std::forward<U>(value), skip,
-                                                                  std::move(skip_eos_val), bmp, children);
-                    }
-                }
-            } else {
-                // has_skip but no skip_eos - preserve skip and children
-                if (children.empty()) {
+        if (children.empty()) {
+            switch (mk_switch(flags, false)) {  // is_list irrelevant
+                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, false):
+                    new_node = builder.build_eos_skip_eos(std::forward<U>(value), skip, std::move(skip_eos_val));
+                    break;
+                case mk_switch(FLAG_SKIP, false):
                     new_node = builder.build_eos_skip(std::forward<U>(value), skip);
-                } else {
-                    auto [is_list, lst, bmp] = base::build_child_structure(chars);
-                    if (is_list) {
-                        new_node = builder.build_eos_skip_list(std::forward<U>(value), skip, lst, children);
-                    } else {
-                        new_node = builder.build_eos_skip_pop(std::forward<U>(value), skip, bmp, children);
-                    }
-                }
+                    break;
+                default:
+                    new_node = builder.build_eos(std::forward<U>(value));
+                    break;
             }
         } else {
-            if (children.empty()) {
-                new_node = builder.build_eos(std::forward<U>(value));
-            } else {
-                auto [is_list, lst, bmp] = base::build_child_structure(chars);
-                if (is_list) {
+            auto [is_list, lst, bmp] = base::build_child_structure(chars);
+            switch (mk_switch(flags, is_list)) {
+                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, true):
+                    new_node = builder.build_eos_skip_eos_list(std::forward<U>(value), skip, std::move(skip_eos_val), lst, children);
+                    break;
+                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, false):
+                    new_node = builder.build_eos_skip_eos_pop(std::forward<U>(value), skip, std::move(skip_eos_val), bmp, children);
+                    break;
+                case mk_switch(FLAG_SKIP, true):
+                    new_node = builder.build_eos_skip_list(std::forward<U>(value), skip, lst, children);
+                    break;
+                case mk_switch(FLAG_SKIP, false):
+                    new_node = builder.build_eos_skip_pop(std::forward<U>(value), skip, bmp, children);
+                    break;
+                case mk_switch(0, true):
                     new_node = builder.build_eos_list(std::forward<U>(value), lst, children);
-                } else {
+                    break;
+                default:
                     new_node = builder.build_eos_pop(std::forward<U>(value), bmp, children);
-                }
+                    break;
             }
         }
         
@@ -527,39 +523,41 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                    U&& value,
                                    result_t& result) {
         node_view_t view(node);
+        uint64_t flags = view.flags();
         std::string_view skip = view.skip_chars();
         
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
+        
+        T eos_val;
+        if (flags & FLAG_EOS) view.eos_data()->try_read(eos_val);
         
         slot_type* new_node;
         
-        if (view.has_eos()) {
-            T eos_val;
-            view.eos_data()->try_read(eos_val);
-            
-            if (children.empty()) {
-                new_node = builder.build_eos_skip_eos(std::move(eos_val), skip, 
-                                                      std::forward<U>(value));
-            } else {
-                if (is_list) {
-                    new_node = builder.build_eos_skip_eos_list(std::move(eos_val), skip,
-                                                               std::forward<U>(value), lst, children);
-                } else {
-                    new_node = builder.build_eos_skip_eos_pop(std::move(eos_val), skip,
-                                                              std::forward<U>(value), bmp, children);
-                }
+        if (children.empty()) {
+            switch (mk_switch(flags, false)) {  // is_list irrelevant
+                case mk_switch(FLAG_EOS | FLAG_SKIP, false):  // node has EOS + SKIP, we add SKIP_EOS
+                    new_node = builder.build_eos_skip_eos(std::move(eos_val), skip, std::forward<U>(value));
+                    break;
+                default:  // node has just SKIP
+                    new_node = builder.build_skip_eos(skip, std::forward<U>(value));
+                    break;
             }
         } else {
-            if (children.empty()) {
-                new_node = builder.build_skip_eos(skip, std::forward<U>(value));
-            } else {
-                if (is_list) {
+            auto [is_list, lst, bmp] = base::build_child_structure(chars);
+            switch (mk_switch(flags, is_list)) {
+                case mk_switch(FLAG_EOS | FLAG_SKIP, true):
+                    new_node = builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::forward<U>(value), lst, children);
+                    break;
+                case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+                    new_node = builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::forward<U>(value), bmp, children);
+                    break;
+                case mk_switch(FLAG_SKIP, true):
                     new_node = builder.build_skip_eos_list(skip, std::forward<U>(value), lst, children);
-                } else {
+                    break;
+                default:
                     new_node = builder.build_skip_eos_pop(skip, std::forward<U>(value), bmp, children);
-                }
+                    break;
             }
         }
         

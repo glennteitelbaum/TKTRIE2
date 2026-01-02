@@ -50,6 +50,13 @@ static constexpr uint64_t WRITE_BIT = 1ULL << 63;
 static constexpr uint64_t READ_BIT  = 1ULL << 62;
 static constexpr uint64_t PTR_MASK  = ~(WRITE_BIT | READ_BIT);  // masks off both control bits
 
+// Switch helper for flag combinations
+// Packs EOS(bit63), SKIP(bit62), SKIP_EOS(bit61) into bits 3,2,1 plus is_list in bit 0
+// Use: switch (mk_switch(flags, is_list)) { case mk_switch(FLAG_EOS | FLAG_SKIP, true): ... }
+KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(uint64_t flags, bool is_list) noexcept {
+    return static_cast<uint8_t>(((flags >> 60) & 0b1110) | is_list);
+}
+
 // Byteswap - C++23 has std::byteswap, provide fallback for C++20
 template <typename T>
 constexpr T byteswap_impl(T value) noexcept {

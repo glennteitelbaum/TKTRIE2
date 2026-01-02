@@ -162,40 +162,54 @@ struct trie_helpers {
                                     small_list& lst,
                                     popcount_bitmap& bmp,
                                     const std::vector<uint64_t>& children) {
-        bool has_eos = view.has_eos();
-        bool has_skip = view.has_skip();
-        bool has_skip_eos = view.has_skip_eos();
+        uint64_t flags = view.flags();
         
         T eos_val, skip_eos_val;
-        if (has_eos) view.eos_data()->try_read(eos_val);
-        if (has_skip_eos) view.skip_eos_data()->try_read(skip_eos_val);
-        std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
+        if (flags & FLAG_EOS) view.eos_data()->try_read(eos_val);
+        if (flags & FLAG_SKIP_EOS) view.skip_eos_data()->try_read(skip_eos_val);
+        std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
         
         if (children.empty()) {
-            if (has_eos && has_skip && has_skip_eos) 
-                return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
-            if (has_eos && has_skip) return builder.build_eos_skip(std::move(eos_val), skip);
-            if (has_eos) return builder.build_eos(std::move(eos_val));
-            if (has_skip && has_skip_eos) return builder.build_skip_eos(skip, std::move(skip_eos_val));
-            return builder.build_empty_root();
+            switch (mk_switch(flags, false)) {  // is_list irrelevant when no children
+                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+                    return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
+                case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+                    return builder.build_eos_skip(std::move(eos_val), skip);
+                case mk_switch(FLAG_EOS, false):
+                    return builder.build_eos(std::move(eos_val));
+                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, false):
+                    return builder.build_skip_eos(skip, std::move(skip_eos_val));
+                default:
+                    return builder.build_empty_root();
+            }
         }
         
-        if (has_eos && has_skip && has_skip_eos) {
-            return is_list ? builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children)
-                           : builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
-        } else if (has_eos && has_skip) {
-            return is_list ? builder.build_eos_skip_list(std::move(eos_val), skip, lst, children)
-                           : builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
-        } else if (has_skip && has_skip_eos) {
-            return is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
-                           : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-        } else if (has_skip) {
-            return is_list ? builder.build_skip_list(skip, lst, children) : builder.build_skip_pop(skip, bmp, children);
-        } else if (has_eos) {
-            return is_list ? builder.build_eos_list(std::move(eos_val), lst, children)
-                           : builder.build_eos_pop(std::move(eos_val), bmp, children);
+        switch (mk_switch(flags, is_list)) {
+            case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, true):
+                return builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children);
+            case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+                return builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
+            case mk_switch(FLAG_EOS | FLAG_SKIP, true):
+                return builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
+            case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+                return builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
+            case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, true):
+                return builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
+            case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, false):
+                return builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
+            case mk_switch(FLAG_SKIP, true):
+                return builder.build_skip_list(skip, lst, children);
+            case mk_switch(FLAG_SKIP, false):
+                return builder.build_skip_pop(skip, bmp, children);
+            case mk_switch(FLAG_EOS, true):
+                return builder.build_eos_list(std::move(eos_val), lst, children);
+            case mk_switch(FLAG_EOS, false):
+                return builder.build_eos_pop(std::move(eos_val), bmp, children);
+            case mk_switch(0, true):
+                return builder.build_list(lst, children);
+            default:
+                return builder.build_pop(bmp, children);
         }
-        return is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
     }
 };
 

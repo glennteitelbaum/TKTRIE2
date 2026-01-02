@@ -148,12 +148,21 @@ private:
                                  result_t& result) {
         node_view_t view(node);
         result.found = true;
+        uint64_t flags = view.flags();
         
-        bool has_skip = view.has_skip(), has_skip_eos = view.has_skip_eos();
         bool has_children = view.child_count() > 0;
         
         // If no other data, delete this subtree
-        if (!has_skip_eos && !has_children) {
+        if (!(flags & FLAG_SKIP_EOS) && !has_children) {
+            result.subtree_deleted = true;
+            result.target_slot = parent_slot;
+            result.expected_ptr = parent_slot_value;
+            result.old_nodes.push_back(node);
+            return result;
+        }
+        
+        // SKIP without SKIP_EOS and without children is also useless
+        if ((flags & FLAG_SKIP) && !(flags & FLAG_SKIP_EOS) && !has_children) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
             result.expected_ptr = parent_slot_value;
@@ -164,40 +173,38 @@ private:
         // Rebuild node without EOS
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
+        
+        T skip_eos_val;
+        if (flags & FLAG_SKIP_EOS) view.skip_eos_data()->try_read(skip_eos_val);
+        std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
         
         slot_type* new_node;
-        if (has_skip && has_skip_eos) {
-            T skip_eos_val; view.skip_eos_data()->try_read(skip_eos_val);
-            std::string_view skip = view.skip_chars();
-            if (has_children) {
-                new_node = is_list ? builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children)
-                                   : builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-            } else {
-                new_node = builder.build_skip_eos(skip, std::move(skip_eos_val));
-            }
-        } else if (has_skip) {
-            std::string_view skip = view.skip_chars();
-            if (has_children) {
-                new_node = is_list ? builder.build_skip_list(skip, lst, children)
-                                   : builder.build_skip_pop(skip, bmp, children);
-            } else {
-                result.subtree_deleted = true;
-                result.target_slot = parent_slot;
-                result.expected_ptr = parent_slot_value;
-                result.old_nodes.push_back(node);
-                return result;
+        
+        if (has_children) {
+            auto [is_list, lst, bmp] = base::build_child_structure(chars);
+            switch (mk_switch(flags, is_list)) {
+                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, true):
+                    new_node = builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
+                    break;
+                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+                    new_node = builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
+                    break;
+                case mk_switch(FLAG_EOS | FLAG_SKIP, true):
+                    new_node = builder.build_skip_list(skip, lst, children);
+                    break;
+                case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+                    new_node = builder.build_skip_pop(skip, bmp, children);
+                    break;
+                case mk_switch(FLAG_EOS, true):
+                    new_node = builder.build_list(lst, children);
+                    break;
+                default:
+                    new_node = builder.build_pop(bmp, children);
+                    break;
             }
         } else {
-            if (has_children) {
-                new_node = is_list ? builder.build_list(lst, children) : builder.build_pop(bmp, children);
-            } else {
-                result.subtree_deleted = true;
-                result.target_slot = parent_slot;
-                result.expected_ptr = parent_slot_value;
-                result.old_nodes.push_back(node);
-                return result;
-            }
+            // No children - must have SKIP_EOS (checked above)
+            new_node = builder.build_skip_eos(skip, std::move(skip_eos_val));
         }
         
         result.new_nodes.push_back(new_node);
@@ -217,11 +224,12 @@ private:
                                       result_t& result) {
         node_view_t view(node);
         result.found = true;
+        uint64_t flags = view.flags();
         
-        bool has_eos = view.has_eos(), has_children = view.child_count() > 0;
+        bool has_children = view.child_count() > 0;
         std::string_view skip = view.skip_chars();
         
-        if (!has_eos && !has_children) {
+        if (!(flags & FLAG_EOS) && !has_children) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
             result.expected_ptr = parent_slot_value;
@@ -231,30 +239,32 @@ private:
         
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
+        
+        T eos_val;
+        if (flags & FLAG_EOS) view.eos_data()->try_read(eos_val);
         
         slot_type* new_node;
-        if (has_eos) {
-            T eos_val; view.eos_data()->try_read(eos_val);
-            if (has_children) {
-                // Keep the skip - children hang off the end of it
-                new_node = is_list ? builder.build_eos_skip_list(std::move(eos_val), skip, lst, children)
-                                   : builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
-            } else {
-                // No children and no skip_eos - skip is pointless, just keep EOS
-                new_node = builder.build_eos(std::move(eos_val));
+        
+        if (has_children) {
+            auto [is_list, lst, bmp] = base::build_child_structure(chars);
+            switch (mk_switch(flags, is_list)) {
+                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, true):
+                    // Keep the skip - children hang off the end of it
+                    new_node = builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
+                    break;
+                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+                    new_node = builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
+                    break;
+                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, true):
+                    new_node = builder.build_skip_list(skip, lst, children);
+                    break;
+                default:
+                    new_node = builder.build_skip_pop(skip, bmp, children);
+                    break;
             }
         } else {
-            if (has_children) {
-                new_node = is_list ? builder.build_skip_list(skip, lst, children)
-                                   : builder.build_skip_pop(skip, bmp, children);
-            } else {
-                result.subtree_deleted = true;
-                result.target_slot = parent_slot;
-                result.expected_ptr = parent_slot_value;
-                result.old_nodes.push_back(node);
-                return result;
-            }
+            // No children - if has EOS, skip is pointless; if no EOS, handled by early return
+            new_node = builder.build_eos(std::move(eos_val));
         }
         
         result.new_nodes.push_back(new_node);
