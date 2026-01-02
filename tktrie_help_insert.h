@@ -22,6 +22,12 @@ struct insert_result {
     bool already_exists = false;
     bool hit_write = false;
     bool hit_read = false;
+    
+    insert_result() {
+        new_nodes.reserve(16);
+        old_nodes.reserve(16);
+        path.reserve(16);
+    }
 };
 
 /**
@@ -653,7 +659,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         return result;
     }
 
-    static result_t& clone_with_new_child(node_builder_t& builder,
+    static result_t& clone_with_new_child(node_builder_t& /*builder*/,
                                            slot_type* node,
                                            unsigned char c,
                                            slot_type* new_child_node,
@@ -667,29 +673,14 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             result.old_nodes.push_back(n);
         }
         
-        // Clone this node with updated child pointer
+        // Update child slot in place - no need to rebuild parent node
         node_view_t view(node);
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
+        slot_type* child_slot = view.find_child(c);
+        store_slot<THREADED>(child_slot, reinterpret_cast<uint64_t>(new_child_node));
         
-        // Find and update child
-        int idx = -1;
-        if (view.has_list()) {
-            idx = view.get_list().offset(c) - 1;
-        } else if (view.has_pop()) {
-            view.get_bitmap().find(c, &idx);
-        }
-        
-        if (idx >= 0) {
-            children[idx] = reinterpret_cast<uint64_t>(new_child_node);
-        }
-        
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
-        
-        result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
-        result.old_nodes.push_back(node);
+        // Parent node is NOT replaced - just modified in place
+        result.new_root = node;
+        // Don't add node to old_nodes since we're keeping it
         
         return result;
     }

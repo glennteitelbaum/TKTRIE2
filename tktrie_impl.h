@@ -528,6 +528,8 @@ private:
                                                U&& value) {
         std::vector<slot_type*> unneeded;
         std::vector<slot_type*> to_free;
+        unneeded.reserve(16);
+        to_free.reserve(16);
 
         // Step 1: OUTSIDE LOCK - collect pathA and build optimistically
         auto resultA = insert_t::build_insert_path(builder_, get_root(), key_bytes,
@@ -694,6 +696,8 @@ private:
     bool erase_threaded(const std::string& key_bytes) {
         std::vector<slot_type*> unneeded;
         std::vector<slot_type*> to_free;
+        unneeded.reserve(16);
+        to_free.reserve(16);
 
         // Step 1: OUTSIDE LOCK - collect pathA and build optimistically
         auto resultA = remove_t::build_remove_path(builder_, get_root(), key_bytes);
@@ -791,6 +795,7 @@ private:
 
     void clear_threaded() {
         std::vector<slot_type*> to_free;
+        to_free.reserve(16);
 
         {
             std::lock_guard<mutex_type> lock(write_mutex_);

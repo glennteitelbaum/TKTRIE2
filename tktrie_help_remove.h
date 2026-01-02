@@ -19,6 +19,12 @@ struct remove_result {
     bool hit_write = false;
     bool hit_read = false;
     bool root_deleted = false;
+    
+    remove_result() {
+        new_nodes.reserve(16);
+        old_nodes.reserve(16);
+        path.reserve(16);
+    }
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -231,25 +237,20 @@ private:
         return result;
     }
 
-    static result_t& clone_with_updated_child(node_builder_t& builder, slot_type* node, unsigned char c,
+    static result_t& clone_with_updated_child(node_builder_t& /*builder*/, slot_type* node, unsigned char c,
                                                slot_type* new_child, result_t& child_result, result_t& result) {
         for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
         for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
         result.found = true;
         
+        // Update child slot in place - no need to rebuild parent node
         node_view_t view(node);
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
+        slot_type* child_slot = view.find_child(c);
+        store_slot<THREADED>(child_slot, reinterpret_cast<uint64_t>(new_child));
         
-        int idx = base::find_char_index(chars, c);
-        
-        if (idx >= 0) children[idx] = reinterpret_cast<uint64_t>(new_child);
-        
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
-        result.new_nodes.push_back(new_node);
-        result.new_root = new_node;
-        result.old_nodes.push_back(node);
+        // Parent node is NOT replaced - just modified in place
+        result.new_root = node;
+        // Don't add node to old_nodes since we're keeping it
         return result;
     }
 
