@@ -12,39 +12,35 @@ namespace gteitelbaum {
  * Remove operation results
  * 
  * THREADED writer protocol (same as insert):
- * 1. Traverse, check WRITE_BIT on each slot, record path
- * 2. Build new subtree optimistically
- * 3. LOCK mutex
- * 4. Re-verify path for WRITE_BIT (any set = abort)
- * 5. Store (new_ptr | WRITE_BIT) to target_slot
- * 6. UNLOCK
- * 7. Free old nodes
- * 8. Clear WRITE_BIT on target_slot
+ * - Always target root_slot
+ * - Verify expected_ptr inside lock
+ * - Rebuild entire path from root to modification point
  */
 template <bool THREADED>
 struct remove_result {
     slot_type_t<THREADED>* new_subtree = nullptr;   // What to install (null = delete)
-    slot_type_t<THREADED>* target_slot = nullptr;   // Where to install
-    std::vector<slot_type_t<THREADED>*> traversal_path;  // Slots traversed (for re-verify)
+    slot_type_t<THREADED>* target_slot = nullptr;   // Always root_slot for THREADED
+    uint64_t expected_ptr = 0;                       // Expected value in target_slot
     std::vector<slot_type_t<THREADED>*> new_nodes;
-    std::vector<slot_type_t<THREADED>*> old_nodes;   // Only replaced nodes, not ancestors
+    std::vector<slot_type_t<THREADED>*> old_nodes;
     bool found = false;
     bool hit_write = false;
-    bool subtree_deleted = false;                    // True if subtree should be removed
+    bool subtree_deleted = false;
     
     remove_result() {
         new_nodes.reserve(16);
         old_nodes.reserve(16);
-        if constexpr (THREADED) {
-            traversal_path.reserve(32);
-        }
     }
     
-    // Check if any slot in path has WRITE_BIT set
-    bool path_has_write_bit() const noexcept {
+    // Check if target_slot has been modified
+    bool path_has_conflict() const noexcept {
         if constexpr (THREADED) {
-            for (auto* slot : traversal_path) {
-                if (load_slot<THREADED>(slot) & WRITE_BIT) {
+            if (target_slot) {
+                uint64_t current = load_slot<THREADED>(target_slot);
+                if ((current & PTR_MASK) != (expected_ptr & PTR_MASK)) {
+                    return true;
+                }
+                if (current & WRITE_BIT) {
                     return true;
                 }
             }
@@ -67,6 +63,7 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
     /**
      * Build remove operation
+     * For THREADED: always targets root_slot
      */
     static result_t build_remove_path(node_builder_t& builder, 
                                        slot_type* root_slot,
@@ -75,9 +72,12 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         result_t result;
         if (!root) return result;  // Key not found
         
-        // Record root_slot in traversal path and check WRITE_BIT
+        // Always target root_slot for THREADED mode
+        result.target_slot = root_slot;
+        result.expected_ptr = reinterpret_cast<uint64_t>(root);
+        
+        // Check root for WRITE_BIT
         if constexpr (THREADED) {
-            result.traversal_path.push_back(root_slot);
             uint64_t val = load_slot<THREADED>(root_slot);
             if (val & WRITE_BIT) {
                 result.hit_write = true;
@@ -85,7 +85,7 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             }
         }
         
-        return remove_from_node(builder, root, root_slot, key, depth, result);
+        return remove_from_node(builder, root, key, depth, result);
     }
 
 private:
@@ -93,7 +93,6 @@ private:
      * Remove from node
      */
     static result_t& remove_from_node(node_builder_t& builder, slot_type* node,
-                                       slot_type* parent_slot,
                                        std::string_view key, size_t depth, result_t& result) {
         node_view_t view(node);
         
@@ -105,27 +104,26 @@ private:
             depth += match;
             if (key.empty()) {
                 if (!view.has_skip_eos()) return result;  // Key not found
-                return remove_skip_eos(builder, node, parent_slot, result);
+                return remove_skip_eos(builder, node, result);
             }
         }
         
         if (key.empty()) {
             if (!view.has_eos()) return result;  // Key not found
-            return remove_eos(builder, node, parent_slot, result);
+            return remove_eos(builder, node, result);
         }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
         slot_type* child_slot = view.find_child(c);
         if (!child_slot) return result;  // Key not found
         
-        // Check WRITE_BIT and record in path
+        // Check WRITE_BIT
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
         if constexpr (THREADED) {
             if (child_ptr & WRITE_BIT) {
                 result.hit_write = true;
                 return result;
             }
-            result.traversal_path.push_back(child_slot);
         }
         uint64_t clean_ptr = child_ptr & PTR_MASK;
         
@@ -134,54 +132,69 @@ private:
             if (depth == FIXED_LEN - 1 && key.size() == 1) {
                 dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
                 if (!dp->has_data()) return result;
-                return remove_leaf_data(builder, node, parent_slot, c, result);
+                return remove_leaf_data(builder, node, c, result);
             }
         }
         
         // Recurse into child
         slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
         result_t child_result;
-        if constexpr (THREADED) {
-            // Copy traversal path to child for propagation back
-            child_result.traversal_path = result.traversal_path;
-        }
-        remove_from_node(builder, child, child_slot, key.substr(1), depth + 1, child_result);
+        remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
         
         if (!child_result.found || child_result.hit_write) {
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
-            if constexpr (THREADED) {
-                result.traversal_path = std::move(child_result.traversal_path);
-            }
             return result;
         }
         
         // Child operation succeeded
         if (child_result.subtree_deleted) {
             // Child subtree should be removed - rebuild this node without that child
-            if constexpr (THREADED) {
-                result.traversal_path = std::move(child_result.traversal_path);
-            }
-            return remove_child(builder, node, parent_slot, c, child_result, result);
+            return remove_child(builder, node, c, child_result, result);
         } else {
-            // Child was modified - just propagate the result up
+            // Child was modified - rebuild this node with new child pointer (COW)
             result.found = true;
-            result.new_subtree = child_result.new_subtree;
-            result.target_slot = child_result.target_slot;
             for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
             for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
-            if constexpr (THREADED) {
-                result.traversal_path = std::move(child_result.traversal_path);
-            }
-            return result;
+            return rebuild_with_new_child(builder, node, c, child_result.new_subtree, result);
         }
+    }
+    
+    /**
+     * Rebuild current node with new child subtree (COW propagation)
+     */
+    static result_t& rebuild_with_new_child(node_builder_t& builder,
+                                             slot_type* node,
+                                             unsigned char c,
+                                             slot_type* new_child,
+                                             result_t& result) {
+        node_view_t view(node);
+        
+        // Get current children
+        auto children = base::extract_children(view);
+        auto chars = base::get_child_chars(view);
+        
+        // Find and replace the modified child
+        int idx = base::find_char_index(chars, c);
+        if (idx >= 0) {
+            children[idx] = reinterpret_cast<uint64_t>(new_child);
+        }
+        
+        // Rebuild with new child pointer
+        auto [is_list, lst, bmp] = base::build_child_structure(chars);
+        slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
+        
+        result.new_nodes.push_back(new_node);
+        result.old_nodes.push_back(node);
+        result.new_subtree = new_node;
+        
+        return result;
     }
 
     /**
      * Remove EOS from node
      */
     static result_t& remove_eos(node_builder_t& builder, slot_type* node,
-                                 slot_type* parent_slot,
                                  result_t& result) {
         node_view_t view(node);
         result.found = true;
@@ -193,7 +206,6 @@ private:
         // If no other data, delete this subtree
         if (!(flags & FLAG_SKIP_EOS) && !has_children) {
             result.subtree_deleted = true;
-            result.target_slot = parent_slot;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -201,7 +213,6 @@ private:
         // SKIP without SKIP_EOS and without children is also useless
         if ((flags & FLAG_SKIP) && !(flags & FLAG_SKIP_EOS) && !has_children) {
             result.subtree_deleted = true;
-            result.target_slot = parent_slot;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -258,7 +269,6 @@ private:
         
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
-        result.target_slot = parent_slot;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
@@ -268,7 +278,6 @@ private:
      * Remove skip_eos from node
      */
     static result_t& remove_skip_eos(node_builder_t& builder, slot_type* node,
-                                      slot_type* parent_slot,
                                       result_t& result) {
         node_view_t view(node);
         result.found = true;
@@ -280,7 +289,6 @@ private:
         
         if (!(flags & FLAG_EOS) && !has_children) {
             result.subtree_deleted = true;
-            result.target_slot = parent_slot;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -331,7 +339,6 @@ private:
         
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
-        result.target_slot = parent_slot;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
@@ -341,7 +348,6 @@ private:
      * Remove child from node (child subtree was deleted)
      */
     static result_t& remove_child(node_builder_t& builder, slot_type* node,
-                                   slot_type* parent_slot,
                                    unsigned char c, result_t& child_result, result_t& result) {
         for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
         for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
@@ -362,7 +368,6 @@ private:
         // If no other data/children, delete this subtree too
         if (children.empty() && !has_eos && !has_skip_eos) {
             result.subtree_deleted = true;
-            result.target_slot = parent_slot;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -372,7 +377,6 @@ private:
         slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
-        result.target_slot = parent_slot;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
@@ -382,7 +386,6 @@ private:
      * Remove leaf data (FIXED_LEN non-threaded only)
      */
     static result_t& remove_leaf_data(node_builder_t& builder, slot_type* node,
-                                       slot_type* parent_slot,
                                        unsigned char c, result_t& result) {
         result.found = true;
         node_view_t view(node);
@@ -400,7 +403,6 @@ private:
         
         if (children.empty()) {
             result.subtree_deleted = true;
-            result.target_slot = parent_slot;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -409,7 +411,6 @@ private:
         slot_type* new_node = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
-        result.target_slot = parent_slot;
         result.old_nodes.push_back(node);
         return result;
     }

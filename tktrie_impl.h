@@ -28,6 +28,39 @@ template <typename Key, typename T, bool THREADED, typename Allocator> class tkt
 namespace gteitelbaum {
 
 /**
+ * Static node deleter for EBR - works without builder instance
+ * Template parameters baked into function to handle different node types
+ */
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+void static_node_deleter(void* ptr) {
+    if (!ptr) return;
+    
+    using slot_type = slot_type_t<THREADED>;
+    using node_view_t = node_view<T, THREADED, Allocator, FIXED_LEN>;
+    using dataptr_t = dataptr<T, THREADED, Allocator>;
+    
+    slot_type* node = static_cast<slot_type*>(ptr);
+    node_view_t view(node);
+    
+    // Clean up dataptr objects
+    if (view.has_eos()) {
+        view.eos_data()->~dataptr_t();
+    }
+    if (view.has_skip_eos()) {
+        view.skip_eos_data()->~dataptr_t();
+    }
+    
+    // Deallocate using rebound allocator
+    using alloc_traits = std::allocator_traits<Allocator>;
+    using slot_alloc_t = typename alloc_traits::template rebind_alloc<slot_type>;
+    using slot_alloc_traits = std::allocator_traits<slot_alloc_t>;
+    
+    slot_alloc_t alloc;
+    size_t sz = view.size();
+    slot_alloc_traits::deallocate(alloc, node, sz);
+}
+
+/**
  * Thread-safe trie with EBR (Epoch-Based Reclamation)
  * 
  * WRITER PROTOCOL (THREADED mode):
@@ -72,18 +105,8 @@ private:
     // Mutex type based on THREADED
     using mutex_type = std::conditional_t<THREADED, std::mutex, empty_mutex>;
     
-    // EBR types (only meaningful for THREADED)
-    struct node_deleter {
-        node_builder_t* builder;
-        void operator()(void* ptr) const {
-            if (builder && ptr) {
-                builder->deallocate_node(static_cast<slot_type*>(ptr));
-            }
-        }
-    };
-    using ebr_manager_t = ebr_manager<node_deleter>;
-    using ebr_context_t = ebr_thread_context<node_deleter>;
-    using ebr_guard_t = ebr_guard<node_deleter>;
+    // Static deleter for this trie's node type
+    static constexpr auto node_deleter = &static_node_deleter<T, THREADED, Allocator, fixed_len>;
     
     // Root slot - stores pointer + control bits
     slot_type root_slot_;
@@ -91,17 +114,16 @@ private:
     mutable mutex_type write_mutex_;
     Allocator alloc_;
     node_builder_t builder_;
-    
-    // EBR manager (only used for THREADED)
-    std::conditional_t<THREADED, std::unique_ptr<ebr_manager_t>, char> ebr_;
 
     friend class tktrie_iterator<Key, T, THREADED, Allocator>;
 
-    // Get thread-local EBR context
-    ebr_context_t& get_ebr_context() const {
-        static thread_local ebr_context_t ctx(
-            const_cast<ebr_manager_t*>(ebr_.get()));
-        return ctx;
+    // Retire a node to global EBR
+    void retire_node(slot_type* node) const {
+        if constexpr (THREADED) {
+            if (node) {
+                ebr_global::instance().retire(node, node_deleter);
+            }
+        }
     }
 
     // Helper to safely read root pointer (masks off control bits)
@@ -133,9 +155,6 @@ public:
         : root_slot_{}
         , builder_(alloc_) {
         store_slot<THREADED>(&root_slot_, 0);
-        if constexpr (THREADED) {
-            ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
-        }
     }
 
     explicit tktrie(const Allocator& alloc)
@@ -143,9 +162,6 @@ public:
         , alloc_(alloc)
         , builder_(alloc) {
         store_slot<THREADED>(&root_slot_, 0);
-        if constexpr (THREADED) {
-            ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
-        }
     }
 
     ~tktrie() {
@@ -159,7 +175,6 @@ public:
         , builder_(other.alloc_) {
         if constexpr (THREADED) {
             std::lock_guard<mutex_type> lock(other.write_mutex_);
-            ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
         }
         slot_type* other_root = const_cast<tktrie&>(other).get_root();
         if (other_root) {
@@ -191,13 +206,6 @@ public:
         , builder_(alloc_) {
         if constexpr (THREADED) {
             std::lock_guard<mutex_type> lock(other.write_mutex_);
-            ebr_ = std::move(other.ebr_);
-            // Update deleter's builder pointer
-            if (ebr_) {
-                // Note: Can't update deleter in existing ebr_ easily
-                // For safety, create new one
-                ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
-            }
         }
         uint64_t other_val = load_slot<THREADED>(&other.root_slot_);
         store_slot<THREADED>(&root_slot_, other_val & PTR_MASK);
@@ -224,7 +232,6 @@ public:
             alloc_ = std::move(other.alloc_);
             builder_ = node_builder_t(alloc_);
             if constexpr (THREADED) {
-                ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
                 elem_count_.store(other.elem_count_.exchange(0, std::memory_order_relaxed),
                                  std::memory_order_relaxed);
             } else {
@@ -249,7 +256,6 @@ public:
         store_slot<THREADED>(&other.root_slot_, tmp & PTR_MASK);
         std::swap(alloc_, other.alloc_);
         if constexpr (THREADED) {
-            // Don't swap EBR managers - they're tied to builders
             size_type tmp_count = elem_count_.load(std::memory_order_relaxed);
             elem_count_.store(other.elem_count_.load(std::memory_order_relaxed),
                              std::memory_order_relaxed);
@@ -290,7 +296,7 @@ public:
         bool hit_write = false;
         
         if constexpr (THREADED) {
-            auto guard = get_ebr_context().guard();
+            auto guard = get_ebr_slot().guard();
             slot_type* root = get_root();
             return nav_t::contains(root, key_bytes, hit_write);
         } else {
@@ -310,7 +316,7 @@ public:
         bool hit_write = false;
         
         if constexpr (THREADED) {
-            auto guard = get_ebr_context().guard();
+            auto guard = get_ebr_slot().guard();
             slot_type* root = get_root();
             bool found = nav_t::read(root, key_bytes, value, hit_write);
             if (found) {
@@ -367,7 +373,7 @@ public:
 
     iterator begin() const {
         if constexpr (THREADED) {
-            auto guard = get_ebr_context().guard();
+            auto guard = get_ebr_slot().guard();
             slot_type* root = get_root();
             if (!root) return end();
             
@@ -407,7 +413,7 @@ public:
     }
 
     iterator next_after(const std::string& key_bytes) const {
-        // TODO: Implement proper in-order traversal
+        (void)key_bytes;  // TODO: Implement proper in-order traversal
         return end();
     }
 
@@ -438,11 +444,13 @@ public:
 
     std::pair<iterator, iterator> prefix_range(const std::string& prefix) const
         requires (fixed_len == 0) {
+        (void)prefix;  // TODO: Implement
         return {end(), end()};
     }
 
     std::pair<iterator, iterator> prefix_range(const Key& key, size_t depth) const
         requires (fixed_len > 0) {
+        (void)key; (void)depth;  // TODO: Implement
         return {end(), end()};
     }
 
@@ -543,6 +551,10 @@ private:
 
         while (true) {
             // Step 1: OUTSIDE LOCK - traverse checking WRITE_BIT, build optimistically
+            // EBR guard protects us from use-after-free during traversal
+            auto& slot = get_ebr_slot();
+            auto guard = slot.guard();
+            
             auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), key_bytes,
                                                        std::forward<U>(value));
             
@@ -561,8 +573,8 @@ private:
             {
                 std::lock_guard<mutex_type> lock(write_mutex_);
 
-                // Step 2: INSIDE LOCK - re-verify path for WRITE_BIT
-                if (result.path_has_write_bit()) {
+                // Step 2: INSIDE LOCK - verify no conflict (pointer changed or WRITE_BIT set)
+                if (result.path_has_conflict()) {
                     for (auto* n : result.new_nodes) unneeded.push_back(n);
                     need_retry = true;
                 }
@@ -574,6 +586,8 @@ private:
                     elem_count_.fetch_add(1, std::memory_order_relaxed);
                 }
             }  // UNLOCK
+            
+            // Exit EBR guard before cleanup (guard goes out of scope at end of iteration)
 
             // Delete unneeded (never visible, safe to delete immediately)
             for (auto* n : unneeded) {
@@ -588,14 +602,14 @@ private:
 
             // Step 4: Retire old nodes to EBR (deferred deletion)
             for (auto* n : result.old_nodes) {
-                ebr_->retire(n);
+                retire_node(n);
             }
 
             // Step 5: Clear WRITE_BIT
             fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
 
             // Step 6: Try to reclaim old epochs
-            ebr_->try_reclaim();
+            ebr_global::instance().try_reclaim();
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
@@ -658,6 +672,10 @@ private:
 
         while (true) {
             // Step 1: OUTSIDE LOCK - traverse checking WRITE_BIT, build optimistically
+            // EBR guard protects us from use-after-free during traversal
+            auto& slot = get_ebr_slot();
+            auto guard = slot.guard();
+            
             auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), key_bytes);
             
             if (result.hit_write) {
@@ -675,8 +693,8 @@ private:
             {
                 std::lock_guard<mutex_type> lock(write_mutex_);
 
-                // Step 2: INSIDE LOCK - re-verify path for WRITE_BIT
-                if (result.path_has_write_bit()) {
+                // Step 2: INSIDE LOCK - verify no conflict (pointer changed or WRITE_BIT set)
+                if (result.path_has_conflict()) {
                     for (auto* n : result.new_nodes) unneeded.push_back(n);
                     need_retry = true;
                 }
@@ -686,9 +704,15 @@ private:
                     uint64_t new_ptr = result.subtree_deleted ? WRITE_BIT 
                                      : (reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT);
                     store_slot<THREADED>(result.target_slot, new_ptr);
-                    elem_count_.fetch_sub(1, std::memory_order_relaxed);
+                    if constexpr (THREADED) {
+                        elem_count_.fetch_sub(1, std::memory_order_relaxed);
+                    } else {
+                        --elem_count_;
+                    }
                 }
             }  // UNLOCK
+            
+            // Exit EBR guard before cleanup
 
             // Delete unneeded (never visible, safe to delete immediately)
             for (auto* n : unneeded) {
@@ -703,14 +727,14 @@ private:
 
             // Step 4: Retire old nodes to EBR
             for (auto* n : result.old_nodes) {
-                ebr_->retire(n);
+                retire_node(n);
             }
 
             // Step 5: Clear WRITE_BIT
             fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
 
             // Step 6: Try to reclaim
-            ebr_->try_reclaim();
+            ebr_global::instance().try_reclaim();
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
@@ -729,20 +753,22 @@ private:
             std::lock_guard<mutex_type> lock(write_mutex_);
             old_root = get_root();
             set_root(nullptr);
-            elem_count_.store(0, std::memory_order_relaxed);
+            if constexpr (THREADED) {
+                elem_count_.store(0, std::memory_order_relaxed);
+            } else {
+                elem_count_ = 0;
+            }
         }  // UNLOCK
         
         // For clear, we need to wait until all readers are done
-        // Then delete the entire tree
-        // Simple approach: advance epoch twice and reclaim
+        // Advance epoch and wait, then delete tree
         if (old_root) {
-            // Retire root - will recursively free when safe
-            // Actually, we need to delete tree properly
-            // For now, just delete immediately (unsafe if readers active)
-            // TODO: Implement proper tree retirement
-            ebr_->advance_epoch();
-            ebr_->advance_epoch();
-            ebr_->try_reclaim();
+            if constexpr (THREADED) {
+                ebr_global::instance().advance_epoch();
+                ebr_global::instance().advance_epoch();
+                ebr_global::instance().try_reclaim();
+            }
+            // Now safe to delete (readers from old epochs are done)
             delete_tree_simple(old_root);
         }
     }

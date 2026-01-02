@@ -6,6 +6,7 @@
 #include <thread>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 #include "tktrie_defines.h"
 
@@ -17,11 +18,10 @@ namespace gteitelbaum {
  * Protocol:
  * - Global epoch counter (0, 1, 2, ...)
  * - Readers: enter_epoch() on start, exit_epoch() on end
- * - Writers: retire() nodes, periodically try_reclaim()
+ * - Writers: retire() nodes with deleter, periodically try_reclaim()
  * - Nodes retired in epoch N can be freed when all threads have exited epoch N
  * 
- * Thread tracking uses a fixed-size array of thread slots.
- * Each slot tracks: active flag, current epoch when active.
+ * This is a GLOBAL singleton shared by all tries to avoid thread_local issues.
  */
 
 // Maximum concurrent threads (can be increased)
@@ -41,22 +41,24 @@ struct alignas(64) ebr_thread_slot {
 };
 
 /**
- * Global EBR state
+ * Retired node entry - stores pointer + deleter
  */
-template <typename Deleter>
-class ebr_manager {
-public:
-    using deleter_t = Deleter;
-    
+struct retired_node {
+    void* ptr;
+    void (*deleter)(void*);
+};
+
+/**
+ * Global EBR manager (singleton)
+ */
+class ebr_global {
 private:
     std::atomic<uint64_t> global_epoch_{1};  // Start at 1 so 0 means "not active"
     std::array<ebr_thread_slot, EBR_MAX_THREADS> slots_{};
     
     // Retire lists per epoch (circular buffer of 3)
-    std::array<std::vector<void*>, EBR_NUM_EPOCHS> retire_lists_;
+    std::array<std::vector<retired_node>, EBR_NUM_EPOCHS> retire_lists_;
     std::array<std::mutex, EBR_NUM_EPOCHS> retire_mutexes_;
-    
-    deleter_t deleter_;
     
     // Find minimum epoch across all active threads
     uint64_t min_active_epoch() const noexcept {
@@ -73,22 +75,28 @@ private:
         return min_epoch;
     }
 
+    ebr_global() = default;
+
 public:
-    explicit ebr_manager(deleter_t deleter = deleter_t{}) 
-        : deleter_(std::move(deleter)) {}
+    static ebr_global& instance() {
+        static ebr_global inst;
+        return inst;
+    }
     
-    ~ebr_manager() {
+    ~ebr_global() {
         // Free all remaining retired nodes
         for (size_t i = 0; i < EBR_NUM_EPOCHS; ++i) {
-            for (void* ptr : retire_lists_[i]) {
-                deleter_(ptr);
+            for (auto& rn : retire_lists_[i]) {
+                if (rn.deleter && rn.ptr) {
+                    rn.deleter(rn.ptr);
+                }
             }
             retire_lists_[i].clear();
         }
     }
     
-    ebr_manager(const ebr_manager&) = delete;
-    ebr_manager& operator=(const ebr_manager&) = delete;
+    ebr_global(const ebr_global&) = delete;
+    ebr_global& operator=(const ebr_global&) = delete;
     
     /**
      * Acquire a thread slot (call once per thread, typically via thread_local)
@@ -141,16 +149,16 @@ public:
     }
     
     /**
-     * Retire a pointer (defer deletion until safe)
+     * Retire a pointer with its deleter (defer deletion until safe)
      */
-    void retire(void* ptr) {
-        if (!ptr) return;
+    void retire(void* ptr, void (*deleter)(void*)) {
+        if (!ptr || !deleter) return;
         
         uint64_t epoch = global_epoch_.load(std::memory_order_acquire);
         size_t list_idx = epoch % EBR_NUM_EPOCHS;
         
         std::lock_guard<std::mutex> lock(retire_mutexes_[list_idx]);
-        retire_lists_[list_idx].push_back(ptr);
+        retire_lists_[list_idx].push_back({ptr, deleter});
     }
     
     /**
@@ -166,15 +174,17 @@ public:
         for (uint64_t old_epoch = current > 2 ? current - 2 : 1; old_epoch < min_active; ++old_epoch) {
             size_t list_idx = old_epoch % EBR_NUM_EPOCHS;
             
-            std::vector<void*> to_delete;
+            std::vector<retired_node> to_delete;
             {
                 std::lock_guard<std::mutex> lock(retire_mutexes_[list_idx]);
                 to_delete = std::move(retire_lists_[list_idx]);
                 retire_lists_[list_idx].clear();
             }
             
-            for (void* ptr : to_delete) {
-                deleter_(ptr);
+            for (auto& rn : to_delete) {
+                if (rn.deleter && rn.ptr) {
+                    rn.deleter(rn.ptr);
+                }
             }
         }
         
@@ -212,67 +222,69 @@ public:
 /**
  * RAII guard for epoch entry/exit
  */
-template <typename Deleter>
 class ebr_guard {
-    ebr_manager<Deleter>* mgr_;
     int slot_idx_;
     
 public:
-    ebr_guard(ebr_manager<Deleter>* mgr, int slot_idx) noexcept
-        : mgr_(mgr), slot_idx_(slot_idx) {
-        if (mgr_) mgr_->enter_epoch(slot_idx_);
+    explicit ebr_guard(int slot_idx) noexcept
+        : slot_idx_(slot_idx) {
+        ebr_global::instance().enter_epoch(slot_idx_);
     }
     
     ~ebr_guard() {
-        if (mgr_) mgr_->exit_epoch(slot_idx_);
+        ebr_global::instance().exit_epoch(slot_idx_);
     }
     
     ebr_guard(const ebr_guard&) = delete;
     ebr_guard& operator=(const ebr_guard&) = delete;
     
     ebr_guard(ebr_guard&& other) noexcept 
-        : mgr_(other.mgr_), slot_idx_(other.slot_idx_) {
-        other.mgr_ = nullptr;
+        : slot_idx_(other.slot_idx_) {
+        other.slot_idx_ = -1;
     }
     
     ebr_guard& operator=(ebr_guard&& other) noexcept {
         if (this != &other) {
-            if (mgr_) mgr_->exit_epoch(slot_idx_);
-            mgr_ = other.mgr_;
+            ebr_global::instance().exit_epoch(slot_idx_);
             slot_idx_ = other.slot_idx_;
-            other.mgr_ = nullptr;
+            other.slot_idx_ = -1;
         }
         return *this;
     }
 };
 
 /**
- * Thread-local slot manager
- * Automatically acquires/releases slots per thread
+ * Thread-local slot - acquires slot on first use, releases on thread exit
  */
-template <typename Deleter>
-class ebr_thread_context {
-    ebr_manager<Deleter>* mgr_;
+class ebr_thread_slot_holder {
     int slot_idx_;
     
 public:
-    explicit ebr_thread_context(ebr_manager<Deleter>* mgr) 
-        : mgr_(mgr), slot_idx_(mgr ? mgr->acquire_slot() : -1) {}
+    ebr_thread_slot_holder() 
+        : slot_idx_(ebr_global::instance().acquire_slot()) {}
     
-    ~ebr_thread_context() {
-        if (mgr_ && slot_idx_ >= 0) {
-            mgr_->release_slot(slot_idx_);
+    ~ebr_thread_slot_holder() {
+        if (slot_idx_ >= 0) {
+            ebr_global::instance().release_slot(slot_idx_);
         }
     }
     
-    ebr_thread_context(const ebr_thread_context&) = delete;
-    ebr_thread_context& operator=(const ebr_thread_context&) = delete;
+    ebr_thread_slot_holder(const ebr_thread_slot_holder&) = delete;
+    ebr_thread_slot_holder& operator=(const ebr_thread_slot_holder&) = delete;
     
     int slot_idx() const noexcept { return slot_idx_; }
     
-    ebr_guard<Deleter> guard() noexcept {
-        return ebr_guard<Deleter>(mgr_, slot_idx_);
+    ebr_guard guard() noexcept {
+        return ebr_guard(slot_idx_);
     }
 };
+
+/**
+ * Get thread-local EBR slot holder
+ */
+inline ebr_thread_slot_holder& get_ebr_slot() {
+    static thread_local ebr_thread_slot_holder holder;
+    return holder;
+}
 
 }  // namespace gteitelbaum
