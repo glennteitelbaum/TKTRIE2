@@ -24,35 +24,20 @@ namespace gteitelbaum {
 template <typename Key>
 struct tktrie_traits;
 
-// String keys - variable length
 template <>
 struct tktrie_traits<std::string> {
     static constexpr size_t fixed_len = 0;
-    
-    static std::string_view to_bytes(const std::string& k) noexcept {
-        return k;
-    }
-    
-    static std::string from_bytes(std::string_view bytes) {
-        return std::string(bytes);
-    }
+    static std::string_view to_bytes(const std::string& k) noexcept { return k; }
+    static std::string from_bytes(std::string_view bytes) { return std::string(bytes); }
 };
 
-// std::string_view keys - variable length
 template <>
 struct tktrie_traits<std::string_view> {
     static constexpr size_t fixed_len = 0;
-    
-    static std::string_view to_bytes(std::string_view k) noexcept {
-        return k;
-    }
-    
-    static std::string from_bytes(std::string_view bytes) {
-        return std::string(bytes);
-    }
+    static std::string_view to_bytes(std::string_view k) noexcept { return k; }
+    static std::string from_bytes(std::string_view bytes) { return std::string(bytes); }
 };
 
-// Integral keys - fixed length, sorted by value
 template <typename T>
     requires std::is_integral_v<T>
 struct tktrie_traits<T> {
@@ -113,18 +98,37 @@ private:
 
 public:
     tktrie_iterator() noexcept : parent_(nullptr), valid_(false) {}
+    
     tktrie_iterator(const trie_type* parent, std::string_view key_bytes, const T& value)
         : parent_(parent), key_bytes_(key_bytes), value_(value), valid_(true) {}
+    
     tktrie_iterator(const tktrie_iterator& other)
         : parent_(other.parent_), key_bytes_(other.key_bytes_), value_(other.value_), valid_(other.valid_) {}
+    
     tktrie_iterator& operator=(const tktrie_iterator& other) {
-        if (this != &other) { parent_ = other.parent_; key_bytes_ = other.key_bytes_; value_ = other.value_; valid_ = other.valid_; }
+        if (this != &other) {
+            parent_ = other.parent_;
+            key_bytes_ = other.key_bytes_;
+            value_ = other.value_;
+            valid_ = other.valid_;
+        }
         return *this;
     }
+    
     tktrie_iterator(tktrie_iterator&& other) noexcept
-        : parent_(other.parent_), key_bytes_(std::move(other.key_bytes_)), value_(std::move(other.value_)), valid_(other.valid_) { other.valid_ = false; }
+        : parent_(other.parent_), key_bytes_(std::move(other.key_bytes_)), 
+          value_(std::move(other.value_)), valid_(other.valid_) {
+        other.valid_ = false;
+    }
+    
     tktrie_iterator& operator=(tktrie_iterator&& other) noexcept {
-        if (this != &other) { parent_ = other.parent_; key_bytes_ = std::move(other.key_bytes_); value_ = std::move(other.value_); valid_ = other.valid_; other.valid_ = false; }
+        if (this != &other) {
+            parent_ = other.parent_;
+            key_bytes_ = std::move(other.key_bytes_);
+            value_ = std::move(other.value_);
+            valid_ = other.valid_;
+            other.valid_ = false;
+        }
         return *this;
     }
 
@@ -135,18 +139,27 @@ public:
     value_type operator*() const { return {key(), value_}; }
     bool valid() const noexcept { return valid_; }
     explicit operator bool() const noexcept { return valid_; }
+    
     bool operator==(const tktrie_iterator& other) const noexcept {
         if (!valid_ && !other.valid_) return true;
         if (valid_ != other.valid_) return false;
         return key_bytes_ == other.key_bytes_;
     }
+    
     bool operator!=(const tktrie_iterator& other) const noexcept { return !(*this == other); }
+    
     tktrie_iterator& operator++() {
         if (!valid_ || !parent_) { valid_ = false; return *this; }
         *this = parent_->next_after(key_bytes_);
         return *this;
     }
-    tktrie_iterator operator++(int) { tktrie_iterator tmp(*this); ++(*this); return tmp; }
+    
+    tktrie_iterator operator++(int) {
+        tktrie_iterator tmp(*this);
+        ++(*this);
+        return tmp;
+    }
+    
     static tktrie_iterator end_iterator() noexcept { return tktrie_iterator(); }
 };
 

@@ -9,53 +9,28 @@
 
 namespace gteitelbaum {
 
-/**
- * Insert operation results
- * 
- * THREADED writer protocol (COW + EBR + mutex):
- * 1. Traverse and build new subtree (EBR protects from freed memory)
- * 2. LOCK mutex
- * 3. Verify root_slot still has expected_ptr
- * 4. Store new_ptr to root_slot
- * 5. UNLOCK
- * 6. Retire old nodes to EBR
- */
 template <bool THREADED>
 struct insert_result {
-    slot_type_t<THREADED>* new_subtree = nullptr;   // What to install
-    slot_type_t<THREADED>* target_slot = nullptr;   // Always root_slot for THREADED
-    uint64_t expected_ptr = 0;                       // Expected value in target_slot
+    slot_type_t<THREADED>* new_subtree = nullptr;
+    slot_type_t<THREADED>* target_slot = nullptr;
+    uint64_t expected_ptr = 0;
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;
     bool already_exists = false;
     
-    insert_result() {
-        new_nodes.reserve(16);
-        old_nodes.reserve(16);
-    }
+    insert_result() { new_nodes.reserve(16); old_nodes.reserve(16); }
     
-    // Check if target_slot has been modified (another writer committed)
     bool path_has_conflict() const noexcept {
         if constexpr (THREADED) {
             if (target_slot) {
                 uint64_t current = load_slot<THREADED>(target_slot);
-                if (current != expected_ptr) {
-                    return true;
-                }
+                if (current != expected_ptr) return true;
             }
         }
         return false;
     }
 };
 
-/**
- * Insert helper functions - COW approach
- * 
- * With COW + EBR:
- * - Traverse is safe even if another writer commits (EBR protects)
- * - Build new tree optimistically
- * - Verify expected_ptr inside lock to detect concurrent modifications
- */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
@@ -65,357 +40,212 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using dataptr_t = typename base::dataptr_t;
     using result_t = insert_result<THREADED>;
 
-    /**
-     * Build insert operation
-     * For THREADED: always targets root_slot, rebuilds entire path from root
-     */
     template <typename U>
-    static result_t build_insert_path(node_builder_t& builder,
-                                       slot_type* root_slot,
-                                       slot_type* root,
-                                       std::string_view key,
-                                       U&& value,
-                                       size_t depth = 0) {
+    static result_t build_insert_path(node_builder_t& builder, slot_type* root_slot, slot_type* root,
+                                       std::string_view key, U&& value, size_t depth = 0) {
         result_t result;
-        
-        // Always target root_slot for THREADED mode
         result.target_slot = root_slot;
         result.expected_ptr = reinterpret_cast<uint64_t>(root);
         
         if (!root) {
-            // Empty trie - create new root
+            slot_type* new_node;
             if (key.empty()) {
-                result.new_subtree = builder.build_eos(std::forward<U>(value));
+                new_node = builder.build_empty();
+                node_view_t view(new_node);
+                view.eos_data()->set(std::forward<U>(value));
             } else {
-                result.new_subtree = builder.build_skip_eos(key, std::forward<U>(value));
+                new_node = builder.build_skip(key);
+                node_view_t view(new_node);
+                view.skip_eos_data()->set(std::forward<U>(value));
             }
-            result.new_nodes.push_back(result.new_subtree);
+            result.new_nodes.push_back(new_node);
+            result.new_subtree = new_node;
             return result;
         }
         
         return insert_into_node(builder, root, key, std::forward<U>(value), depth, result);
     }
 
-    /**
-     * Insert into a node
-     * For THREADED: rebuilds entire path (COW) for safe concurrent access
-     */
     template <typename U>
-    static result_t& insert_into_node(node_builder_t& builder,
-                                       slot_type* node,
-                                       std::string_view key,
-                                       U&& value,
-                                       size_t depth,
-                                       result_t& result) {
+    static result_t& insert_into_node(node_builder_t& builder, slot_type* node, std::string_view key,
+                                       U&& value, size_t depth, result_t& result) {
         node_view_t view(node);
         
-        // Handle skip sequence
         if (view.has_skip()) {
             std::string_view skip = view.skip_chars();
             size_t match = base::match_skip(skip, key);
             
             if (match < skip.size() && match < key.size()) {
-                split_skip_diverge(builder, node,
-                                   key, std::forward<U>(value), depth, match, result);
-                return result;
+                return split_skip_diverge(builder, node, key, std::forward<U>(value), depth, match, result);
             } else if (match < skip.size()) {
-                split_skip_prefix(builder, node,
-                                  key, std::forward<U>(value), depth, match, result);
-                return result;
+                return split_skip_prefix(builder, node, key, std::forward<U>(value), depth, match, result);
             } else {
                 key.remove_prefix(match);
                 depth += match;
-                
                 if (key.empty()) {
-                    if (view.has_skip_eos()) {
+                    if (view.skip_eos_data()->has_data()) {
                         result.already_exists = true;
                         return result;
                     }
-                    add_skip_eos(builder, node,
-                                 std::forward<U>(value), result);
-                    return result;
+                    return set_skip_eos(builder, node, std::forward<U>(value), result);
                 }
             }
         }
         
         if (key.empty()) {
-            if (view.has_eos()) {
+            if (view.eos_data()->has_data()) {
                 result.already_exists = true;
                 return result;
             }
-            add_eos(builder, node,
-                    std::forward<U>(value), result);
-            return result;
+            return set_eos(builder, node, std::forward<U>(value), result);
         }
         
-        // Need to follow or create child
         unsigned char c = static_cast<unsigned char>(key[0]);
         slot_type* child_slot = view.find_child(c);
         
         if (child_slot) {
-            // Child slot exists - check if it has a valid pointer
-            uint64_t child_ptr = load_slot<THREADED>(child_slot);
-            
-            // Check for null pointer (deleted child or empty FULL slot)
-            if (child_ptr == 0) {
-                // Treat as missing child
-                add_child(builder, node,
-                          c, key.substr(1), std::forward<U>(value), depth, result);
+            if (view.has_leaf()) {
+                if (key.size() == 1) {
+                    result.already_exists = true;  // Leaf key exists
+                    return result;
+                }
+                // Key too long - need to convert leaf to internal? 
+                // This shouldn't happen with FIXED_LEN correctly used
+                KTRIE_DEBUG_ASSERT(false && "Key longer than FIXED_LEN at leaf");
                 return result;
             }
             
-            // FIXED_LEN leaf optimization
-            if constexpr (FIXED_LEN > 0 && !THREADED) {
-                if (depth == FIXED_LEN - 1 && key.size() == 1) {
-                    dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
-                    if (dp->has_data()) {
-                        result.already_exists = true;
-                        return result;
-                    }
-                    set_leaf_data(builder, node,
-                                  c, std::forward<U>(value), depth, result);
-                    return result;
-                }
+            uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            if (child_ptr == 0) {
+                return add_child(builder, node, c, key.substr(1), std::forward<U>(value), depth, result);
             }
             
-            // Recurse into child
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
-            insert_into_node(builder, child,
-                             key.substr(1), std::forward<U>(value), depth + 1, result);
+            insert_into_node(builder, child, key.substr(1), std::forward<U>(value), depth + 1, result);
             
-            // If child modification succeeded, rebuild this node to point to new child
             if (!result.already_exists && result.new_subtree) {
                 return rebuild_with_new_child(builder, node, c, result);
             }
             return result;
         } else {
-            add_child(builder, node,
-                      c, key.substr(1), std::forward<U>(value), depth, result);
-            return result;
+            return add_child(builder, node, c, key.substr(1), std::forward<U>(value), depth, result);
         }
     }
-    
-    /**
-     * Rebuild current node with new child subtree (COW propagation)
-     */
-    static result_t& rebuild_with_new_child(node_builder_t& builder,
-                                             slot_type* node,
-                                             unsigned char c,
-                                             result_t& result) {
+
+    static result_t& rebuild_with_new_child(node_builder_t& builder, slot_type* node, unsigned char c, result_t& result) {
         node_view_t view(node);
-        
-        // Get current children and chars
-        auto old_children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
+        auto children = base::extract_children(view);
         
-        // For FULL nodes, old_children is already 256-element, update directly
-        if (view.has_full()) {
-            old_children[c] = reinterpret_cast<uint64_t>(result.new_subtree);
-            
-            // Rebuild as FULL (children already in correct format)
-            slot_type* new_node;
-            if (view.has_eos()) {
-                T eos_val;
-                view.eos_data()->try_read(eos_val);
-                new_node = builder.build_eos_full(std::move(eos_val), old_children);
-            } else {
-                new_node = builder.build_full(old_children);
-            }
-            
-            result.new_nodes.push_back(new_node);
-            result.old_nodes.push_back(node);
-            result.new_subtree = new_node;
-            return result;
-        }
-        
-        // For LIST/POP: find and replace the modified child
         int idx = base::find_char_index(chars, c);
         if (idx >= 0) {
-            old_children[idx] = reinterpret_cast<uint64_t>(result.new_subtree);
+            if (view.has_full()) {
+                children[c] = reinterpret_cast<uint64_t>(result.new_subtree);
+            } else {
+                children[idx] = reinterpret_cast<uint64_t>(result.new_subtree);
+            }
         }
         
-        // Rebuild with same structure (no transition needed, just updating pointer)
         auto [node_type, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, old_children);
         
+        if (node_type == 2 && !view.has_full()) {
+            // Expand to FULL
+            std::vector<uint64_t> full_children(256, 0);
+            for (size_t i = 0; i < chars.size(); ++i) full_children[chars[i]] = children[i];
+            children = std::move(full_children);
+        }
+        
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
         result.new_nodes.push_back(new_node);
         result.old_nodes.push_back(node);
         result.new_subtree = new_node;
-        
         return result;
     }
 
-    // =========================================================================
-    // Node modification operations
-    // =========================================================================
-
-    /**
-     * Split node where key diverges within skip
-     */
     template <typename U>
-    static result_t& split_skip_diverge(node_builder_t& builder,
-                                         slot_type* node,
-                                         std::string_view key,
-                                         U&& value,
-                                         size_t depth,
-                                         size_t match,
-                                         result_t& result) {
+    static result_t& split_skip_diverge(node_builder_t& builder, slot_type* node, std::string_view key,
+                                         U&& value, size_t depth, size_t match, result_t& result) {
         node_view_t view(node);
         std::string_view skip = view.skip_chars();
-        
         std::string_view common = skip.substr(0, match);
         unsigned char old_char = static_cast<unsigned char>(skip[match]);
         unsigned char new_char = static_cast<unsigned char>(key[match]);
         
-        // FIXED_LEN leaf optimization
-        if constexpr (FIXED_LEN > 0 && !THREADED) {
-            if (depth + match == FIXED_LEN - 1) {
-                T old_val;
-                if (view.has_skip_eos()) {
-                    view.skip_eos_data()->try_read(old_val);
-                }
-                
-                small_list lst(old_char, new_char);
-                std::vector<uint64_t> children = {0, 0};
-                
-                slot_type* branch;
-                if (common.empty()) {
-                    if (view.has_eos()) {
-                        T eos_val;
-                        view.eos_data()->try_read(eos_val);
-                        branch = builder.build_eos_list(std::move(eos_val), lst, children);
-                    } else {
-                        branch = builder.build_list(lst, children);
-                    }
-                } else {
-                    if (view.has_eos()) {
-                        T eos_val;
-                        view.eos_data()->try_read(eos_val);
-                        branch = builder.build_eos_skip_list(std::move(eos_val), common, lst, children);
-                    } else {
-                        branch = builder.build_skip_list(common, lst, children);
-                    }
-                }
-                
-                node_view_t branch_view(branch);
-                int old_idx = lst.offset(old_char) - 1;
-                int new_idx = lst.offset(new_char) - 1;
-                
-                dataptr_t* old_dp = reinterpret_cast<dataptr_t*>(&branch_view.child_ptrs()[old_idx]);
-                new (old_dp) dataptr_t();
-                old_dp->set(std::move(old_val));
-                
-                dataptr_t* new_dp = reinterpret_cast<dataptr_t*>(&branch_view.child_ptrs()[new_idx]);
-                new (new_dp) dataptr_t();
-                new_dp->set(std::forward<U>(value));
-                
-                result.new_nodes.push_back(branch);
-                result.new_subtree = branch;
-                result.old_nodes.push_back(node);
-                return result;
-            }
-        }
+        // Suffix node for old path
+        slot_type* old_suffix = clone_with_shorter_skip(builder, node, match + 1);
+        result.new_nodes.push_back(old_suffix);
         
-        // Build node for old suffix
-        slot_type* old_suffix_node = clone_with_shorter_skip(builder, node, match + 1);
-        result.new_nodes.push_back(old_suffix_node);
-        
-        // Build node for new key suffix
+        // New key suffix node
         std::string_view new_suffix = key.substr(match + 1);
         slot_type* new_suffix_node;
         if (new_suffix.empty()) {
-            new_suffix_node = builder.build_eos(std::forward<U>(value));
+            new_suffix_node = builder.build_empty();
+            node_view_t nv(new_suffix_node);
+            nv.eos_data()->set(std::forward<U>(value));
         } else {
-            new_suffix_node = builder.build_skip_eos(new_suffix, std::forward<U>(value));
+            new_suffix_node = builder.build_skip(new_suffix);
+            node_view_t nv(new_suffix_node);
+            nv.skip_eos_data()->set(std::forward<U>(value));
         }
         result.new_nodes.push_back(new_suffix_node);
         
-        // Build branch node
+        // Branch node
         small_list lst(old_char, new_char);
         std::vector<uint64_t> children;
         if (old_char < new_char) {
-            children = {reinterpret_cast<uint64_t>(old_suffix_node),
-                       reinterpret_cast<uint64_t>(new_suffix_node)};
+            children = {reinterpret_cast<uint64_t>(old_suffix), reinterpret_cast<uint64_t>(new_suffix_node)};
         } else {
-            children = {reinterpret_cast<uint64_t>(new_suffix_node),
-                       reinterpret_cast<uint64_t>(old_suffix_node)};
+            children = {reinterpret_cast<uint64_t>(new_suffix_node), reinterpret_cast<uint64_t>(old_suffix)};
         }
         
-        slot_type* branch;
-        if (common.empty()) {
-            if (view.has_eos()) {
-                T eos_val;
-                view.eos_data()->try_read(eos_val);
-                branch = builder.build_eos_list(std::move(eos_val), lst, children);
-            } else {
-                branch = builder.build_list(lst, children);
-            }
-        } else {
-            if (view.has_eos()) {
-                T eos_val;
-                view.eos_data()->try_read(eos_val);
-                branch = builder.build_eos_skip_list(std::move(eos_val), common, lst, children);
-            } else {
-                branch = builder.build_skip_list(common, lst, children);
-            }
-        }
+        slot_type* branch = common.empty() ? builder.build_list(lst, children) 
+                                           : builder.build_skip_list(common, lst, children);
+        
+        // Copy EOS from original
+        node_view_t bv(branch);
+        bv.eos_data()->deep_copy_from(*view.eos_data());
+        
         result.new_nodes.push_back(branch);
-        
         result.new_subtree = branch;
         result.old_nodes.push_back(node);
+        (void)depth;
         return result;
     }
 
-    /**
-     * Split node where key is prefix of skip
-     */
     template <typename U>
-    static result_t& split_skip_prefix(node_builder_t& builder,
-                                        slot_type* node,
-                                        std::string_view /*key*/,
-                                        U&& value,
-                                        size_t /*depth*/,
-                                        size_t match,
-                                        result_t& result) {
+    static result_t& split_skip_prefix(node_builder_t& builder, slot_type* node, std::string_view /*key*/,
+                                        U&& value, size_t /*depth*/, size_t match, result_t& result) {
         node_view_t view(node);
         std::string_view skip = view.skip_chars();
+        std::string_view prefix = skip.substr(0, match);
+        unsigned char c = static_cast<unsigned char>(skip[match]);
         
-        // Build node for rest of skip
         slot_type* suffix_node = clone_with_shorter_skip(builder, node, match + 1);
         result.new_nodes.push_back(suffix_node);
         
-        // Build new root with key as data point
-        std::string_view prefix = skip.substr(0, match);
-        unsigned char c = static_cast<unsigned char>(skip[match]);
         small_list lst;
         lst.add(c);
         std::vector<uint64_t> children = {reinterpret_cast<uint64_t>(suffix_node)};
         
-        slot_type* new_node;
-        if (prefix.empty()) {
-            if (view.has_eos()) {
-                result.already_exists = true;
-                builder.deallocate_node(suffix_node);
-                result.new_nodes.pop_back();
-                return result;
-            }
-            new_node = builder.build_eos_list(std::forward<U>(value), lst, children);
-        } else {
-            new_node = builder.build_skip_eos_list(prefix, std::forward<U>(value), lst, children);
-        }
-        result.new_nodes.push_back(new_node);
+        slot_type* new_node = prefix.empty() ? builder.build_list(lst, children)
+                                             : builder.build_skip_list(prefix, lst, children);
         
+        node_view_t nv(new_node);
+        if (prefix.empty()) {
+            nv.eos_data()->set(std::forward<U>(value));
+        } else {
+            nv.skip_eos_data()->set(std::forward<U>(value));
+        }
+        // Copy original EOS
+        if (!prefix.empty()) nv.eos_data()->deep_copy_from(*view.eos_data());
+        
+        result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.old_nodes.push_back(node);
         return result;
     }
 
-    /**
-     * Clone node with shorter skip sequence
-     */
-    static slot_type* clone_with_shorter_skip(node_builder_t& builder,
-                                               slot_type* node,
-                                               size_t skip_prefix_len) {
+    static slot_type* clone_with_shorter_skip(node_builder_t& builder, slot_type* node, size_t skip_prefix_len) {
         node_view_t view(node);
         std::string_view skip = view.skip_chars();
         std::string_view new_skip = skip.substr(skip_prefix_len);
@@ -423,132 +253,54 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        bool has_eos = view.has_skip_eos();
-        T eos_val;
-        if (has_eos) {
-            view.skip_eos_data()->try_read(eos_val);
-        }
-        
-        bool has_new_skip = !new_skip.empty();
-        bool has_children = view.has_full() ? (view.live_child_count() > 0) : !children.empty();
-        
-        if (!has_children) {
-            switch (mk_switch(has_new_skip, has_eos)) {
-                case mk_switch(true, true):
-                    return builder.build_skip_eos(new_skip, std::move(eos_val));
-                case mk_switch(true, false):
-                case mk_switch(false, false):
-                    return builder.build_empty_root();
-                case mk_switch(false, true):
-                    return builder.build_eos(std::move(eos_val));
+        slot_type* new_node;
+        if (children.empty()) {
+            new_node = new_skip.empty() ? builder.build_empty() : builder.build_skip(new_skip);
+        } else {
+            auto [node_type, lst, bmp] = base::build_child_structure(chars);
+            if (node_type == 2) {
+                std::vector<uint64_t> full_children(256, 0);
+                for (size_t i = 0; i < chars.size(); ++i) full_children[chars[i]] = children[i];
+                new_node = new_skip.empty() ? builder.build_full(full_children)
+                                            : builder.build_skip_full(new_skip, full_children);
+            } else if (node_type == 1) {
+                new_node = new_skip.empty() ? builder.build_pop(bmp, children)
+                                            : builder.build_skip_pop(new_skip, bmp, children);
+            } else {
+                new_node = new_skip.empty() ? builder.build_list(lst, children)
+                                            : builder.build_skip_list(new_skip, lst, children);
             }
-            __builtin_unreachable();
         }
         
+        node_view_t nv(new_node);
+        // Move skip_eos to eos if new_skip empty, else to skip_eos
+        if (view.skip_eos_data()->has_data()) {
+            if (new_skip.empty()) {
+                nv.eos_data()->deep_copy_from(*view.skip_eos_data());
+            } else {
+                nv.skip_eos_data()->deep_copy_from(*view.skip_eos_data());
+            }
+        }
+        
+        return new_node;
+    }
+
+    template <typename U>
+    static result_t& set_eos(node_builder_t& builder, slot_type* node, U&& value, result_t& result) {
+        node_view_t view(node);
+        auto children = base::extract_children(view);
+        auto chars = base::get_child_chars(view);
         auto [node_type, lst, bmp] = base::build_child_structure(chars);
         
-        // FULL nodes: children is already 256-element
-        if (node_type == 2) {
-            return has_eos ? builder.build_eos_full(std::move(eos_val), children)
-                           : builder.build_full(children);
+        if (node_type == 2 && !view.has_full()) {
+            std::vector<uint64_t> full_children(256, 0);
+            for (size_t i = 0; i < chars.size(); ++i) full_children[chars[i]] = children[i];
+            children = std::move(full_children);
         }
         
-        bool is_list = (node_type == 0);
-        switch (mk_switch(has_new_skip, has_eos, is_list)) {
-            case mk_switch(true, true, true):
-                return builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
-            case mk_switch(true, true, false):
-                return builder.build_skip_eos_pop(new_skip, std::move(eos_val), bmp, children);
-            case mk_switch(true, false, true):
-                return builder.build_skip_list(new_skip, lst, children);
-            case mk_switch(true, false, false):
-                return builder.build_skip_pop(new_skip, bmp, children);
-            case mk_switch(false, true, true):
-                return builder.build_eos_list(std::move(eos_val), lst, children);
-            case mk_switch(false, true, false):
-                return builder.build_eos_pop(std::move(eos_val), bmp, children);
-            case mk_switch(false, false, true):
-                return builder.build_list(lst, children);
-            case mk_switch(false, false, false):
-                return builder.build_pop(bmp, children);
-        }
-        __builtin_unreachable();
-    }
-
-    /**
-     * Add EOS to existing node
-     */
-    template <typename U>
-    static result_t& add_eos(node_builder_t& builder,
-                              slot_type* node,
-                              U&& value,
-                              result_t& result) {
-        node_view_t view(node);
-        uint64_t flags = view.flags();
-        constexpr uint64_t MASK = FLAG_SKIP | FLAG_SKIP_EOS;
-        
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-        
-        T skip_eos_val;
-        if (flags & FLAG_SKIP_EOS) view.skip_eos_data()->try_read(skip_eos_val);
-        std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
-        
-        slot_type* new_node;
-        
-        bool has_children = view.has_full() ? (view.live_child_count() > 0) : !children.empty();
-        
-        if (!has_children) {
-            switch (mk_flag_switch(flags, MASK)) {
-                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
-                    new_node = builder.build_eos_skip_eos(std::forward<U>(value), skip, std::move(skip_eos_val));
-                    break;
-                case mk_flag_switch(FLAG_SKIP, MASK):
-                    new_node = builder.build_eos_skip(std::forward<U>(value), skip);
-                    break;
-                case mk_flag_switch(0, MASK):
-                    new_node = builder.build_eos(std::forward<U>(value));
-                    break;
-                case mk_flag_switch(FLAG_SKIP_EOS, MASK):
-                default:
-                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
-                    __builtin_unreachable();
-            }
-        } else {
-            auto [node_type, lst, bmp] = base::build_child_structure(chars);
-            
-            // FULL nodes: children is already 256-element
-            if (node_type == 2) {
-                new_node = builder.build_eos_full(std::forward<U>(value), children);
-            } else {
-                bool is_list = (node_type == 0);
-                switch (mk_flag_switch(flags, MASK, is_list)) {
-                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
-                        new_node = builder.build_eos_skip_eos_list(std::forward<U>(value), skip, std::move(skip_eos_val), lst, children);
-                        break;
-                    case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
-                        new_node = builder.build_eos_skip_eos_pop(std::forward<U>(value), skip, std::move(skip_eos_val), bmp, children);
-                        break;
-                    case mk_flag_switch(FLAG_SKIP, MASK, true):
-                        new_node = builder.build_eos_skip_list(std::forward<U>(value), skip, lst, children);
-                        break;
-                    case mk_flag_switch(FLAG_SKIP, MASK, false):
-                        new_node = builder.build_eos_skip_pop(std::forward<U>(value), skip, bmp, children);
-                        break;
-                    case mk_flag_switch(0, MASK, true):
-                        new_node = builder.build_eos_list(std::forward<U>(value), lst, children);
-                        break;
-                    case mk_flag_switch(0, MASK, false):
-                        new_node = builder.build_eos_pop(std::forward<U>(value), bmp, children);
-                        break;
-                    case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
-                    case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
-                    default:
-                        KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
-                        __builtin_unreachable();
-                }
-            }
-        }
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
+        node_view_t nv(new_node);
+        nv.eos_data()->set(std::forward<U>(value));
         
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
@@ -556,69 +308,22 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         return result;
     }
 
-    /**
-     * Add skip_eos to existing node
-     */
     template <typename U>
-    static result_t& add_skip_eos(node_builder_t& builder,
-                                   slot_type* node,
-                                   U&& value,
-                                   result_t& result) {
+    static result_t& set_skip_eos(node_builder_t& builder, slot_type* node, U&& value, result_t& result) {
         node_view_t view(node);
-        uint64_t flags = view.flags();
-        constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP;
-        std::string_view skip = view.skip_chars();
-        
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
+        auto [node_type, lst, bmp] = base::build_child_structure(chars);
         
-        T eos_val;
-        if (flags & FLAG_EOS) view.eos_data()->try_read(eos_val);
-        
-        slot_type* new_node;
-        
-        bool has_children = view.has_full() ? (view.live_child_count() > 0) : !children.empty();
-        
-        if (!has_children) {
-            switch (mk_flag_switch(flags, MASK)) {
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
-                    new_node = builder.build_eos_skip_eos(std::move(eos_val), skip, std::forward<U>(value));
-                    break;
-                case mk_flag_switch(FLAG_SKIP, MASK):
-                    new_node = builder.build_skip_eos(skip, std::forward<U>(value));
-                    break;
-                case mk_flag_switch(FLAG_EOS, MASK):
-                case mk_flag_switch(0, MASK):
-                default:
-                    KTRIE_DEBUG_ASSERT(false && "add_skip_eos called on node without SKIP");
-                    __builtin_unreachable();
-            }
-        } else {
-            auto [node_type, lst, bmp] = base::build_child_structure(chars);
-            // FULL nodes shouldn't have SKIP (not currently supported)
-            bool is_list = (node_type == 0);
-            switch (mk_flag_switch(flags, MASK, is_list)) {
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
-                    new_node = builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::forward<U>(value), lst, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
-                    new_node = builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::forward<U>(value), bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_SKIP, MASK, true):
-                    new_node = builder.build_skip_eos_list(skip, std::forward<U>(value), lst, children);
-                    break;
-                case mk_flag_switch(FLAG_SKIP, MASK, false):
-                    new_node = builder.build_skip_eos_pop(skip, std::forward<U>(value), bmp, children);
-                    break;
-                case mk_flag_switch(FLAG_EOS, MASK, true):
-                case mk_flag_switch(FLAG_EOS, MASK, false):
-                case mk_flag_switch(0, MASK, true):
-                case mk_flag_switch(0, MASK, false):
-                default:
-                    KTRIE_DEBUG_ASSERT(false && "add_skip_eos called on node without SKIP");
-                    __builtin_unreachable();
-            }
+        if (node_type == 2 && !view.has_full()) {
+            std::vector<uint64_t> full_children(256, 0);
+            for (size_t i = 0; i < chars.size(); ++i) full_children[chars[i]] = children[i];
+            children = std::move(full_children);
         }
+        
+        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
+        node_view_t nv(new_node);
+        nv.skip_eos_data()->set(std::forward<U>(value));
         
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
@@ -626,147 +331,108 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         return result;
     }
 
-    /**
-     * Add new child to existing node
-     */
     template <typename U>
-    static result_t& add_child(node_builder_t& builder,
-                                slot_type* node,
-                                unsigned char c,
-                                std::string_view rest,
-                                U&& value,
-                                size_t depth,
-                                result_t& result) {
+    static result_t& add_child(node_builder_t& builder, slot_type* node, unsigned char c,
+                                std::string_view rest, U&& value, size_t depth, result_t& result) {
         node_view_t view(node);
         auto old_children = base::extract_children(view);
         auto old_chars = base::get_child_chars(view);
         
-        // Add new char to chars list
         std::vector<unsigned char> new_chars = old_chars;
         new_chars.push_back(c);
-        
-        // Determine new structure
         auto [node_type, lst, bmp] = base::build_child_structure(new_chars);
         
-        // FIXED_LEN leaf optimization
-        if constexpr (FIXED_LEN > 0 && !THREADED) {
-            if (depth == FIXED_LEN - 1 && rest.empty()) {
-                // This is a leaf level - children are dataptr slots, not node pointers
-                std::vector<uint64_t> new_children;
-                
-                if (node_type == 2) {
-                    // Expand to FULL (256 slots)
-                    new_children.resize(256, 0);
-                    // Copy old children to their correct positions
-                    if (view.has_full()) {
-                        for (int i = 0; i < 256; ++i) {
-                            new_children[i] = old_children[i];
-                        }
-                    } else {
-                        for (size_t i = 0; i < old_chars.size(); ++i) {
-                            new_children[old_chars[i]] = old_children[i];
-                        }
-                    }
-                } else if (node_type == 1) {
-                    // POP - insert at bitmap position
-                    int pos = bmp.index_of(c);
-                    new_children = old_children;
-                    new_children.insert(new_children.begin() + pos, 0);
-                } else {
-                    // LIST - add at end
-                    new_children = old_children;
-                    new_children.push_back(0);
+        // Check if this should be a LEAF node (FIXED_LEN and at leaf depth)
+        bool make_leaf = (FIXED_LEN > 0) && can_embed_leaf_v<T> && 
+                         (depth + (view.has_skip() ? view.skip_length() : 0) == FIXED_LEN - 1) && rest.empty();
+        
+        if (make_leaf) {
+            // Build or expand LEAF node
+            std::vector<T> values;
+            if (view.has_leaf()) {
+                values = base::extract_leaf_values(view);
+            } else {
+                // Converting from non-leaf - shouldn't have children with data
+                values.resize(old_chars.size());
+            }
+            
+            if (node_type == 2) {
+                // LEAF|FULL
+                std::vector<T> full_values(256);
+                popcount_bitmap valid_bmp;
+                for (size_t i = 0; i < old_chars.size(); ++i) {
+                    full_values[old_chars[i]] = values[i];
+                    valid_bmp.set(old_chars[i]);
                 }
+                full_values[c] = std::forward<U>(value);
+                valid_bmp.set(c);
                 
-                slot_type* new_parent = base::rebuild_node(builder, view, node_type, lst, bmp, new_children);
+                slot_type* new_node = view.has_skip() 
+                    ? builder.build_skip_leaf_full(view.skip_chars(), valid_bmp, full_values)
+                    : builder.build_leaf_full(valid_bmp, full_values);
+                node_view_t nv(new_node);
+                nv.eos_data()->deep_copy_from(*view.eos_data());
+                if (view.has_skip()) nv.skip_eos_data()->deep_copy_from(*view.skip_eos_data());
                 
-                node_view_t new_view(new_parent);
-                slot_type* new_child_slot = new_view.find_child(c);
-                dataptr_t* dp = reinterpret_cast<dataptr_t*>(new_child_slot);
-                new (dp) dataptr_t();
-                dp->set(std::forward<U>(value));
+                result.new_nodes.push_back(new_node);
+                result.new_subtree = new_node;
+                result.old_nodes.push_back(node);
+                return result;
+            } else {
+                values.push_back(std::forward<U>(value));
+                slot_type* new_node;
+                if (node_type == 1) {
+                    new_node = view.has_skip() ? builder.build_skip_leaf_pop(view.skip_chars(), bmp, values)
+                                               : builder.build_leaf_pop(bmp, values);
+                } else {
+                    new_node = view.has_skip() ? builder.build_skip_leaf_list(view.skip_chars(), lst, values)
+                                               : builder.build_leaf_list(lst, values);
+                }
+                node_view_t nv(new_node);
+                nv.eos_data()->deep_copy_from(*view.eos_data());
+                if (view.has_skip()) nv.skip_eos_data()->deep_copy_from(*view.skip_eos_data());
                 
-                result.new_nodes.push_back(new_parent);
-                result.new_subtree = new_parent;
+                result.new_nodes.push_back(new_node);
+                result.new_subtree = new_node;
                 result.old_nodes.push_back(node);
                 return result;
             }
         }
         
-        // Build new child node
+        // Non-leaf: build child node
         slot_type* child_node;
         if (rest.empty()) {
-            child_node = builder.build_eos(std::forward<U>(value));
+            child_node = builder.build_empty();
+            node_view_t cv(child_node);
+            cv.eos_data()->set(std::forward<U>(value));
         } else {
-            child_node = builder.build_skip_eos(rest, std::forward<U>(value));
+            child_node = builder.build_skip(rest);
+            node_view_t cv(child_node);
+            cv.skip_eos_data()->set(std::forward<U>(value));
         }
         result.new_nodes.push_back(child_node);
         
-        // Build new children vector
         std::vector<uint64_t> new_children;
-        
         if (node_type == 2) {
-            // FULL node - 256 direct slots indexed by character
             new_children.resize(256, 0);
-            
-            // Copy old children to their correct positions
             if (view.has_full()) {
-                // Source is already FULL - direct copy
-                for (int i = 0; i < 256; ++i) {
-                    new_children[i] = old_children[i];
-                }
+                for (int i = 0; i < 256; ++i) new_children[i] = old_children[i];
             } else {
-                // Source is LIST or POP - map to character positions
-                for (size_t i = 0; i < old_chars.size(); ++i) {
-                    new_children[old_chars[i]] = old_children[i];
-                }
+                for (size_t i = 0; i < old_chars.size(); ++i) new_children[old_chars[i]] = old_children[i];
             }
-            // Add new child at its character position
             new_children[c] = reinterpret_cast<uint64_t>(child_node);
         } else if (node_type == 1) {
-            // POP node - insert at bitmap position
             int pos = bmp.index_of(c);
             new_children = old_children;
             new_children.insert(new_children.begin() + pos, reinterpret_cast<uint64_t>(child_node));
         } else {
-            // LIST node - add at end (unsorted)
             new_children = old_children;
             new_children.push_back(reinterpret_cast<uint64_t>(child_node));
         }
         
         slot_type* new_parent = base::rebuild_node(builder, view, node_type, lst, bmp, new_children);
         result.new_nodes.push_back(new_parent);
-        
         result.new_subtree = new_parent;
-        result.old_nodes.push_back(node);
-        return result;
-    }
-
-    /**
-     * Set data in leaf slot (FIXED_LEN non-threaded only)
-     */
-    template <typename U>
-    static result_t& set_leaf_data(node_builder_t& builder,
-                                    slot_type* node,
-                                    unsigned char c,
-                                    U&& value,
-                                    size_t /*depth*/,
-                                    result_t& result) {
-        node_view_t view(node);
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-        
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
-        
-        node_view_t new_view(new_node);
-        slot_type* child_slot = new_view.find_child(c);
-        dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
-        new (dp) dataptr_t();
-        dp->set(std::forward<U>(value));
-        
-        result.new_nodes.push_back(new_node);
-        result.new_subtree = new_node;
         result.old_nodes.push_back(node);
         return result;
     }
