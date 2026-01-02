@@ -527,130 +527,96 @@ private:
                                                const std::string& key_bytes,
                                                U&& value) {
         std::vector<slot_type*> unneeded;
-        std::vector<slot_type*> to_free;
         unneeded.reserve(16);
-        to_free.reserve(16);
-        bool already_exists_exit = false;
 
-        // Step 1: OUTSIDE LOCK - collect pathA and build optimistically
-        auto resultA = insert_t::build_insert_path(builder_, get_root(), key_bytes,
-                                                    std::forward<U>(value));
-        
-        if (resultA.hit_write || resultA.hit_read) {
-            // Hit control bits, deallocate and restart
-            for (auto* n : resultA.new_nodes) builder_.deallocate_node(n);
-            cpu_pause();
-            return insert_threaded(key, key_bytes, std::forward<U>(value));
-        }
-
-        {
-            std::lock_guard<mutex_type> lock(write_mutex_);
-
-        retry_inside_lock:
-            // Step 3: Recollect pathB
-            auto resultB = insert_t::build_insert_path(builder_, get_root(), key_bytes,
+        while (true) {
+            // Step 1: OUTSIDE LOCK - build optimistically
+            auto resultA = insert_t::build_insert_path(builder_, get_root(), key_bytes,
                                                         std::forward<U>(value));
-
-            // Step 4: Compare paths
-            bool paths_match = compare_paths(resultA.path, resultB.path);
-
-            // Step 5: If different, add to unneeded and rebuild
-            if (!paths_match || resultA.expected_root != resultB.expected_root) {
-                for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                resultA = std::move(resultB);
-                // Now resultA has the freshly collected path
-                
-                if (resultA.hit_write || resultA.hit_read) {
-                    // Hit control bits during recollection, retry
-                    for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                    resultA = insert_t::build_insert_path(builder_, get_root(), key_bytes,
-                                                          std::forward<U>(value));
-                }
-                goto retry_inside_lock;
+            
+            if (resultA.hit_write || resultA.hit_read) {
+                for (auto* n : resultA.new_nodes) builder_.deallocate_node(n);
+                cpu_pause();
+                continue;
             }
 
-            // At this point resultA == resultB
             if (resultA.already_exists) {
-                for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                already_exists_exit = true;
-                // Exit lock scope, deallocate outside
-            } else {
-                // Step 6: Handle data pointer at leaf
-                // The leaf data pointer is in the NEW node we created, not old tree
-                // Old tree's data (if any) is in old_nodes - handled by deletion
+                for (auto* n : resultA.new_nodes) builder_.deallocate_node(n);
+                return {find(key), false};
+            }
 
-                // Step 7: Check READ_BIT on path child slots (would indicate another writer)
-                for (const auto& step : resultA.path) {
-                    if (step.child_slot) {
-                        uint64_t current = load_slot<THREADED>(step.child_slot);
-                        if (current & READ_BIT) {
-                            // Another writer is deleting - rebuild
-                            for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                            resultA = insert_t::build_insert_path(builder_, get_root(), key_bytes,
-                                                                  std::forward<U>(value));
-                            goto retry_inside_lock;
+            bool need_retry = false;
+            {
+                std::lock_guard<mutex_type> lock(write_mutex_);
+
+                // Step 2: INSIDE LOCK - verify path still valid (NO allocations)
+                // Check that root hasn't changed
+                if (get_root() != resultA.expected_root) {
+                    for (auto* n : resultA.new_nodes) unneeded.push_back(n);
+                    need_retry = true;
+                } else {
+                    // Verify each path step still has same slot value
+                    for (const auto& step : resultA.path) {
+                        if (step.child_slot) {
+                            uint64_t current = load_slot<THREADED>(step.child_slot);
+                            if (current != step.expected_ptr || (current & (WRITE_BIT | READ_BIT))) {
+                                for (auto* n : resultA.new_nodes) unneeded.push_back(n);
+                                need_retry = true;
+                                break;
+                            }
                         }
                     }
                 }
 
-                // Step 8: Set WRITE_BIT on all old path child slots (leaf to root order)
-                // This blocks readers from traversing into old subtree
-                for (auto it = resultA.path.rbegin(); it != resultA.path.rend(); ++it) {
-                    if (it->child_slot) {
-                        fetch_or_slot<THREADED>(it->child_slot, WRITE_BIT);
+                if (!need_retry) {
+                    // Step 3: Commit - set bits and swap pointers
+                    // Set WRITE_BIT on path slots (leaf to root)
+                    for (auto it = resultA.path.rbegin(); it != resultA.path.rend(); ++it) {
+                        if (it->child_slot) {
+                            fetch_or_slot<THREADED>(it->child_slot, WRITE_BIT);
+                        }
                     }
-                }
 
-                // Step 9: Set READ_BIT on old child slots (guards against other writers)
-                for (const auto& step : resultA.path) {
-                    if (step.child_slot) {
-                        fetch_or_slot<THREADED>(step.child_slot, READ_BIT);
+                    // Set READ_BIT on old slots
+                    for (const auto& step : resultA.path) {
+                        if (step.child_slot) {
+                            fetch_or_slot<THREADED>(step.child_slot, READ_BIT);
+                        }
                     }
+
+                    // Swap root
+                    if (resultA.new_root) {
+                        set_root(resultA.new_root);
+                    }
+
+                    elem_count_.fetch_add(1, std::memory_order_relaxed);
                 }
+            }  // UNLOCK
 
-                // Step 10: Swap root
-                if (resultA.new_root) {
-                    set_root(resultA.new_root);
-                }
-
-                elem_count_.fetch_add(1, std::memory_order_relaxed);
-                to_free = std::move(resultA.old_nodes);
-            }
-
-        }  // Step 11: UNLOCK
-
-        // Step 12: Delete unneeded (outside lock - safe, never visible)
-        for (auto* n : unneeded) {
-            builder_.deallocate_node(n);
-        }
-
-        // Handle early exit for already_exists case
-        if (already_exists_exit) {
-            return {find(key), false};
-        }
-
-        // Step 13: Delete old nodes (outside lock)
-        // WRITE_BIT on data pointer blocks readers
-        // READ_BIT on child slots blocks other writers from double-delete
-        for (auto* n : to_free) {
-            if (n) {
-                node_view_t view(n);
-                // Wait for any readers finishing data copy
-                if (view.has_eos()) view.eos_data()->begin_write();
-                if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
+            // Delete unneeded (never visible, safe)
+            for (auto* n : unneeded) {
                 builder_.deallocate_node(n);
             }
-        }
+            unneeded.clear();
 
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
+            if (need_retry) {
+                cpu_pause();
+                continue;
+            }
 
-        T val;
-        if constexpr (std::is_rvalue_reference_v<U&&>) {
-            val = std::forward<U>(value);
-        } else {
-            val = value;
+            // TODO: old_nodes need READ_BIT protection - leak for now to measure speed
+            // for (auto* n : resultA.old_nodes) { ... }
+
+            validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
+
+            T val;
+            if constexpr (std::is_rvalue_reference_v<U&&>) {
+                val = std::forward<U>(value);
+            } else {
+                val = value;
+            }
+            return {iterator(this, key_bytes, val), true};
         }
-        return {iterator(this, key_bytes, val), true};
     }
 
     // =========================================================================
@@ -699,104 +665,90 @@ private:
 
     bool erase_threaded(const std::string& key_bytes) {
         std::vector<slot_type*> unneeded;
-        std::vector<slot_type*> to_free;
         unneeded.reserve(16);
-        to_free.reserve(16);
-        bool not_found_exit = false;
 
-        // Step 1: OUTSIDE LOCK - collect pathA and build optimistically
-        auto resultA = remove_t::build_remove_path(builder_, get_root(), key_bytes);
-        
-        if (resultA.hit_write || resultA.hit_read) {
-            for (auto* n : resultA.new_nodes) builder_.deallocate_node(n);
-            cpu_pause();
-            return erase_threaded(key_bytes);
-        }
-
-        {
-            std::lock_guard<mutex_type> lock(write_mutex_);
-
-        retry_inside_lock:
-            auto resultB = remove_t::build_remove_path(builder_, get_root(), key_bytes);
-
-            bool paths_match = compare_paths(resultA.path, resultB.path);
-
-            if (!paths_match || resultA.expected_root != resultB.expected_root) {
-                for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                resultA = std::move(resultB);
-                
-                if (resultA.hit_write || resultA.hit_read) {
-                    for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                    resultA = remove_t::build_remove_path(builder_, get_root(), key_bytes);
-                }
-                goto retry_inside_lock;
+        while (true) {
+            // Step 1: OUTSIDE LOCK - build optimistically
+            auto resultA = remove_t::build_remove_path(builder_, get_root(), key_bytes);
+            
+            if (resultA.hit_write || resultA.hit_read) {
+                for (auto* n : resultA.new_nodes) builder_.deallocate_node(n);
+                cpu_pause();
+                continue;
             }
 
             if (!resultA.found) {
-                for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                not_found_exit = true;
-                // Exit lock scope, deallocate outside
-            } else {
-                // Check READ_BIT on path
-                for (const auto& step : resultA.path) {
-                    if (step.child_slot) {
-                        uint64_t current = load_slot<THREADED>(step.child_slot);
-                        if (current & READ_BIT) {
-                            for (auto* n : resultA.new_nodes) unneeded.push_back(n);
-                            resultA = remove_t::build_remove_path(builder_, get_root(), key_bytes);
-                            goto retry_inside_lock;
+                for (auto* n : resultA.new_nodes) builder_.deallocate_node(n);
+                return false;
+            }
+
+            bool need_retry = false;
+            {
+                std::lock_guard<mutex_type> lock(write_mutex_);
+
+                // Step 2: INSIDE LOCK - verify path still valid (NO allocations)
+                if (get_root() != resultA.expected_root) {
+                    for (auto* n : resultA.new_nodes) unneeded.push_back(n);
+                    need_retry = true;
+                } else {
+                    // Verify each path step still has same slot value
+                    for (const auto& step : resultA.path) {
+                        if (step.child_slot) {
+                            uint64_t current = load_slot<THREADED>(step.child_slot);
+                            if (current != step.expected_ptr || (current & (WRITE_BIT | READ_BIT))) {
+                                for (auto* n : resultA.new_nodes) unneeded.push_back(n);
+                                need_retry = true;
+                                break;
+                            }
                         }
                     }
                 }
 
-                // Set WRITE_BIT leaf to root
-                for (auto it = resultA.path.rbegin(); it != resultA.path.rend(); ++it) {
-                    if (it->child_slot) {
-                        fetch_or_slot<THREADED>(it->child_slot, WRITE_BIT);
+                if (!need_retry) {
+                    // Step 3: Commit - set bits and swap pointers
+                    // Set WRITE_BIT on path slots (leaf to root)
+                    for (auto it = resultA.path.rbegin(); it != resultA.path.rend(); ++it) {
+                        if (it->child_slot) {
+                            fetch_or_slot<THREADED>(it->child_slot, WRITE_BIT);
+                        }
                     }
-                }
 
-                // Set READ_BIT on old slots
-                for (const auto& step : resultA.path) {
-                    if (step.child_slot) {
-                        fetch_or_slot<THREADED>(step.child_slot, READ_BIT);
+                    // Set READ_BIT on old slots
+                    for (const auto& step : resultA.path) {
+                        if (step.child_slot) {
+                            fetch_or_slot<THREADED>(step.child_slot, READ_BIT);
+                        }
                     }
+
+                    // Swap root
+                    if (resultA.root_deleted) {
+                        set_root(nullptr);
+                    } else if (resultA.new_root) {
+                        set_root(resultA.new_root);
+                    }
+
+                    elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 }
+            }  // UNLOCK
 
-                // Swap root
-                if (resultA.root_deleted) {
-                    set_root(nullptr);
-                } else if (resultA.new_root) {
-                    set_root(resultA.new_root);
-                }
-
-                elem_count_.fetch_sub(1, std::memory_order_relaxed);
-                to_free = std::move(resultA.old_nodes);
-            }
-
-        }  // UNLOCK
-
-        for (auto* n : unneeded) {
-            builder_.deallocate_node(n);
-        }
-
-        // Handle early exit for not found case
-        if (not_found_exit) {
-            return false;
-        }
-
-        for (auto* n : to_free) {
-            if (n) {
-                node_view_t view(n);
-                if (view.has_eos()) view.eos_data()->begin_write();
-                if (view.has_skip_eos()) view.skip_eos_data()->begin_write();
+            // Delete unneeded (never visible, safe)
+            for (auto* n : unneeded) {
                 builder_.deallocate_node(n);
             }
+            unneeded.clear();
+
+            if (need_retry) {
+                cpu_pause();
+                continue;
+            }
+
+            // TODO: old_nodes need READ_BIT protection - leak for now to measure speed
+            // for (auto* n : resultA.old_nodes) { ... }
+
+            validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
+
+            return true;
         }
-
-        validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
-
-        return true;
     }
 
     // =========================================================================
