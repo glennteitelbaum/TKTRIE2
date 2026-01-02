@@ -356,6 +356,11 @@ public:
                 if (!root) return end();
                 
                 std::string key;
+                if constexpr (fixed_len > 0) {
+                    key.reserve(fixed_len);
+                } else {
+                    key.reserve(15);
+                }
                 bool hit_write = false;
                 slot_type* data_slot = nav_t::find_first_leaf(root, key, hit_write);
                 if (hit_write) {
@@ -377,6 +382,11 @@ public:
             if (!root) return end();
             
             std::string key;
+            if constexpr (fixed_len > 0) {
+                key.reserve(fixed_len);
+            } else {
+                key.reserve(15);
+            }
             bool hit_write = false;
             slot_type* data_slot = nav_t::find_first_leaf(root, key, hit_write);
             if (!data_slot) return end();
