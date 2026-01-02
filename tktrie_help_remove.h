@@ -149,6 +149,7 @@ private:
         node_view_t view(node);
         result.found = true;
         uint64_t flags = view.flags();
+        constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS;
         
         bool has_children = view.child_count() > 0;
         
@@ -182,20 +183,20 @@ private:
         
         if (has_children) {
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
-            switch (mk_switch(flags, is_list)) {
-                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, true):
+            switch (mk_flag_switch(flags, MASK, is_list)) {
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                     new_node = builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
                     break;
-                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                     new_node = builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
                     break;
-                case mk_switch(FLAG_EOS | FLAG_SKIP, true):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
                     new_node = builder.build_skip_list(skip, lst, children);
                     break;
-                case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
                     new_node = builder.build_skip_pop(skip, bmp, children);
                     break;
-                case mk_switch(FLAG_EOS, true):
+                case mk_flag_switch(FLAG_EOS, MASK, true):
                     new_node = builder.build_list(lst, children);
                     break;
                 default:
@@ -225,6 +226,7 @@ private:
         node_view_t view(node);
         result.found = true;
         uint64_t flags = view.flags();
+        constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS;
         
         bool has_children = view.child_count() > 0;
         std::string_view skip = view.skip_chars();
@@ -247,15 +249,15 @@ private:
         
         if (has_children) {
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
-            switch (mk_switch(flags, is_list)) {
-                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, true):
+            switch (mk_flag_switch(flags, MASK, is_list)) {
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                     // Keep the skip - children hang off the end of it
                     new_node = builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
                     break;
-                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                     new_node = builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
                     break;
-                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, true):
+                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                     new_node = builder.build_skip_list(skip, lst, children);
                     break;
                 default:
@@ -376,38 +378,57 @@ private:
         new_skip.push_back(static_cast<char>(c));
         
         node_view_t child_view(child);
+        uint64_t child_flags = child_view.flags();
+        constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP_EOS;
+        
         if (child_view.has_skip()) new_skip.append(child_view.skip_chars());
         
         auto children = base::extract_children(child_view);
         auto chars = base::get_child_chars(child_view);
-        auto [is_list, lst, bmp] = base::build_child_structure(chars);
         
-        bool child_has_eos = child_view.has_eos(), child_has_skip_eos = child_view.has_skip_eos();
         T eos_val, skip_eos_val;
-        if (child_has_eos) child_view.eos_data()->try_read(eos_val);
-        if (child_has_skip_eos) child_view.skip_eos_data()->try_read(skip_eos_val);
+        if (child_flags & FLAG_EOS) child_view.eos_data()->try_read(eos_val);
+        if (child_flags & FLAG_SKIP_EOS) child_view.skip_eos_data()->try_read(skip_eos_val);
         
         slot_type* collapsed;
         if (children.empty()) {
-            if (child_has_eos && child_has_skip_eos) {
-                collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
-            } else if (child_has_eos) {
-                collapsed = builder.build_skip_eos(new_skip, std::move(eos_val));
-            } else if (child_has_skip_eos) {
-                collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
-            } else {
-                return;  // Can't collapse empty node
+            switch (mk_flag_switch(child_flags, MASK)) {
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
+                    collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
+                    break;
+                case mk_flag_switch(FLAG_EOS, MASK):
+                    collapsed = builder.build_skip_eos(new_skip, std::move(eos_val));
+                    break;
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK):
+                    collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
+                    break;
+                default:
+                    return;  // Can't collapse empty node
             }
         } else {
-            if (child_has_eos && child_has_skip_eos) return;  // Too complex to collapse
-            else if (child_has_eos) {
-                collapsed = builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
-            } else if (child_has_skip_eos) {
-                collapsed = is_list ? builder.build_skip_eos_list(new_skip, std::move(skip_eos_val), lst, children)
-                                    : builder.build_skip_eos_pop(new_skip, std::move(skip_eos_val), bmp, children);
-            } else {
-                collapsed = is_list ? builder.build_skip_list(new_skip, lst, children) 
-                                    : builder.build_skip_pop(new_skip, bmp, children);
+            auto [is_list, lst, bmp] = base::build_child_structure(chars);
+            switch (mk_flag_switch(child_flags, MASK, is_list)) {
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
+                    return;  // Too complex to collapse
+                case mk_flag_switch(FLAG_EOS, MASK, true):
+                    collapsed = builder.build_skip_eos_list(new_skip, std::move(eos_val), lst, children);
+                    break;
+                case mk_flag_switch(FLAG_EOS, MASK, false):
+                    collapsed = builder.build_skip_eos_pop(new_skip, std::move(eos_val), bmp, children);
+                    break;
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+                    collapsed = builder.build_skip_eos_list(new_skip, std::move(skip_eos_val), lst, children);
+                    break;
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+                    collapsed = builder.build_skip_eos_pop(new_skip, std::move(skip_eos_val), bmp, children);
+                    break;
+                case mk_flag_switch(0, MASK, true):
+                    collapsed = builder.build_skip_list(new_skip, lst, children);
+                    break;
+                default:
+                    collapsed = builder.build_skip_pop(new_skip, bmp, children);
+                    break;
             }
         }
         

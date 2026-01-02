@@ -50,11 +50,32 @@ static constexpr uint64_t WRITE_BIT = 1ULL << 63;
 static constexpr uint64_t READ_BIT  = 1ULL << 62;
 static constexpr uint64_t PTR_MASK  = ~(WRITE_BIT | READ_BIT);  // masks off both control bits
 
-// Switch helper for flag combinations
-// Packs EOS(bit63), SKIP(bit62), SKIP_EOS(bit61) into bits 3,2,1 plus is_list in bit 0
-// Use: switch (mk_switch(flags, is_list)) { case mk_switch(FLAG_EOS | FLAG_SKIP, true): ... }
-KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(uint64_t flags, bool is_list) noexcept {
-    return static_cast<uint8_t>(((flags >> 60) & 0b1110) | is_list);
+// Switch helper for pure bool combinations
+// Use: switch (mk_switch(a, b, c)) { case mk_switch(true, false, true): ... }
+template <typename... Bools>
+KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(Bools... bs) noexcept {
+    uint8_t result = 0;
+    ((result = (result << 1) | uint8_t(bool(bs))), ...);
+    return result;
+}
+
+// Switch helper for flag + bool combinations
+// Uses Kernighan's bit iteration (low-to-high) for efficiency
+// Use: switch (mk_flag_switch(flags, FLAG_EOS|FLAG_SKIP, is_list)) { 
+//        case mk_flag_switch(FLAG_EOS, FLAG_EOS|FLAG_SKIP, true): ... }
+template <typename... Bools>
+KTRIE_FORCE_INLINE constexpr uint8_t mk_flag_switch(uint64_t flags, uint64_t mask, Bools... extra) noexcept {
+    uint8_t result = 0;
+    
+    // Process flags using Kernighan's method (low-to-high)
+    for (uint64_t m = mask; m; m &= m - 1) {
+        uint64_t bit = m & static_cast<uint64_t>(-static_cast<int64_t>(m));  // isolate lowest set bit
+        result = (result << 1) | uint8_t(bool(flags & bit));
+    }
+    
+    // Append extra bools
+    ((result = (result << 1) | uint8_t(bool(extra))), ...);
+    return result;
 }
 
 // Byteswap - C++23 has std::byteswap, provide fallback for C++20

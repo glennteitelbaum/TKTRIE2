@@ -163,6 +163,7 @@ struct trie_helpers {
                                     popcount_bitmap& bmp,
                                     const std::vector<uint64_t>& children) {
         uint64_t flags = view.flags();
+        constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS;
         
         T eos_val, skip_eos_val;
         if (flags & FLAG_EOS) view.eos_data()->try_read(eos_val);
@@ -170,42 +171,42 @@ struct trie_helpers {
         std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
         
         if (children.empty()) {
-            switch (mk_switch(flags, false)) {  // is_list irrelevant when no children
-                case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+            switch (mk_flag_switch(flags, MASK)) {
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
-                case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
                     return builder.build_eos_skip(std::move(eos_val), skip);
-                case mk_switch(FLAG_EOS, false):
+                case mk_flag_switch(FLAG_EOS, MASK):
                     return builder.build_eos(std::move(eos_val));
-                case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, false):
+                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     return builder.build_skip_eos(skip, std::move(skip_eos_val));
                 default:
                     return builder.build_empty_root();
             }
         }
         
-        switch (mk_switch(flags, is_list)) {
-            case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, true):
+        switch (mk_flag_switch(flags, MASK, is_list)) {
+            case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                 return builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children);
-            case mk_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, false):
+            case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                 return builder.build_eos_skip_eos_pop(std::move(eos_val), skip, std::move(skip_eos_val), bmp, children);
-            case mk_switch(FLAG_EOS | FLAG_SKIP, true):
+            case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
                 return builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
-            case mk_switch(FLAG_EOS | FLAG_SKIP, false):
+            case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
                 return builder.build_eos_skip_pop(std::move(eos_val), skip, bmp, children);
-            case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, true):
+            case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                 return builder.build_skip_eos_list(skip, std::move(skip_eos_val), lst, children);
-            case mk_switch(FLAG_SKIP | FLAG_SKIP_EOS, false):
+            case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                 return builder.build_skip_eos_pop(skip, std::move(skip_eos_val), bmp, children);
-            case mk_switch(FLAG_SKIP, true):
+            case mk_flag_switch(FLAG_SKIP, MASK, true):
                 return builder.build_skip_list(skip, lst, children);
-            case mk_switch(FLAG_SKIP, false):
+            case mk_flag_switch(FLAG_SKIP, MASK, false):
                 return builder.build_skip_pop(skip, bmp, children);
-            case mk_switch(FLAG_EOS, true):
+            case mk_flag_switch(FLAG_EOS, MASK, true):
                 return builder.build_eos_list(std::move(eos_val), lst, children);
-            case mk_switch(FLAG_EOS, false):
+            case mk_flag_switch(FLAG_EOS, MASK, false):
                 return builder.build_eos_pop(std::move(eos_val), bmp, children);
-            case mk_switch(0, true):
+            case mk_flag_switch(0, MASK, true):
                 return builder.build_list(lst, children);
             default:
                 return builder.build_pop(bmp, children);
