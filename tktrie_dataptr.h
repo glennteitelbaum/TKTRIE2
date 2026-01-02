@@ -19,25 +19,23 @@ template <typename T, bool THREADED, typename Allocator, bool CAN_EMBED = can_em
 class dataptr;
 
 // =============================================================================
-// THREADED=true implementation (always uses pointer, never embeds)
+// THREADED=true implementation - simplified for COW+EBR
+// With COW, each modification creates new nodes with new dataptrs.
+// Readers see immutable data protected by EBR. No READ_BIT/WRITE_BIT needed.
 // =============================================================================
 template <typename T, typename Allocator>
 class dataptr<T, true, Allocator, true> {
-    std::atomic<uint64_t> bits_{0};
+    std::atomic<T*> ptr_{nullptr};
     
     using alloc_traits = std::allocator_traits<Allocator>;
     using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
     using value_alloc_traits = std::allocator_traits<value_alloc_t>;
-    
-    static T* get_ptr(uint64_t v) noexcept {
-        return reinterpret_cast<T*>(v & PTR_MASK);
-    }
 
 public:
     dataptr() noexcept = default;
     
     ~dataptr() {
-        T* ptr = get_ptr(bits_.load(std::memory_order_relaxed));
+        T* ptr = ptr_.load(std::memory_order_relaxed);
         if (ptr) {
             value_alloc_t alloc;
             std::destroy_at(ptr);
@@ -49,14 +47,14 @@ public:
     dataptr& operator=(const dataptr&) = delete;
     
     dataptr(dataptr&& other) noexcept {
-        bits_.store(other.bits_.exchange(0, std::memory_order_acq_rel), 
-                    std::memory_order_relaxed);
+        ptr_.store(other.ptr_.exchange(nullptr, std::memory_order_acq_rel), 
+                   std::memory_order_relaxed);
     }
     
     dataptr& operator=(dataptr&& other) noexcept {
         if (this != &other) {
-            T* old = get_ptr(bits_.load(std::memory_order_relaxed));
-            bits_.store(other.bits_.exchange(0, std::memory_order_acq_rel),
+            T* old = ptr_.load(std::memory_order_relaxed);
+            ptr_.store(other.ptr_.exchange(nullptr, std::memory_order_acq_rel),
                        std::memory_order_relaxed);
             if (old) {
                 value_alloc_t alloc;
@@ -68,46 +66,22 @@ public:
     }
 
     bool has_data() const noexcept {
-        return get_ptr(bits_.load(std::memory_order_acquire)) != nullptr;
+        return ptr_.load(std::memory_order_acquire) != nullptr;
     }
 
     /**
-     * Try to read value using CAS protocol
-     * Returns false if WRITE_BIT set (caller should retry from root)
-     * or if no data present
+     * Read value - with COW+EBR, data is immutable once visible
      */
     bool try_read(T& out) const noexcept {
-        auto* self = const_cast<dataptr*>(this);
-        
-        while (true) {
-            uint64_t old = self->bits_.load(std::memory_order_acquire);
-            
-            if (old & WRITE_BIT) return false;
-            
-            T* ptr = get_ptr(old);
-            if (!ptr) return false;
-            
-            if (old & READ_BIT) {
-                cpu_pause();
-                continue;
-            }
-            
-            if (self->bits_.compare_exchange_weak(old, old | READ_BIT,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire)) {
-                out = *ptr;
-                self->bits_.fetch_and(~READ_BIT, std::memory_order_release);
-                return true;
-            }
-        }
+        T* ptr = ptr_.load(std::memory_order_acquire);
+        if (!ptr) return false;
+        out = *ptr;
+        return true;
     }
 
-    void begin_write() noexcept {
-        bits_.fetch_or(WRITE_BIT, std::memory_order_acq_rel);
-        while (bits_.load(std::memory_order_acquire) & READ_BIT) {
-            cpu_pause();
-        }
-    }
+    // begin_write/end_write are no-ops with COW - kept for API compatibility
+    void begin_write() noexcept { }
+    void end_write() noexcept { }
 
     void set(const T& value) {
         value_alloc_t alloc;
@@ -119,9 +93,8 @@ public:
             throw;
         }
         
-        T* old_ptr = get_ptr(bits_.load(std::memory_order_relaxed));
-        bits_.store(reinterpret_cast<uint64_t>(new_ptr) | WRITE_BIT, 
-                   std::memory_order_release);
+        T* old_ptr = ptr_.load(std::memory_order_relaxed);
+        ptr_.store(new_ptr, std::memory_order_release);
         
         if (old_ptr) {
             std::destroy_at(old_ptr);
@@ -139,9 +112,8 @@ public:
             throw;
         }
         
-        T* old_ptr = get_ptr(bits_.load(std::memory_order_relaxed));
-        bits_.store(reinterpret_cast<uint64_t>(new_ptr) | WRITE_BIT,
-                   std::memory_order_release);
+        T* old_ptr = ptr_.load(std::memory_order_relaxed);
+        ptr_.store(new_ptr, std::memory_order_release);
         
         if (old_ptr) {
             std::destroy_at(old_ptr);
@@ -150,8 +122,8 @@ public:
     }
 
     void clear() noexcept {
-        T* old_ptr = get_ptr(bits_.load(std::memory_order_relaxed));
-        bits_.store(WRITE_BIT, std::memory_order_release);
+        T* old_ptr = ptr_.load(std::memory_order_relaxed);
+        ptr_.store(nullptr, std::memory_order_release);
         
         if (old_ptr) {
             value_alloc_t alloc;
@@ -160,28 +132,20 @@ public:
         }
     }
 
-    void end_write() noexcept {
-        bits_.fetch_and(~WRITE_BIT, std::memory_order_release);
-    }
-
     uint64_t to_u64() const noexcept {
-        return bits_.load(std::memory_order_relaxed);
+        return reinterpret_cast<uint64_t>(ptr_.load(std::memory_order_relaxed));
     }
 
     void from_u64(uint64_t v) noexcept {
-        bits_.store(v, std::memory_order_relaxed);
+        ptr_.store(reinterpret_cast<T*>(v), std::memory_order_relaxed);
     }
 
-    // Deep copy for trie copy constructor - acts as reader
-    // Returns false if WRITE_BIT encountered (caller should retry)
-    bool deep_copy_from(const dataptr& other) {
-        T value;
-        if (!const_cast<dataptr&>(other).try_read(value)) {
-            return false;  // WRITE_BIT set, caller should retry
+    // Deep copy - with COW, source is immutable
+    void deep_copy_from(const dataptr& other) {
+        T* src = other.ptr_.load(std::memory_order_acquire);
+        if (src) {
+            set(*src);
         }
-        set(std::move(value));
-        end_write();
-        return true;
     }
 };
 

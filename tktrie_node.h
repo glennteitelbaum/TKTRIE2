@@ -760,10 +760,7 @@ public:
 
     /**
      * Deep copy a node (recursively copies children)
-     */
-    /**
-     * Deep copy a node (recursively copies children)
-     * For THREADED: returns nullptr if WRITE_BIT encountered (caller should retry)
+     * With COW+EBR, source tree is immutable during copy
      */
     slot_type* deep_copy(slot_type* src, size_t depth = 0) {
         if (!src) return nullptr;
@@ -773,11 +770,8 @@ public:
         
         slot_type* dst = allocate_node(sz);
         
-        // Copy header (mask off control bits for THREADED)
+        // Copy header
         uint64_t header = load_slot<THREADED>(&src[0]);
-        if constexpr (THREADED) {
-            header &= ~(WRITE_BIT | READ_BIT);
-        }
         store_slot<THREADED>(&dst[0], header);
         
         node_view_t dst_view(dst);
@@ -785,16 +779,7 @@ public:
         // Deep copy EOS data
         if (src_view.has_eos()) {
             new (dst_view.eos_data()) dataptr_t();
-            if constexpr (THREADED) {
-                if (!dst_view.eos_data()->deep_copy_from(*src_view.eos_data())) {
-                    // WRITE_BIT encountered - clean up and signal retry
-                    dst_view.eos_data()->~dataptr_t();
-                    deallocate_node(dst);
-                    return nullptr;
-                }
-            } else {
-                dst_view.eos_data()->deep_copy_from(*src_view.eos_data());
-            }
+            dst_view.eos_data()->deep_copy_from(*src_view.eos_data());
         }
         
         // Copy skip
@@ -807,17 +792,7 @@ public:
             // Deep copy SKIP_EOS data
             if (src_view.has_skip_eos()) {
                 new (dst_view.skip_eos_data()) dataptr_t();
-                if constexpr (THREADED) {
-                    if (!dst_view.skip_eos_data()->deep_copy_from(*src_view.skip_eos_data())) {
-                        // Clean up and signal retry
-                        dst_view.skip_eos_data()->~dataptr_t();
-                        if (src_view.has_eos()) dst_view.eos_data()->~dataptr_t();
-                        deallocate_node(dst);
-                        return nullptr;
-                    }
-                } else {
-                    dst_view.skip_eos_data()->deep_copy_from(*src_view.skip_eos_data());
-                }
+                dst_view.skip_eos_data()->deep_copy_from(*src_view.skip_eos_data());
             }
         }
         
@@ -847,25 +822,9 @@ public:
                 }
             }
             
-            if constexpr (THREADED) {
-                // Check for WRITE_BIT on child pointer
-                if (child_ptr & WRITE_BIT) {
-                    // Clean up partially built node and signal retry
-                    cleanup_partial_copy(dst, i);
-                    return nullptr;
-                }
-                child_ptr &= PTR_MASK;
-            }
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             if (child) {
                 slot_type* child_copy = deep_copy(child, child_depth);
-                if constexpr (THREADED) {
-                    if (!child_copy) {
-                        // Child copy failed - clean up and signal retry
-                        cleanup_partial_copy(dst, i);
-                        return nullptr;
-                    }
-                }
                 dst_view.set_child_ptr(i, reinterpret_cast<uint64_t>(child_copy));
             } else {
                 dst_view.set_child_ptr(i, 0);
@@ -873,30 +832,6 @@ public:
         }
         
         return dst;
-    }
-
-private:
-    // Helper to clean up partially copied node during failed deep_copy
-    void cleanup_partial_copy(slot_type* node, int copied_children) {
-        node_view_t view(node);
-        
-        // Clean up dataptrs
-        if (view.has_eos()) view.eos_data()->~dataptr_t();
-        if (view.has_skip_eos()) view.skip_eos_data()->~dataptr_t();
-        
-        // Recursively delete already-copied children
-        for (int i = 0; i < copied_children; ++i) {
-            uint64_t child_ptr = view.get_child_ptr(i);
-            if constexpr (THREADED) {
-                child_ptr &= PTR_MASK;
-            }
-            slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
-            if (child) {
-                deallocate_node(child);
-            }
-        }
-        
-        deallocate_node(node);
     }
 };
 

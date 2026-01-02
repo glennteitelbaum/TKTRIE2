@@ -12,15 +12,13 @@ namespace gteitelbaum {
 /**
  * Insert operation results
  * 
- * THREADED writer protocol:
- * 1. Traverse, check WRITE_BIT on each slot
- * 2. Build new subtree optimistically (always targeting root)
- * 3. LOCK mutex
- * 4. Verify root_slot still has expected_ptr
- * 5. Store (new_ptr | WRITE_BIT) to root_slot
- * 6. UNLOCK
- * 7. Retire old nodes to EBR
- * 8. Clear WRITE_BIT
+ * THREADED writer protocol (COW + EBR + mutex):
+ * 1. Traverse and build new subtree (EBR protects from freed memory)
+ * 2. LOCK mutex
+ * 3. Verify root_slot still has expected_ptr
+ * 4. Store new_ptr to root_slot
+ * 5. UNLOCK
+ * 6. Retire old nodes to EBR
  */
 template <bool THREADED>
 struct insert_result {
@@ -30,23 +28,18 @@ struct insert_result {
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;
     bool already_exists = false;
-    bool hit_write = false;
     
     insert_result() {
         new_nodes.reserve(16);
         old_nodes.reserve(16);
     }
     
-    // Check if target_slot has been modified
+    // Check if target_slot has been modified (another writer committed)
     bool path_has_conflict() const noexcept {
         if constexpr (THREADED) {
             if (target_slot) {
                 uint64_t current = load_slot<THREADED>(target_slot);
-                // Check both pointer value and WRITE_BIT
-                if ((current & PTR_MASK) != (expected_ptr & PTR_MASK)) {
-                    return true;
-                }
-                if (current & WRITE_BIT) {
+                if (current != expected_ptr) {
                     return true;
                 }
             }
@@ -56,14 +49,12 @@ struct insert_result {
 };
 
 /**
- * Insert helper functions - atomic slot update approach
+ * Insert helper functions - COW approach
  * 
- * THREADED writer protocol:
- * 1. Traverse, check WRITE_BIT on each slot, record in traversal_path
- * 2. Build new subtree optimistically
- * 3. LOCK mutex
- * 4. Re-verify traversal_path for WRITE_BIT
- * 5. Store (new_ptr | WRITE_BIT), UNLOCK, free, clear WRITE_BIT
+ * With COW + EBR:
+ * - Traverse is safe even if another writer commits (EBR protects)
+ * - Build new tree optimistically
+ * - Verify expected_ptr inside lock to detect concurrent modifications
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -100,15 +91,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             }
             result.new_nodes.push_back(result.new_subtree);
             return result;
-        }
-        
-        // Check root for WRITE_BIT
-        if constexpr (THREADED) {
-            uint64_t val = load_slot<THREADED>(root_slot);
-            if (val & WRITE_BIT) {
-                result.hit_write = true;
-                return result;
-            }
         }
         
         return insert_into_node(builder, root, key, std::forward<U>(value), depth, result);
@@ -171,17 +153,8 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* child_slot = view.find_child(c);
         
         if (child_slot) {
-            // Child exists - check WRITE_BIT
+            // Child exists - follow it
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
-            
-            if constexpr (THREADED) {
-                if (child_ptr & WRITE_BIT) {
-                    result.hit_write = true;
-                    return result;
-                }
-            }
-            
-            uint64_t clean_ptr = child_ptr & PTR_MASK;
             
             // FIXED_LEN leaf optimization
             if constexpr (FIXED_LEN > 0 && !THREADED) {
@@ -198,12 +171,12 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             }
             
             // Recurse into child
-            slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
+            slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             insert_into_node(builder, child,
                              key.substr(1), std::forward<U>(value), depth + 1, result);
             
             // If child modification succeeded, rebuild this node to point to new child
-            if (!result.already_exists && !result.hit_write && result.new_subtree) {
+            if (!result.already_exists && result.new_subtree) {
                 return rebuild_with_new_child(builder, node, c, result);
             }
             return result;

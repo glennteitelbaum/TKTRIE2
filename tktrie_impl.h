@@ -63,16 +63,15 @@ void static_node_deleter(void* ptr) {
 /**
  * Thread-safe trie with EBR (Epoch-Based Reclamation)
  * 
- * WRITER PROTOCOL (THREADED mode):
- * 1. Traverse checking WRITE_BIT, record path
- * 2. Build new subtree optimistically
+ * WRITER PROTOCOL (THREADED mode - COW + EBR + mutex):
+ * 1. Enter EBR epoch
+ * 2. Traverse and build new subtree (COW)
  * 3. LOCK mutex
- * 4. Re-verify path for WRITE_BIT (another writer committed)
- * 5. Commit: store (new_ptr | WRITE_BIT)
+ * 4. Verify root hasn't changed (expected_ptr check)
+ * 5. Commit: store new_ptr
  * 6. UNLOCK
  * 7. Retire old nodes to EBR
- * 8. Clear WRITE_BIT
- * 9. try_reclaim() periodically
+ * 8. try_reclaim() periodically
  * 
  * READER PROTOCOL (THREADED mode):
  * - Enter EBR epoch (RAII guard)
@@ -126,14 +125,10 @@ private:
         }
     }
 
-    // Helper to safely read root pointer (masks off control bits)
+    // Helper to read root pointer
     slot_type* get_root() const noexcept {
         uint64_t val = load_slot<THREADED>(const_cast<slot_type*>(&root_slot_));
-        if constexpr (THREADED) {
-            return reinterpret_cast<slot_type*>(val & PTR_MASK);
-        } else {
-            return reinterpret_cast<slot_type*>(val);
-        }
+        return reinterpret_cast<slot_type*>(val);
     }
     
     // Helper to get raw root slot value
@@ -141,7 +136,7 @@ private:
         return load_slot<THREADED>(const_cast<slot_type*>(&root_slot_));
     }
     
-    // Helper to safely write root pointer
+    // Helper to write root pointer
     void set_root(slot_type* new_root) noexcept {
         store_slot<THREADED>(&root_slot_, reinterpret_cast<uint64_t>(new_root));
     }
@@ -208,7 +203,7 @@ public:
             std::lock_guard<mutex_type> lock(other.write_mutex_);
         }
         uint64_t other_val = load_slot<THREADED>(&other.root_slot_);
-        store_slot<THREADED>(&root_slot_, other_val & PTR_MASK);
+        store_slot<THREADED>(&root_slot_, other_val);
         store_slot<THREADED>(&other.root_slot_, 0);
         if constexpr (THREADED) {
             elem_count_.store(other.elem_count_.exchange(0, std::memory_order_relaxed),
@@ -227,7 +222,7 @@ public:
                 std::lock_guard<mutex_type> lock(other.write_mutex_);
             }
             uint64_t other_val = load_slot<THREADED>(&other.root_slot_);
-            store_slot<THREADED>(&root_slot_, other_val & PTR_MASK);
+            store_slot<THREADED>(&root_slot_, other_val);
             store_slot<THREADED>(&other.root_slot_, 0);
             alloc_ = std::move(other.alloc_);
             builder_ = node_builder_t(alloc_);
@@ -252,8 +247,8 @@ public:
             std::lock_guard<mutex_type> lock2(*second);
         }
         uint64_t tmp = load_slot<THREADED>(&root_slot_);
-        store_slot<THREADED>(&root_slot_, load_slot<THREADED>(&other.root_slot_) & PTR_MASK);
-        store_slot<THREADED>(&other.root_slot_, tmp & PTR_MASK);
+        store_slot<THREADED>(&root_slot_, load_slot<THREADED>(&other.root_slot_));
+        store_slot<THREADED>(&other.root_slot_, tmp);
         std::swap(alloc_, other.alloc_);
         if constexpr (THREADED) {
             size_type tmp_count = elem_count_.load(std::memory_order_relaxed);
@@ -293,14 +288,12 @@ public:
             key_bytes = std::string(traits::to_bytes(key));
         }
         
-        bool hit_write = false;
-        
         if constexpr (THREADED) {
             auto guard = get_ebr_slot().guard();
             slot_type* root = get_root();
-            return nav_t::contains(root, key_bytes, hit_write);
+            return nav_t::contains(root, key_bytes);
         } else {
-            return nav_t::contains(get_root(), key_bytes, hit_write);
+            return nav_t::contains(get_root(), key_bytes);
         }
     }
 
@@ -313,18 +306,17 @@ public:
         }
         
         T value;
-        bool hit_write = false;
         
         if constexpr (THREADED) {
             auto guard = get_ebr_slot().guard();
             slot_type* root = get_root();
-            bool found = nav_t::read(root, key_bytes, value, hit_write);
+            bool found = nav_t::read(root, key_bytes, value);
             if (found) {
                 return iterator(this, key_bytes, value);
             }
             return end();
         } else {
-            bool found = nav_t::read(get_root(), key_bytes, value, hit_write);
+            bool found = nav_t::read(get_root(), key_bytes, value);
             if (found) {
                 return iterator(this, key_bytes, value);
             }
@@ -383,8 +375,7 @@ public:
             } else {
                 key.reserve(15);
             }
-            bool hit_write = false;
-            slot_type* data_slot = nav_t::find_first_leaf(root, key, hit_write);
+            slot_type* data_slot = nav_t::find_first_leaf(root, key);
             if (!data_slot) return end();
             
             dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
@@ -401,8 +392,7 @@ public:
             } else {
                 key.reserve(15);
             }
-            bool hit_write = false;
-            slot_type* data_slot = nav_t::find_first_leaf(root, key, hit_write);
+            slot_type* data_slot = nav_t::find_first_leaf(root, key);
             if (!data_slot) return end();
             
             dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
@@ -469,7 +459,6 @@ private:
         int num_children = view.child_count();
         for (int i = 0; i < num_children; ++i) {
             uint64_t child_ptr = view.get_child_ptr(i);
-            child_ptr &= PTR_MASK;
 
             // FIXED_LEN leaf optimization
             if constexpr (fixed_len > 0 && !THREADED) {
@@ -550,19 +539,13 @@ private:
         unneeded.reserve(16);
 
         while (true) {
-            // Step 1: OUTSIDE LOCK - traverse checking WRITE_BIT, build optimistically
+            // Step 1: OUTSIDE LOCK - traverse and build new tree (COW)
             // EBR guard protects us from use-after-free during traversal
             auto& slot = get_ebr_slot();
             auto guard = slot.guard();
             
             auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), key_bytes,
                                                        std::forward<U>(value));
-            
-            if (result.hit_write) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                cpu_pause();
-                continue;
-            }
 
             if (result.already_exists) {
                 for (auto* n : result.new_nodes) builder_.deallocate_node(n);
@@ -573,15 +556,15 @@ private:
             {
                 std::lock_guard<mutex_type> lock(write_mutex_);
 
-                // Step 2: INSIDE LOCK - verify no conflict (pointer changed or WRITE_BIT set)
+                // Step 2: INSIDE LOCK - verify root hasn't changed
                 if (result.path_has_conflict()) {
                     for (auto* n : result.new_nodes) unneeded.push_back(n);
                     need_retry = true;
                 }
 
                 if (!need_retry) {
-                    // Step 3: Commit - store (new_ptr | WRITE_BIT)
-                    uint64_t new_ptr = reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT;
+                    // Step 3: Commit - store new_ptr
+                    uint64_t new_ptr = reinterpret_cast<uint64_t>(result.new_subtree);
                     store_slot<THREADED>(result.target_slot, new_ptr);
                     elem_count_.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -605,10 +588,7 @@ private:
                 retire_node(n);
             }
 
-            // Step 5: Clear WRITE_BIT
-            fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
-
-            // Step 6: Try to reclaim old epochs
+            // Step 5: Try to reclaim old epochs
             ebr_global::instance().try_reclaim();
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
@@ -671,18 +651,12 @@ private:
         unneeded.reserve(16);
 
         while (true) {
-            // Step 1: OUTSIDE LOCK - traverse checking WRITE_BIT, build optimistically
+            // Step 1: OUTSIDE LOCK - traverse and build new tree (COW)
             // EBR guard protects us from use-after-free during traversal
             auto& slot = get_ebr_slot();
             auto guard = slot.guard();
             
             auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), key_bytes);
-            
-            if (result.hit_write) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                cpu_pause();
-                continue;
-            }
 
             if (!result.found) {
                 for (auto* n : result.new_nodes) builder_.deallocate_node(n);
@@ -693,16 +667,16 @@ private:
             {
                 std::lock_guard<mutex_type> lock(write_mutex_);
 
-                // Step 2: INSIDE LOCK - verify no conflict (pointer changed or WRITE_BIT set)
+                // Step 2: INSIDE LOCK - verify root hasn't changed
                 if (result.path_has_conflict()) {
                     for (auto* n : result.new_nodes) unneeded.push_back(n);
                     need_retry = true;
                 }
 
                 if (!need_retry) {
-                    // Step 3: Commit - store (new_ptr | WRITE_BIT) or (0 | WRITE_BIT)
-                    uint64_t new_ptr = result.subtree_deleted ? WRITE_BIT 
-                                     : (reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT);
+                    // Step 3: Commit - store new_ptr or 0
+                    uint64_t new_ptr = result.subtree_deleted ? 0 
+                                     : reinterpret_cast<uint64_t>(result.new_subtree);
                     store_slot<THREADED>(result.target_slot, new_ptr);
                     if constexpr (THREADED) {
                         elem_count_.fetch_sub(1, std::memory_order_relaxed);
@@ -730,10 +704,7 @@ private:
                 retire_node(n);
             }
 
-            // Step 5: Clear WRITE_BIT
-            fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
-
-            // Step 6: Try to reclaim
+            // Step 5: Try to reclaim
             ebr_global::instance().try_reclaim();
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());

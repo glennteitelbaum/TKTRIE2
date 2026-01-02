@@ -12,10 +12,10 @@ namespace gteitelbaum {
 /**
  * Navigation helper functions (READER operations)
  * 
- * Reader protocol for THREADED mode:
- * - Child pointers: if WRITE_BIT set → restart from root
- *   Then double-check slot unchanged after loading pointer
- * - Data pointers: handled by dataptr::try_read (spin on READ_BIT, CAS to set, copy, clear)
+ * With COW + EBR:
+ * - Readers are protected by EBR epoch - old nodes won't be freed while readers active
+ * - Data is immutable once published (COW)
+ * - No WRITE_BIT/READ_BIT coordination needed
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -25,43 +25,11 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using dataptr_t = typename base::dataptr_t;
 
     /**
-     * Safely load child pointer with double-check
-     * Returns nullptr and sets hit_write if WRITE_BIT seen or slot changed
-     */
-    static slot_type* safe_load_child(slot_type* child_slot, bool& hit_write) noexcept {
-        if constexpr (THREADED) {
-            uint64_t val = load_slot<THREADED>(child_slot);
-            
-            // Check for WRITE_BIT (writer is modifying)
-            if (val & WRITE_BIT) {
-                hit_write = true;
-                return nullptr;
-            }
-            
-            slot_type* child = reinterpret_cast<slot_type*>(val & PTR_MASK);
-            
-            // Double-check slot hasn't changed (race protection)
-            uint64_t val2 = load_slot<THREADED>(child_slot);
-            if (val2 != val) {
-                hit_write = true;
-                return nullptr;
-            }
-            
-            return child;
-        } else {
-            uint64_t val = load_slot<THREADED>(child_slot);
-            return reinterpret_cast<slot_type*>(val);
-        }
-    }
-
-    /**
      * Find node for exact key match
-     * Sets hit_write if WRITE_BIT encountered (caller should retry)
      * Returns pointer to data slot, or nullptr if not found
      */
     static slot_type* find_data_slot(slot_type* root, std::string_view key, 
-                                      bool& hit_write, size_t start_depth = 0) noexcept {
-        hit_write = false;
+                                      size_t start_depth = 0) noexcept {
         slot_type* cur = root;
         size_t depth = start_depth;
         
@@ -107,9 +75,9 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 }
             }
             
-            // Safe load with double-check
-            cur = safe_load_child(child_slot, hit_write);
-            if (hit_write) return nullptr;
+            // Load child pointer
+            uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            cur = reinterpret_cast<slot_type*>(child_ptr);
             
             key.remove_prefix(1);
             ++depth;
@@ -121,48 +89,30 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     /**
      * Check if key exists in trie
      */
-    static bool contains(slot_type* root, std::string_view key, bool& hit_write) noexcept {
-        slot_type* data_slot = find_data_slot(root, key, hit_write);
-        if (!data_slot || hit_write) return false;
+    static bool contains(slot_type* root, std::string_view key) noexcept {
+        slot_type* data_slot = find_data_slot(root, key);
+        if (!data_slot) return false;
         
-        if constexpr (THREADED) {
-            dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
-            T dummy;
-            if (!dp->try_read(dummy)) {
-                hit_write = true;
-                return false;
-            }
-            return true;
-        } else {
-            dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
-            return dp->has_data();
-        }
+        dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+        return dp->has_data();
     }
 
     /**
      * Read value at key
      */
-    static bool read(slot_type* root, std::string_view key, T& out, bool& hit_write) noexcept {
-        slot_type* data_slot = find_data_slot(root, key, hit_write);
-        if (!data_slot || hit_write) return false;
+    static bool read(slot_type* root, std::string_view key, T& out) noexcept {
+        slot_type* data_slot = find_data_slot(root, key);
+        if (!data_slot) return false;
         
         dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
-        if (!dp->try_read(out)) {
-            if constexpr (THREADED) {
-                hit_write = true;
-            }
-            return false;
-        }
-        return true;
+        return dp->try_read(out);
     }
 
     /**
      * Find first leaf in subtree (for iteration)
-     * Used by DELETE ALL - must handle WRITE_BIT same as other readers
      */
     static slot_type* find_first_leaf(slot_type* node, std::string& key_out, 
-                                       bool& hit_write, size_t depth = 0) noexcept {
-        hit_write = false;
+                                       size_t depth = 0) noexcept {
         if (!node) return nullptr;
         
         while (true) {
@@ -205,9 +155,9 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 }
             }
             
-            // Safe load with double-check
-            node = safe_load_child(child_slot, hit_write);
-            if (hit_write) return nullptr;
+            // Load child pointer
+            uint64_t child_ptr = load_slot<THREADED>(child_slot);
+            node = reinterpret_cast<slot_type*>(child_ptr);
             
             ++depth;
         }

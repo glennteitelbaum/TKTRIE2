@@ -11,7 +11,7 @@ namespace gteitelbaum {
 /**
  * Remove operation results
  * 
- * THREADED writer protocol (same as insert):
+ * THREADED writer protocol (COW + EBR + mutex):
  * - Always target root_slot
  * - Verify expected_ptr inside lock
  * - Rebuild entire path from root to modification point
@@ -24,7 +24,6 @@ struct remove_result {
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;
     bool found = false;
-    bool hit_write = false;
     bool subtree_deleted = false;
     
     remove_result() {
@@ -32,15 +31,12 @@ struct remove_result {
         old_nodes.reserve(16);
     }
     
-    // Check if target_slot has been modified
+    // Check if target_slot has been modified (another writer committed)
     bool path_has_conflict() const noexcept {
         if constexpr (THREADED) {
             if (target_slot) {
                 uint64_t current = load_slot<THREADED>(target_slot);
-                if ((current & PTR_MASK) != (expected_ptr & PTR_MASK)) {
-                    return true;
-                }
-                if (current & WRITE_BIT) {
+                if (current != expected_ptr) {
                     return true;
                 }
             }
@@ -50,7 +46,7 @@ struct remove_result {
 };
 
 /**
- * Remove helper functions - atomic slot update approach
+ * Remove helper functions - COW approach
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -75,15 +71,6 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         // Always target root_slot for THREADED mode
         result.target_slot = root_slot;
         result.expected_ptr = reinterpret_cast<uint64_t>(root);
-        
-        // Check root for WRITE_BIT
-        if constexpr (THREADED) {
-            uint64_t val = load_slot<THREADED>(root_slot);
-            if (val & WRITE_BIT) {
-                result.hit_write = true;
-                return result;
-            }
-        }
         
         return remove_from_node(builder, root, key, depth, result);
     }
@@ -117,15 +104,7 @@ private:
         slot_type* child_slot = view.find_child(c);
         if (!child_slot) return result;  // Key not found
         
-        // Check WRITE_BIT
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
-        if constexpr (THREADED) {
-            if (child_ptr & WRITE_BIT) {
-                result.hit_write = true;
-                return result;
-            }
-        }
-        uint64_t clean_ptr = child_ptr & PTR_MASK;
         
         // FIXED_LEN leaf optimization
         if constexpr (FIXED_LEN > 0 && !THREADED) {
@@ -137,13 +116,12 @@ private:
         }
         
         // Recurse into child
-        slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
+        slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
         result_t child_result;
         remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
         
-        if (!child_result.found || child_result.hit_write) {
+        if (!child_result.found) {
             result.found = child_result.found;
-            result.hit_write = child_result.hit_write;
             return result;
         }
         
@@ -424,7 +402,6 @@ private:
         if (view.has_eos() || view.has_skip_eos() || view.child_count() != 1) return;
         
         uint64_t child_ptr = view.get_child_ptr(0);
-        if constexpr (THREADED) child_ptr &= PTR_MASK;
         slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
         if (!child) return;
         

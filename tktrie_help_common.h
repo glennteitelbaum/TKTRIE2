@@ -64,18 +64,13 @@ struct trie_helpers {
 
     /**
      * Extract child pointers from a node as vector
-     * For THREADED mode, masks out control bits
      */
     static std::vector<uint64_t> extract_children(node_view_t& view) {
         std::vector<uint64_t> children;
         int count = view.child_count();
         children.reserve(count);
         for (int i = 0; i < count; ++i) {
-            uint64_t ptr = view.get_child_ptr(i);
-            if constexpr (THREADED) {
-                ptr &= PTR_MASK;
-            }
-            children.push_back(ptr);
+            children.push_back(view.get_child_ptr(i));
         }
         return children;
     }
@@ -290,7 +285,6 @@ struct trie_debug {
             for (int i = 0; i < lst.count(); ++i) {
                 unsigned char c = lst.char_at(i);
                 uint64_t child_ptr = view.get_child_ptr(i);
-                if constexpr (THREADED) child_ptr &= PTR_MASK;
                 std::string child_prefix = byte_to_string(c) + " -> ";
                 if constexpr (FIXED_LEN > 0) { if (depth + view.skip_length() >= FIXED_LEN - 1) { os << indent << "    " << child_prefix << "(leaf)\n"; continue; } }
                 pretty_print_node(reinterpret_cast<slot_type*>(child_ptr), os, indent_level + 2, child_prefix, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
@@ -301,7 +295,6 @@ struct trie_debug {
             for (int i = 0; i < bmp.count(); ++i) {
                 unsigned char c = bmp.nth_char(i);
                 uint64_t child_ptr = view.get_child_ptr(i);
-                if constexpr (THREADED) child_ptr &= PTR_MASK;
                 std::string child_prefix = byte_to_string(c) + " -> ";
                 if constexpr (FIXED_LEN > 0) { if (depth + view.skip_length() >= FIXED_LEN - 1) { os << indent << "    " << child_prefix << "(leaf)\n"; continue; } }
                 pretty_print_node(reinterpret_cast<slot_type*>(child_ptr), os, indent_level + 2, child_prefix, depth + (view.has_skip() ? view.skip_length() : 0) + 1);
@@ -319,7 +312,6 @@ struct trie_debug {
         int num_children = view.child_count();
         for (int i = 0; i < num_children; ++i) {
             uint64_t child_ptr = view.get_child_ptr(i);
-            if constexpr (THREADED) child_ptr &= PTR_MASK;
             if constexpr (FIXED_LEN > 0) { if (depth + (view.has_skip() ? view.skip_length() : 0) + 1 >= FIXED_LEN) continue; }
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
             if (child) { std::string err = validate_node(child, depth + (view.has_skip() ? view.skip_length() : 0) + 1); if (!err.empty()) return err; }
