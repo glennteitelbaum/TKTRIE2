@@ -182,6 +182,8 @@ private:
         slot_type* new_node;
         
         if (has_children) {
+            // 3 flag bits + is_list = 16 combos
+            // Valid: must have EOS, SKIP_EOS requires SKIP
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
@@ -199,9 +201,24 @@ private:
                 case mk_flag_switch(FLAG_EOS, MASK, true):
                     new_node = builder.build_list(lst, children);
                     break;
-                default:
+                case mk_flag_switch(FLAG_EOS, MASK, false):
                     new_node = builder.build_pop(bmp, children);
                     break;
+                // Invalid: EOS | SKIP_EOS without SKIP
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
+                // Invalid: no EOS (shouldn't call remove_eos)
+                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
+                case mk_flag_switch(FLAG_SKIP, MASK, true):
+                case mk_flag_switch(FLAG_SKIP, MASK, false):
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+                case mk_flag_switch(0, MASK, true):
+                case mk_flag_switch(0, MASK, false):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination in remove_eos");
+                    __builtin_unreachable();
             }
         } else {
             // No children - must have SKIP_EOS (checked above)
@@ -248,6 +265,8 @@ private:
         slot_type* new_node;
         
         if (has_children) {
+            // 3 flag bits + is_list = 16 combos
+            // Valid: must have SKIP_EOS (which requires SKIP)
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
@@ -260,9 +279,26 @@ private:
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                     new_node = builder.build_skip_list(skip, lst, children);
                     break;
-                default:
+                case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                     new_node = builder.build_skip_pop(skip, bmp, children);
                     break;
+                // Invalid: no SKIP_EOS (shouldn't call remove_skip_eos)
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
+                case mk_flag_switch(FLAG_EOS, MASK, true):
+                case mk_flag_switch(FLAG_EOS, MASK, false):
+                case mk_flag_switch(FLAG_SKIP, MASK, true):
+                case mk_flag_switch(FLAG_SKIP, MASK, false):
+                case mk_flag_switch(0, MASK, true):
+                case mk_flag_switch(0, MASK, false):
+                // Invalid flag combos (SKIP_EOS without SKIP)
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination in remove_skip_eos");
+                    __builtin_unreachable();
             }
         } else {
             // No children - if has EOS, skip is pointless; if no EOS, handled by early return
@@ -392,6 +428,7 @@ private:
         
         slot_type* collapsed;
         if (children.empty()) {
+            // 2 flag bits = 4 combos, all valid
             switch (mk_flag_switch(child_flags, MASK)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
                     collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
@@ -402,10 +439,11 @@ private:
                 case mk_flag_switch(FLAG_SKIP_EOS, MASK):
                     collapsed = builder.build_skip_eos(new_skip, std::move(skip_eos_val));
                     break;
-                default:
+                case mk_flag_switch(0, MASK):
                     return;  // Can't collapse empty node
             }
         } else {
+            // 2 flag bits + is_list = 8 combos, all valid
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(child_flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
@@ -426,7 +464,7 @@ private:
                 case mk_flag_switch(0, MASK, true):
                     collapsed = builder.build_skip_list(new_skip, lst, children);
                     break;
-                default:
+                case mk_flag_switch(0, MASK, false):
                     collapsed = builder.build_skip_pop(new_skip, bmp, children);
                     break;
             }

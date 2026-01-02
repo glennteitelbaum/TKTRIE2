@@ -171,6 +171,7 @@ struct trie_helpers {
         std::string_view skip = (flags & FLAG_SKIP) ? view.skip_chars() : std::string_view{};
         
         if (children.empty()) {
+            // 3 flag bits = 8 combos, but SKIP_EOS requires SKIP
             switch (mk_flag_switch(flags, MASK)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     return builder.build_eos_skip_eos(std::move(eos_val), skip, std::move(skip_eos_val));
@@ -180,11 +181,19 @@ struct trie_helpers {
                     return builder.build_eos(std::move(eos_val));
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     return builder.build_skip_eos(skip, std::move(skip_eos_val));
-                default:
+                case mk_flag_switch(FLAG_SKIP, MASK):  // SKIP with no data - degenerate but handle it
+                case mk_flag_switch(0, MASK):
                     return builder.build_empty_root();
+                // Invalid: SKIP_EOS without SKIP
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK):
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
+                    __builtin_unreachable();
             }
         }
         
+        // 3 flag bits + is_list = 16 combos, but SKIP_EOS requires SKIP
         switch (mk_flag_switch(flags, MASK, is_list)) {
             case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                 return builder.build_eos_skip_eos_list(std::move(eos_val), skip, std::move(skip_eos_val), lst, children);
@@ -208,8 +217,16 @@ struct trie_helpers {
                 return builder.build_eos_pop(std::move(eos_val), bmp, children);
             case mk_flag_switch(0, MASK, true):
                 return builder.build_list(lst, children);
-            default:
+            case mk_flag_switch(0, MASK, false):
                 return builder.build_pop(bmp, children);
+            // Invalid: SKIP_EOS without SKIP
+            case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+            case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+            case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
+            case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
+            default:
+                KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
+                __builtin_unreachable();
         }
     }
 };

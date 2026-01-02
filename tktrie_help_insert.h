@@ -401,17 +401,20 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         bool has_children = !children.empty();
         
         if (!has_children) {
-            // No children: is_list is irrelevant
+            // 2 bools = 4 cases, all valid
             switch (mk_switch(has_new_skip, has_eos)) {
                 case mk_switch(true, true):
                     return builder.build_skip_eos(new_skip, std::move(eos_val));
+                case mk_switch(true, false):
+                case mk_switch(false, false):
+                    return builder.build_empty_root();
                 case mk_switch(false, true):
                     return builder.build_eos(std::move(eos_val));
-                default:
-                    return builder.build_empty_root();
             }
+            __builtin_unreachable();
         }
         
+        // 3 bools = 8 cases, all valid
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         switch (mk_switch(has_new_skip, has_eos, is_list)) {
             case mk_switch(true, true, true):
@@ -428,9 +431,10 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 return builder.build_eos_pop(std::move(eos_val), bmp, children);
             case mk_switch(false, false, true):
                 return builder.build_list(lst, children);
-            default:
+            case mk_switch(false, false, false):
                 return builder.build_pop(bmp, children);
         }
+        __builtin_unreachable();
     }
 
     /**
@@ -457,6 +461,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* new_node;
         
         if (children.empty()) {
+            // 2 flag bits = 4 combos, but SKIP_EOS requires SKIP
             switch (mk_flag_switch(flags, MASK)) {
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     new_node = builder.build_eos_skip_eos(std::forward<U>(value), skip, std::move(skip_eos_val));
@@ -464,11 +469,17 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(FLAG_SKIP, MASK):
                     new_node = builder.build_eos_skip(std::forward<U>(value), skip);
                     break;
-                default:
+                case mk_flag_switch(0, MASK):
                     new_node = builder.build_eos(std::forward<U>(value));
                     break;
+                // Invalid: SKIP_EOS without SKIP
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
+                    __builtin_unreachable();
             }
         } else {
+            // 2 flag bits + is_list = 8 combos, but SKIP_EOS requires SKIP
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
@@ -486,9 +497,15 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(0, MASK, true):
                     new_node = builder.build_eos_list(std::forward<U>(value), lst, children);
                     break;
-                default:
+                case mk_flag_switch(0, MASK, false):
                     new_node = builder.build_eos_pop(std::forward<U>(value), bmp, children);
                     break;
+                // Invalid: SKIP_EOS without SKIP
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
+                case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
+                    __builtin_unreachable();
             }
         }
         
@@ -524,15 +541,23 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* new_node;
         
         if (children.empty()) {
+            // 2 flag bits = 4 combos, but must have SKIP (we're adding SKIP_EOS)
             switch (mk_flag_switch(flags, MASK)) {
-                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):  // node has EOS + SKIP, we add SKIP_EOS
+                case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
                     new_node = builder.build_eos_skip_eos(std::move(eos_val), skip, std::forward<U>(value));
                     break;
-                default:  // node has just SKIP
+                case mk_flag_switch(FLAG_SKIP, MASK):
                     new_node = builder.build_skip_eos(skip, std::forward<U>(value));
                     break;
+                // Invalid: can't add skip_eos to node without skip
+                case mk_flag_switch(FLAG_EOS, MASK):
+                case mk_flag_switch(0, MASK):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "add_skip_eos called on node without SKIP");
+                    __builtin_unreachable();
             }
         } else {
+            // 2 flag bits + is_list = 8 combos, but must have SKIP
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
@@ -544,9 +569,17 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(FLAG_SKIP, MASK, true):
                     new_node = builder.build_skip_eos_list(skip, std::forward<U>(value), lst, children);
                     break;
-                default:
+                case mk_flag_switch(FLAG_SKIP, MASK, false):
                     new_node = builder.build_skip_eos_pop(skip, std::forward<U>(value), bmp, children);
                     break;
+                // Invalid: can't add skip_eos to node without skip
+                case mk_flag_switch(FLAG_EOS, MASK, true):
+                case mk_flag_switch(FLAG_EOS, MASK, false):
+                case mk_flag_switch(0, MASK, true):
+                case mk_flag_switch(0, MASK, false):
+                default:
+                    KTRIE_DEBUG_ASSERT(false && "add_skip_eos called on node without SKIP");
+                    __builtin_unreachable();
             }
         }
         
