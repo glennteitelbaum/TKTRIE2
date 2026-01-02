@@ -11,78 +11,50 @@ namespace gteitelbaum {
 /**
  * Remove operation results
  * 
- * Atomic slot update approach (same as insert):
- * - new_subtree: the rebuilt node/subtree to install (or null if deleting)
- * - target_slot: the single slot to atomically update (null = update root)
- * - expected_ptr: expected current value in target_slot for verification
- * - old_nodes: only the nodes being replaced (NOT ancestors)
- * - read_locked_slots: slots where we set READ_BIT (THREADED only) - only on modified nodes
+ * THREADED writer protocol (same as insert):
+ * 1. Traverse, check WRITE_BIT on each slot, record path
+ * 2. Build new subtree optimistically
+ * 3. LOCK mutex
+ * 4. Re-verify path for WRITE_BIT (any set = abort)
+ * 5. Store (new_ptr | WRITE_BIT) to target_slot
+ * 6. UNLOCK
+ * 7. Free old nodes
+ * 8. Clear WRITE_BIT on target_slot
  */
 template <bool THREADED>
 struct remove_result {
     slot_type_t<THREADED>* new_subtree = nullptr;   // What to install (null = delete)
-    slot_type_t<THREADED>* target_slot = nullptr;   // Where to install (null = root)
-    slot_type_t<THREADED>* root_slot = nullptr;     // Root slot for READ_BIT when parent_slot is null
-    uint64_t expected_ptr = 0;                       // Expected value in target_slot
+    slot_type_t<THREADED>* target_slot = nullptr;   // Where to install
+    std::vector<slot_type_t<THREADED>*> traversal_path;  // Slots traversed (for re-verify)
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;   // Only replaced nodes, not ancestors
-    std::vector<slot_type_t<THREADED>*> read_locked_slots;  // Slots with READ_BIT set
     bool found = false;
     bool hit_write = false;
-    bool hit_read = false;
     bool subtree_deleted = false;                    // True if subtree should be removed
     
     remove_result() {
         new_nodes.reserve(16);
         old_nodes.reserve(16);
         if constexpr (THREADED) {
-            read_locked_slots.reserve(4);
+            traversal_path.reserve(32);
         }
     }
     
-    // Clear READ_BITs we set (call after commit or on abort)
-    void clear_read_locks() noexcept {
+    // Check if any slot in path has WRITE_BIT set
+    bool path_has_write_bit() const noexcept {
         if constexpr (THREADED) {
-            for (auto* slot : read_locked_slots) {
-                fetch_and_slot<THREADED>(slot, ~READ_BIT);
+            for (auto* slot : traversal_path) {
+                if (load_slot<THREADED>(slot) & WRITE_BIT) {
+                    return true;
+                }
             }
-            read_locked_slots.clear();
         }
-    }
-    
-    // Try to acquire READ_BIT on the slot pointing to the node we're modifying
-    // Returns false if WRITE_BIT or READ_BIT already set (caller should abort)
-    bool try_acquire_modification_lock(slot_type_t<THREADED>* parent_slot) noexcept {
-        if constexpr (THREADED) {
-            slot_type_t<THREADED>* slot = parent_slot ? parent_slot : root_slot;
-            if (!slot) return true;  // No slot to lock (shouldn't happen)
-            
-            uint64_t old_val = fetch_or_slot<THREADED>(slot, READ_BIT);
-            if (old_val & WRITE_BIT) {
-                fetch_and_slot<THREADED>(slot, ~READ_BIT);
-                hit_write = true;
-                return false;
-            }
-            if (old_val & READ_BIT) {
-                fetch_and_slot<THREADED>(slot, ~READ_BIT);
-                hit_read = true;
-                return false;
-            }
-            read_locked_slots.push_back(slot);
-            return true;
-        } else {
-            return true;
-        }
+        return false;
     }
 };
 
 /**
  * Remove helper functions - atomic slot update approach
- * 
- * THREADED writer protocol:
- * - Only set READ_BIT on slot pointing to node being modified
- * - If we see WRITE_BIT during traversal, abort
- * - After commit, clear READ_BITs we set (except target_slot which is updated)
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -95,33 +67,33 @@ struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
     /**
      * Build remove operation
-     * @param builder Node builder
-     * @param root_slot Pointer to root slot (for READ_BIT protection when modifying root)
-     * @param root Current root node
-     * @param key Key to remove
-     * @param depth Current depth
      */
     static result_t build_remove_path(node_builder_t& builder, 
                                        slot_type* root_slot,
                                        slot_type* root,
                                        std::string_view key, size_t depth = 0) {
         result_t result;
-        result.root_slot = root_slot;  // Store for modification locking
         if (!root) return result;  // Key not found
         
-        result.expected_ptr = reinterpret_cast<uint64_t>(root);
-        return remove_from_node(builder, root, nullptr, result.expected_ptr, key, depth, result);
+        // Record root_slot in traversal path and check WRITE_BIT
+        if constexpr (THREADED) {
+            result.traversal_path.push_back(root_slot);
+            uint64_t val = load_slot<THREADED>(root_slot);
+            if (val & WRITE_BIT) {
+                result.hit_write = true;
+                return result;
+            }
+        }
+        
+        return remove_from_node(builder, root, root_slot, key, depth, result);
     }
 
 private:
     /**
      * Remove from node
-     * @param node Current node
-     * @param parent_slot Slot pointing to this node (null = root)
-     * @param parent_slot_value Current value in parent_slot
      */
     static result_t& remove_from_node(node_builder_t& builder, slot_type* node,
-                                       slot_type* parent_slot, uint64_t parent_slot_value,
+                                       slot_type* parent_slot,
                                        std::string_view key, size_t depth, result_t& result) {
         node_view_t view(node);
         
@@ -133,26 +105,27 @@ private:
             depth += match;
             if (key.empty()) {
                 if (!view.has_skip_eos()) return result;  // Key not found
-                return remove_skip_eos(builder, node, parent_slot, parent_slot_value, result);
+                return remove_skip_eos(builder, node, parent_slot, result);
             }
         }
         
         if (key.empty()) {
             if (!view.has_eos()) return result;  // Key not found
-            return remove_eos(builder, node, parent_slot, parent_slot_value, result);
+            return remove_eos(builder, node, parent_slot, result);
         }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
         slot_type* child_slot = view.find_child(c);
         if (!child_slot) return result;  // Key not found
         
-        // Check for WRITE_BIT during traversal (another writer committed)
+        // Check WRITE_BIT and record in path
         uint64_t child_ptr = load_slot<THREADED>(child_slot);
         if constexpr (THREADED) {
             if (child_ptr & WRITE_BIT) {
                 result.hit_write = true;
                 return result;
             }
+            result.traversal_path.push_back(child_slot);
         }
         uint64_t clean_ptr = child_ptr & PTR_MASK;
         
@@ -161,25 +134,24 @@ private:
             if (depth == FIXED_LEN - 1 && key.size() == 1) {
                 dataptr_t* dp = reinterpret_cast<dataptr_t*>(child_slot);
                 if (!dp->has_data()) return result;
-                return remove_leaf_data(builder, node, parent_slot, parent_slot_value, c, result);
+                return remove_leaf_data(builder, node, parent_slot, c, result);
             }
         }
         
         // Recurse into child
         slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
         result_t child_result;
-        child_result.root_slot = result.root_slot;  // Propagate root_slot
-        remove_from_node(builder, child, child_slot, child_ptr, key.substr(1), depth + 1, child_result);
+        if constexpr (THREADED) {
+            // Copy traversal path to child for propagation back
+            child_result.traversal_path = result.traversal_path;
+        }
+        remove_from_node(builder, child, child_slot, key.substr(1), depth + 1, child_result);
         
-        if (!child_result.found || child_result.hit_write || child_result.hit_read) {
+        if (!child_result.found || child_result.hit_write) {
             result.found = child_result.found;
             result.hit_write = child_result.hit_write;
-            result.hit_read = child_result.hit_read;
-            // Propagate read locks for cleanup on abort
             if constexpr (THREADED) {
-                for (auto* s : child_result.read_locked_slots) {
-                    result.read_locked_slots.push_back(s);
-                }
+                result.traversal_path = std::move(child_result.traversal_path);
             }
             return result;
         }
@@ -187,26 +159,19 @@ private:
         // Child operation succeeded
         if (child_result.subtree_deleted) {
             // Child subtree should be removed - rebuild this node without that child
-            // Propagate read locks
             if constexpr (THREADED) {
-                for (auto* s : child_result.read_locked_slots) {
-                    result.read_locked_slots.push_back(s);
-                }
+                result.traversal_path = std::move(child_result.traversal_path);
             }
-            return remove_child(builder, node, parent_slot, parent_slot_value, c, child_result, result);
+            return remove_child(builder, node, parent_slot, c, child_result, result);
         } else {
             // Child was modified - just propagate the result up
-            // The target_slot is already set to child_slot by the child
             result.found = true;
             result.new_subtree = child_result.new_subtree;
             result.target_slot = child_result.target_slot;
-            result.expected_ptr = child_result.expected_ptr;
             for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
             for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
             if constexpr (THREADED) {
-                for (auto* s : child_result.read_locked_slots) {
-                    result.read_locked_slots.push_back(s);
-                }
+                result.traversal_path = std::move(child_result.traversal_path);
             }
             return result;
         }
@@ -216,13 +181,8 @@ private:
      * Remove EOS from node
      */
     static result_t& remove_eos(node_builder_t& builder, slot_type* node,
-                                 slot_type* parent_slot, uint64_t parent_slot_value,
+                                 slot_type* parent_slot,
                                  result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         result.found = true;
         uint64_t flags = view.flags();
@@ -234,7 +194,6 @@ private:
         if (!(flags & FLAG_SKIP_EOS) && !has_children) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
-            result.expected_ptr = parent_slot_value;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -243,7 +202,6 @@ private:
         if ((flags & FLAG_SKIP) && !(flags & FLAG_SKIP_EOS) && !has_children) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
-            result.expected_ptr = parent_slot_value;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -259,8 +217,6 @@ private:
         slot_type* new_node;
         
         if (has_children) {
-            // 3 flag bits + is_list = 16 combos
-            // Valid: must have EOS, SKIP_EOS requires SKIP
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
@@ -281,10 +237,8 @@ private:
                 case mk_flag_switch(FLAG_EOS, MASK, false):
                     new_node = builder.build_pop(bmp, children);
                     break;
-                // Invalid: EOS | SKIP_EOS without SKIP
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
-                // Invalid: no EOS (shouldn't call remove_eos)
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                 case mk_flag_switch(FLAG_SKIP, MASK, true):
@@ -305,7 +259,6 @@ private:
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
@@ -315,13 +268,8 @@ private:
      * Remove skip_eos from node
      */
     static result_t& remove_skip_eos(node_builder_t& builder, slot_type* node,
-                                      slot_type* parent_slot, uint64_t parent_slot_value,
+                                      slot_type* parent_slot,
                                       result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         result.found = true;
         uint64_t flags = view.flags();
@@ -333,7 +281,6 @@ private:
         if (!(flags & FLAG_EOS) && !has_children) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
-            result.expected_ptr = parent_slot_value;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -347,12 +294,9 @@ private:
         slot_type* new_node;
         
         if (has_children) {
-            // 3 flag bits + is_list = 16 combos
-            // Valid: must have SKIP_EOS (which requires SKIP)
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
-                    // Keep the skip - children hang off the end of it
                     new_node = builder.build_eos_skip_list(std::move(eos_val), skip, lst, children);
                     break;
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
@@ -364,7 +308,6 @@ private:
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, false):
                     new_node = builder.build_skip_pop(skip, bmp, children);
                     break;
-                // Invalid: no SKIP_EOS (shouldn't call remove_skip_eos)
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, false):
                 case mk_flag_switch(FLAG_EOS, MASK, true):
@@ -373,7 +316,6 @@ private:
                 case mk_flag_switch(FLAG_SKIP, MASK, false):
                 case mk_flag_switch(0, MASK, true):
                 case mk_flag_switch(0, MASK, false):
-                // Invalid flag combos (SKIP_EOS without SKIP)
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, false):
                 case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
@@ -383,14 +325,13 @@ private:
                     __builtin_unreachable();
             }
         } else {
-            // No children - if has EOS, skip is pointless; if no EOS, handled by early return
+            // No children - if has EOS, skip is pointless
             new_node = builder.build_eos(std::move(eos_val));
         }
         
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
@@ -400,20 +341,10 @@ private:
      * Remove child from node (child subtree was deleted)
      */
     static result_t& remove_child(node_builder_t& builder, slot_type* node,
-                                   slot_type* parent_slot, uint64_t parent_slot_value,
+                                   slot_type* parent_slot,
                                    unsigned char c, result_t& child_result, result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
         for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
-        if constexpr (THREADED) {
-            for (auto* s : child_result.read_locked_slots) {
-                result.read_locked_slots.push_back(s);
-            }
-        }
         result.found = true;
         
         node_view_t view(node);
@@ -432,7 +363,6 @@ private:
         if (children.empty() && !has_eos && !has_skip_eos) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
-            result.expected_ptr = parent_slot_value;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -443,7 +373,6 @@ private:
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         try_collapse(builder, result);
         return result;
@@ -453,13 +382,8 @@ private:
      * Remove leaf data (FIXED_LEN non-threaded only)
      */
     static result_t& remove_leaf_data(node_builder_t& builder, slot_type* node,
-                                       slot_type* parent_slot, uint64_t parent_slot_value,
+                                       slot_type* parent_slot,
                                        unsigned char c, result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         result.found = true;
         node_view_t view(node);
         auto children = base::extract_children(view);
@@ -477,7 +401,6 @@ private:
         if (children.empty()) {
             result.subtree_deleted = true;
             result.target_slot = parent_slot;
-            result.expected_ptr = parent_slot_value;
             result.old_nodes.push_back(node);
             return result;
         }
@@ -487,7 +410,6 @@ private:
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
@@ -525,7 +447,6 @@ private:
         
         slot_type* collapsed;
         if (children.empty()) {
-            // 2 flag bits = 4 combos, all valid
             switch (mk_flag_switch(child_flags, MASK)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK):
                     collapsed = builder.build_eos_skip_eos(std::move(eos_val), new_skip, std::move(skip_eos_val));
@@ -540,7 +461,6 @@ private:
                     return;  // Can't collapse empty node
             }
         } else {
-            // 2 flag bits + is_list = 8 combos, all valid
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(child_flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP_EOS, MASK, true):

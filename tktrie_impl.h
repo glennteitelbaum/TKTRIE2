@@ -254,7 +254,7 @@ public:
         if constexpr (THREADED) {
             while (true) {
                 uint64_t root_val = get_root_slot_value();
-                if (root_val & (WRITE_BIT | READ_BIT)) {
+                if (root_val & WRITE_BIT) {
                     cpu_pause();
                     continue;
                 }
@@ -282,7 +282,7 @@ public:
         if constexpr (THREADED) {
             while (true) {
                 uint64_t root_val = get_root_slot_value();
-                if (root_val & (WRITE_BIT | READ_BIT)) {
+                if (root_val & WRITE_BIT) {
                     cpu_pause();
                     continue;
                 }
@@ -348,7 +348,7 @@ public:
         if constexpr (THREADED) {
             while (true) {
                 uint64_t root_val = get_root_slot_value();
-                if (root_val & (WRITE_BIT | READ_BIT)) {
+                if (root_val & WRITE_BIT) {
                     cpu_pause();
                     continue;
                 }
@@ -540,20 +540,18 @@ private:
         unneeded.reserve(16);
 
         while (true) {
-            // Step 1: OUTSIDE LOCK - build optimistically with READ_BIT protection
+            // Step 1: OUTSIDE LOCK - traverse checking WRITE_BIT, build optimistically
             auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), key_bytes,
                                                        std::forward<U>(value));
             
-            if (result.hit_write || result.hit_read) {
+            if (result.hit_write) {
                 for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                result.clear_read_locks();
                 cpu_pause();
                 continue;
             }
 
             if (result.already_exists) {
                 for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                result.clear_read_locks();
                 return {find(key), false};
             }
 
@@ -561,43 +559,25 @@ private:
             {
                 std::lock_guard<mutex_type> lock(write_mutex_);
 
-                // Step 2: INSIDE LOCK - verify target_slot pointer unchanged
-                // We ignore READ_BIT since we set it; check only WRITE_BIT and pointer
-                if (result.target_slot) {
-                    uint64_t current = load_slot<THREADED>(result.target_slot);
-                    if ((current & PTR_MASK) != result.expected_ptr || (current & WRITE_BIT)) {
-                        for (auto* n : result.new_nodes) unneeded.push_back(n);
-                        need_retry = true;
-                    }
-                } else {
-                    uint64_t current = get_root_slot_value();
-                    if ((current & PTR_MASK) != result.expected_ptr || (current & WRITE_BIT)) {
-                        for (auto* n : result.new_nodes) unneeded.push_back(n);
-                        need_retry = true;
-                    }
+                // Step 2: INSIDE LOCK - re-verify path for WRITE_BIT
+                if (result.path_has_write_bit()) {
+                    for (auto* n : result.new_nodes) unneeded.push_back(n);
+                    need_retry = true;
                 }
 
                 if (!need_retry) {
-                    // Step 3: Commit - set WRITE_BIT and update slot
-                    uint64_t new_ptr = reinterpret_cast<uint64_t>(result.new_subtree);
+                    // Step 3: Commit - store (new_ptr | WRITE_BIT)
+                    uint64_t new_ptr = reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT;
                     
                     if (result.target_slot) {
-                        // Set WRITE_BIT on target slot (may already have our READ_BIT)
-                        fetch_or_slot<THREADED>(result.target_slot, WRITE_BIT);
-                        // Update slot with new subtree (clears both READ_BIT and WRITE_BIT)
                         store_slot<THREADED>(result.target_slot, new_ptr);
                     } else {
-                        // Update root
-                        set_root(result.new_subtree);
+                        store_slot<THREADED>(&root_slot_, new_ptr);
                     }
 
                     elem_count_.fetch_add(1, std::memory_order_relaxed);
                 }
             }  // UNLOCK
-
-            // Clear READ_BITs we set on slots (target_slot was updated so already cleared)
-            // Do this before deleting unneeded nodes in case slot is inside one
-            result.clear_read_locks();
 
             // Delete unneeded (never visible, safe)
             for (auto* n : unneeded) {
@@ -610,9 +590,16 @@ private:
                 continue;
             }
 
-            // Delete old nodes - safe because WRITE_BIT was set before slot update
+            // Delete old nodes - safe because WRITE_BIT blocks readers
             for (auto* n : result.old_nodes) {
                 builder_.deallocate_node(n);
+            }
+
+            // Step 4: Clear WRITE_BIT after frees complete
+            if (result.target_slot) {
+                fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
+            } else {
+                fetch_and_slot<THREADED>(&root_slot_, ~WRITE_BIT);
             }
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
@@ -685,19 +672,17 @@ private:
         unneeded.reserve(16);
 
         while (true) {
-            // Step 1: OUTSIDE LOCK - build optimistically with READ_BIT protection
+            // Step 1: OUTSIDE LOCK - traverse checking WRITE_BIT, build optimistically
             auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), key_bytes);
             
-            if (result.hit_write || result.hit_read) {
+            if (result.hit_write) {
                 for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                result.clear_read_locks();
                 cpu_pause();
                 continue;
             }
 
             if (!result.found) {
                 for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                result.clear_read_locks();
                 return false;
             }
 
@@ -705,46 +690,26 @@ private:
             {
                 std::lock_guard<mutex_type> lock(write_mutex_);
 
-                // Step 2: INSIDE LOCK - verify target_slot pointer unchanged
-                // We ignore READ_BIT since we set it; check only WRITE_BIT and pointer
-                if (result.target_slot) {
-                    uint64_t current = load_slot<THREADED>(result.target_slot);
-                    if ((current & PTR_MASK) != result.expected_ptr || (current & WRITE_BIT)) {
-                        for (auto* n : result.new_nodes) unneeded.push_back(n);
-                        need_retry = true;
-                    }
-                } else {
-                    uint64_t current = get_root_slot_value();
-                    if ((current & PTR_MASK) != result.expected_ptr || (current & WRITE_BIT)) {
-                        for (auto* n : result.new_nodes) unneeded.push_back(n);
-                        need_retry = true;
-                    }
+                // Step 2: INSIDE LOCK - re-verify path for WRITE_BIT
+                if (result.path_has_write_bit()) {
+                    for (auto* n : result.new_nodes) unneeded.push_back(n);
+                    need_retry = true;
                 }
 
                 if (!need_retry) {
-                    // Step 3: Commit - set WRITE_BIT and update slot
+                    // Step 3: Commit - store (new_ptr | WRITE_BIT) or (0 | WRITE_BIT) for deletion
+                    uint64_t new_ptr = result.subtree_deleted ? WRITE_BIT 
+                                     : (reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT);
+                    
                     if (result.target_slot) {
-                        fetch_or_slot<THREADED>(result.target_slot, WRITE_BIT);
-                        if (result.subtree_deleted) {
-                            store_slot<THREADED>(result.target_slot, 0);
-                        } else {
-                            store_slot<THREADED>(result.target_slot, 
-                                                 reinterpret_cast<uint64_t>(result.new_subtree));
-                        }
+                        store_slot<THREADED>(result.target_slot, new_ptr);
                     } else {
-                        if (result.subtree_deleted) {
-                            set_root(nullptr);
-                        } else {
-                            set_root(result.new_subtree);
-                        }
+                        store_slot<THREADED>(&root_slot_, new_ptr);
                     }
 
                     elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 }
             }  // UNLOCK
-
-            // Clear READ_BITs we set on slots (target_slot was updated so already cleared)
-            result.clear_read_locks();
 
             // Delete unneeded (never visible, safe)
             for (auto* n : unneeded) {
@@ -757,9 +722,16 @@ private:
                 continue;
             }
 
-            // Delete old nodes - safe because WRITE_BIT was set
+            // Delete old nodes - safe because WRITE_BIT blocks readers
             for (auto* n : result.old_nodes) {
                 builder_.deallocate_node(n);
+            }
+
+            // Step 4: Clear WRITE_BIT after frees complete
+            if (result.target_slot) {
+                fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
+            } else {
+                fetch_and_slot<THREADED>(&root_slot_, ~WRITE_BIT);
             }
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());

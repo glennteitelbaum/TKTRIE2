@@ -12,80 +12,56 @@ namespace gteitelbaum {
 /**
  * Insert operation results
  * 
- * Atomic slot update approach:
- * - new_subtree: the newly built node/subtree to install
- * - target_slot: the single slot to atomically update (null = update root)
- * - expected_ptr: expected current value in target_slot for verification
- * - old_nodes: only the nodes being replaced (NOT ancestors - they stay in place)
- * - read_locked_slots: slots where we set READ_BIT (THREADED only) - only on modified nodes
+ * THREADED writer protocol:
+ * 1. Traverse, check WRITE_BIT on each slot, record path
+ * 2. Build new subtree optimistically
+ * 3. LOCK mutex
+ * 4. Re-verify path for WRITE_BIT (any set = abort)
+ * 5. Store (new_ptr | WRITE_BIT) to target_slot
+ * 6. UNLOCK
+ * 7. Free old nodes
+ * 8. Clear WRITE_BIT on target_slot
  */
 template <bool THREADED>
 struct insert_result {
     slot_type_t<THREADED>* new_subtree = nullptr;   // What to install
-    slot_type_t<THREADED>* target_slot = nullptr;   // Where to install (null = root)
-    slot_type_t<THREADED>* root_slot = nullptr;     // Root slot for READ_BIT when parent_slot is null
-    uint64_t expected_ptr = 0;                       // Expected value in target_slot
+    slot_type_t<THREADED>* target_slot = nullptr;   // Where to install
+    std::vector<slot_type_t<THREADED>*> traversal_path;  // Slots traversed (for re-verify)
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;   // Only replaced nodes, not ancestors
-    std::vector<slot_type_t<THREADED>*> read_locked_slots;  // Slots with READ_BIT set
     bool already_exists = false;
     bool hit_write = false;
-    bool hit_read = false;
     
     insert_result() {
         new_nodes.reserve(16);
         old_nodes.reserve(16);
         if constexpr (THREADED) {
-            read_locked_slots.reserve(4);
+            traversal_path.reserve(32);
         }
     }
     
-    // Clear READ_BITs we set (call after commit or on abort)
-    void clear_read_locks() noexcept {
+    // Check if any slot in path has WRITE_BIT set
+    bool path_has_write_bit() const noexcept {
         if constexpr (THREADED) {
-            for (auto* slot : read_locked_slots) {
-                fetch_and_slot<THREADED>(slot, ~READ_BIT);
+            for (auto* slot : traversal_path) {
+                if (load_slot<THREADED>(slot) & WRITE_BIT) {
+                    return true;
+                }
             }
-            read_locked_slots.clear();
         }
-    }
-    
-    // Try to acquire READ_BIT on the slot pointing to the node we're modifying
-    // Returns false if WRITE_BIT or READ_BIT already set (caller should abort)
-    bool try_acquire_modification_lock(slot_type_t<THREADED>* parent_slot) noexcept {
-        if constexpr (THREADED) {
-            slot_type_t<THREADED>* slot = parent_slot ? parent_slot : root_slot;
-            if (!slot) return true;  // No slot to lock (shouldn't happen)
-            
-            uint64_t old_val = fetch_or_slot<THREADED>(slot, READ_BIT);
-            if (old_val & WRITE_BIT) {
-                fetch_and_slot<THREADED>(slot, ~READ_BIT);
-                hit_write = true;
-                return false;
-            }
-            if (old_val & READ_BIT) {
-                fetch_and_slot<THREADED>(slot, ~READ_BIT);
-                hit_read = true;
-                return false;
-            }
-            read_locked_slots.push_back(slot);
-            return true;
-        } else {
-            return true;
-        }
+        return false;
     }
 };
 
 /**
  * Insert helper functions - atomic slot update approach
  * 
- * Key insight: We only replace the node where modification happens.
- * Ancestor nodes stay in place - we just atomically update their child slot.
- * 
  * THREADED writer protocol:
- * - Set READ_BIT on each slot we traverse through
- * - If we see READ_BIT or WRITE_BIT already set, abort (another writer is here)
- * - After commit, clear READ_BITs we set (except target_slot which is updated)
+ * 1. Traverse, check WRITE_BIT on each slot, record in traversal_path
+ * 2. Build new subtree optimistically
+ * 3. LOCK mutex
+ * 4. Re-verify traversal_path for WRITE_BIT
+ * 5. Store (new_ptr | WRITE_BIT), UNLOCK, free, clear WRITE_BIT
  */
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
@@ -98,12 +74,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
     /**
      * Build insert operation
-     * @param builder Node builder
-     * @param root_slot Pointer to root slot (for READ_BIT protection when modifying root)
-     * @param root Current root node
-     * @param key Key to insert
-     * @param value Value to insert
-     * @return Result with new_subtree and target_slot to update
      */
     template <typename U>
     static result_t build_insert_path(node_builder_t& builder,
@@ -113,42 +83,39 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                        U&& value,
                                        size_t depth = 0) {
         result_t result;
-        result.root_slot = root_slot;  // Store for modification locking
         
         if (!root) {
-            // Empty trie - create new root (no node to lock, root_slot is null->new)
+            // Empty trie - create new root
             if (key.empty()) {
                 result.new_subtree = builder.build_eos(std::forward<U>(value));
             } else {
                 result.new_subtree = builder.build_skip_eos(key, std::forward<U>(value));
             }
             result.new_nodes.push_back(result.new_subtree);
-            result.target_slot = nullptr;  // Update root
-            result.expected_ptr = 0;       // Root was null
+            result.target_slot = root_slot;
             return result;
         }
         
-        // Non-empty trie: target_slot = null means update root, expected_ptr = root
-        result.expected_ptr = reinterpret_cast<uint64_t>(root);
-        return insert_into_node(builder, root, nullptr, result.expected_ptr,
-                                key, std::forward<U>(value), depth, result);
+        // Record root_slot in traversal path and check WRITE_BIT
+        if constexpr (THREADED) {
+            result.traversal_path.push_back(root_slot);
+            uint64_t val = load_slot<THREADED>(root_slot);
+            if (val & WRITE_BIT) {
+                result.hit_write = true;
+                return result;
+            }
+        }
+        
+        return insert_into_node(builder, root, root_slot, key, std::forward<U>(value), depth, result);
     }
 
     /**
      * Insert into a node
-     * @param node Current node
-     * @param parent_slot Slot pointing to this node (null = root slot)
-     * @param parent_slot_value Current value in parent_slot
-     * @param key Remaining key
-     * @param value Value to insert
-     * @param depth Current depth
-     * @param result Output result
      */
     template <typename U>
     static result_t& insert_into_node(node_builder_t& builder,
                                        slot_type* node,
                                        slot_type* parent_slot,
-                                       uint64_t parent_slot_value,
                                        std::string_view key,
                                        U&& value,
                                        size_t depth,
@@ -161,40 +128,32 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             size_t match = base::match_skip(skip, key);
             
             if (match < skip.size() && match < key.size()) {
-                // Key diverges within skip - split this node
-                return split_skip_diverge(builder, node, parent_slot, parent_slot_value,
+                return split_skip_diverge(builder, node, parent_slot,
                                           key, std::forward<U>(value), depth, match, result);
             } else if (match < skip.size()) {
-                // Key is prefix of skip - split this node
-                return split_skip_prefix(builder, node, parent_slot, parent_slot_value,
+                return split_skip_prefix(builder, node, parent_slot,
                                          key, std::forward<U>(value), depth, match, result);
             } else {
-                // Skip fully matched
                 key.remove_prefix(match);
                 depth += match;
                 
                 if (key.empty()) {
-                    // Key ends at skip_eos position
                     if (view.has_skip_eos()) {
                         result.already_exists = true;
                         return result;
                     }
-                    // Add skip_eos - rebuild this node
-                    return add_skip_eos(builder, node, parent_slot, parent_slot_value,
+                    return add_skip_eos(builder, node, parent_slot,
                                         std::forward<U>(value), result);
                 }
             }
         }
         
-        // Key continues past skip (or no skip)
         if (key.empty()) {
-            // Key ends at this node
             if (view.has_eos()) {
                 result.already_exists = true;
                 return result;
             }
-            // Add EOS - rebuild this node
-            return add_eos(builder, node, parent_slot, parent_slot_value,
+            return add_eos(builder, node, parent_slot,
                            std::forward<U>(value), result);
         }
         
@@ -203,15 +162,15 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* child_slot = view.find_child(c);
         
         if (child_slot) {
-            // Child exists - check for WRITE_BIT before following
+            // Child exists - check WRITE_BIT and record in path
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
             
             if constexpr (THREADED) {
-                // Only check WRITE_BIT during traversal (another writer committed)
                 if (child_ptr & WRITE_BIT) {
                     result.hit_write = true;
                     return result;
                 }
+                result.traversal_path.push_back(child_slot);
             }
             
             uint64_t clean_ptr = child_ptr & PTR_MASK;
@@ -224,26 +183,22 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                         result.already_exists = true;
                         return result;
                     }
-                    // Set data in existing slot - rebuild parent node
-                    return set_leaf_data(builder, node, parent_slot, parent_slot_value,
+                    return set_leaf_data(builder, node, parent_slot,
                                          c, std::forward<U>(value), depth, result);
                 }
             }
             
-            // Recurse into child
-            // Pass child_slot as the parent_slot for the child
             slot_type* child = reinterpret_cast<slot_type*>(clean_ptr);
-            return insert_into_node(builder, child, child_slot, child_ptr,
+            return insert_into_node(builder, child, child_slot,
                                     key.substr(1), std::forward<U>(value), depth + 1, result);
         } else {
-            // No child exists - add new child (requires rebuilding this node)
-            return add_child(builder, node, parent_slot, parent_slot_value,
+            return add_child(builder, node, parent_slot,
                              c, key.substr(1), std::forward<U>(value), depth, result);
         }
     }
 
     // =========================================================================
-    // Node modification operations - all rebuild the current node only
+    // Node modification operations
     // =========================================================================
 
     /**
@@ -253,17 +208,11 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& split_skip_diverge(node_builder_t& builder,
                                          slot_type* node,
                                          slot_type* parent_slot,
-                                         uint64_t parent_slot_value,
                                          std::string_view key,
                                          U&& value,
                                          size_t depth,
                                          size_t match,
                                          result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         std::string_view skip = view.skip_chars();
         
@@ -316,7 +265,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 result.new_nodes.push_back(branch);
                 result.new_subtree = branch;
                 result.target_slot = parent_slot;
-                result.expected_ptr = parent_slot_value;
                 result.old_nodes.push_back(node);
                 return result;
             }
@@ -369,7 +317,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         
         result.new_subtree = branch;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
@@ -381,17 +328,11 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& split_skip_prefix(node_builder_t& builder,
                                         slot_type* node,
                                         slot_type* parent_slot,
-                                        uint64_t parent_slot_value,
                                         std::string_view /*key*/,
                                         U&& value,
                                         size_t /*depth*/,
                                         size_t match,
                                         result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         std::string_view skip = view.skip_chars();
         
@@ -422,7 +363,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
@@ -450,7 +390,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         bool has_children = !children.empty();
         
         if (!has_children) {
-            // 2 bools = 4 cases, all valid
             switch (mk_switch(has_new_skip, has_eos)) {
                 case mk_switch(true, true):
                     return builder.build_skip_eos(new_skip, std::move(eos_val));
@@ -463,7 +402,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             __builtin_unreachable();
         }
         
-        // 3 bools = 8 cases, all valid
         auto [is_list, lst, bmp] = base::build_child_structure(chars);
         switch (mk_switch(has_new_skip, has_eos, is_list)) {
             case mk_switch(true, true, true):
@@ -493,14 +431,8 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& add_eos(node_builder_t& builder,
                               slot_type* node,
                               slot_type* parent_slot,
-                              uint64_t parent_slot_value,
                               U&& value,
                               result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         uint64_t flags = view.flags();
         constexpr uint64_t MASK = FLAG_SKIP | FLAG_SKIP_EOS;
@@ -515,7 +447,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* new_node;
         
         if (children.empty()) {
-            // 2 flag bits = 4 combos, but SKIP_EOS requires SKIP
             switch (mk_flag_switch(flags, MASK)) {
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK):
                     new_node = builder.build_eos_skip_eos(std::forward<U>(value), skip, std::move(skip_eos_val));
@@ -526,14 +457,12 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(0, MASK):
                     new_node = builder.build_eos(std::forward<U>(value));
                     break;
-                // Invalid: SKIP_EOS without SKIP
                 case mk_flag_switch(FLAG_SKIP_EOS, MASK):
                 default:
                     KTRIE_DEBUG_ASSERT(false && "Invalid flag combination");
                     __builtin_unreachable();
             }
         } else {
-            // 2 flag bits + is_list = 8 combos, but SKIP_EOS requires SKIP
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_SKIP | FLAG_SKIP_EOS, MASK, true):
@@ -554,7 +483,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(0, MASK, false):
                     new_node = builder.build_eos_pop(std::forward<U>(value), bmp, children);
                     break;
-                // Invalid: SKIP_EOS without SKIP
                 case mk_flag_switch(FLAG_SKIP_EOS, MASK, true):
                 case mk_flag_switch(FLAG_SKIP_EOS, MASK, false):
                 default:
@@ -566,7 +494,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
@@ -578,14 +505,8 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& add_skip_eos(node_builder_t& builder,
                                    slot_type* node,
                                    slot_type* parent_slot,
-                                   uint64_t parent_slot_value,
                                    U&& value,
                                    result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         uint64_t flags = view.flags();
         constexpr uint64_t MASK = FLAG_EOS | FLAG_SKIP;
@@ -600,7 +521,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         slot_type* new_node;
         
         if (children.empty()) {
-            // 2 flag bits = 4 combos, but must have SKIP (we're adding SKIP_EOS)
             switch (mk_flag_switch(flags, MASK)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK):
                     new_node = builder.build_eos_skip_eos(std::move(eos_val), skip, std::forward<U>(value));
@@ -608,7 +528,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(FLAG_SKIP, MASK):
                     new_node = builder.build_skip_eos(skip, std::forward<U>(value));
                     break;
-                // Invalid: can't add skip_eos to node without skip
                 case mk_flag_switch(FLAG_EOS, MASK):
                 case mk_flag_switch(0, MASK):
                 default:
@@ -616,7 +535,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     __builtin_unreachable();
             }
         } else {
-            // 2 flag bits + is_list = 8 combos, but must have SKIP
             auto [is_list, lst, bmp] = base::build_child_structure(chars);
             switch (mk_flag_switch(flags, MASK, is_list)) {
                 case mk_flag_switch(FLAG_EOS | FLAG_SKIP, MASK, true):
@@ -631,7 +549,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 case mk_flag_switch(FLAG_SKIP, MASK, false):
                     new_node = builder.build_skip_eos_pop(skip, std::forward<U>(value), bmp, children);
                     break;
-                // Invalid: can't add skip_eos to node without skip
                 case mk_flag_switch(FLAG_EOS, MASK, true):
                 case mk_flag_switch(FLAG_EOS, MASK, false):
                 case mk_flag_switch(0, MASK, true):
@@ -645,7 +562,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
@@ -657,22 +573,15 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& add_child(node_builder_t& builder,
                                 slot_type* node,
                                 slot_type* parent_slot,
-                                uint64_t parent_slot_value,
                                 unsigned char c,
                                 std::string_view rest,
                                 U&& value,
                                 size_t depth,
                                 result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
         
-        // Determine child structure
         bool is_list;
         small_list lst;
         popcount_bitmap bmp;
@@ -709,7 +618,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 result.new_nodes.push_back(new_parent);
                 result.new_subtree = new_parent;
                 result.target_slot = parent_slot;
-                result.expected_ptr = parent_slot_value;
                 result.old_nodes.push_back(node);
                 return result;
             }
@@ -727,13 +635,11 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         children.insert(children.begin() + pos, reinterpret_cast<uint64_t>(child));
         chars.insert(chars.begin() + pos, c);
         
-        // Rebuild parent with new child
         slot_type* new_parent = base::rebuild_node(builder, view, is_list, lst, bmp, children);
         result.new_nodes.push_back(new_parent);
         
         result.new_subtree = new_parent;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }
@@ -745,16 +651,10 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& set_leaf_data(node_builder_t& builder,
                                     slot_type* node,
                                     slot_type* parent_slot,
-                                    uint64_t parent_slot_value,
                                     unsigned char c,
                                     U&& value,
                                     size_t /*depth*/,
                                     result_t& result) {
-        // Acquire READ_BIT on slot pointing to node we're modifying
-        if (!result.try_acquire_modification_lock(parent_slot)) {
-            return result;
-        }
-        
         node_view_t view(node);
         auto children = base::extract_children(view);
         auto chars = base::get_child_chars(view);
@@ -771,7 +671,6 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.target_slot = parent_slot;
-        result.expected_ptr = parent_slot_value;
         result.old_nodes.push_back(node);
         return result;
     }

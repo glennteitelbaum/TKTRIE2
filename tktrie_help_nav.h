@@ -13,7 +13,7 @@ namespace gteitelbaum {
  * Navigation helper functions (READER operations)
  * 
  * Reader protocol for THREADED mode:
- * - Child pointers: if WRITE_BIT or READ_BIT set → restart from root
+ * - Child pointers: if WRITE_BIT set → restart from root
  *   Then double-check slot unchanged after loading pointer
  * - Data pointers: handled by dataptr::try_read (spin on READ_BIT, CAS to set, copy, clear)
  */
@@ -26,14 +26,14 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
     /**
      * Safely load child pointer with double-check
-     * Returns nullptr and sets hit_write if WRITE_BIT/READ_BIT seen or slot changed
+     * Returns nullptr and sets hit_write if WRITE_BIT seen or slot changed
      */
     static slot_type* safe_load_child(slot_type* child_slot, bool& hit_write) noexcept {
         if constexpr (THREADED) {
             uint64_t val = load_slot<THREADED>(child_slot);
             
-            // Check for control bits
-            if (val & (WRITE_BIT | READ_BIT)) {
+            // Check for WRITE_BIT (writer is modifying)
+            if (val & WRITE_BIT) {
                 hit_write = true;
                 return nullptr;
             }
@@ -56,7 +56,7 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
     /**
      * Find node for exact key match
-     * Sets hit_write if WRITE_BIT/READ_BIT encountered (caller should retry)
+     * Sets hit_write if WRITE_BIT encountered (caller should retry)
      * Returns pointer to data slot, or nullptr if not found
      */
     static slot_type* find_data_slot(slot_type* root, std::string_view key, 
