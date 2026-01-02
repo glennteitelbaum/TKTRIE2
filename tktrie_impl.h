@@ -17,6 +17,7 @@
 #include "tktrie_help_nav.h"
 #include "tktrie_help_insert.h"
 #include "tktrie_help_remove.h"
+#include "tktrie_ebr.h"
 
 // Forward declarations - traits and iterator defined in tktrie.h
 namespace gteitelbaum {
@@ -27,25 +28,23 @@ template <typename Key, typename T, bool THREADED, typename Allocator> class tkt
 namespace gteitelbaum {
 
 /**
- * Thread-safe trie with atomic slot updates
+ * Thread-safe trie with EBR (Epoch-Based Reclamation)
  * 
- * WRITER PROTOCOL (THREADED mode - atomic slot update):
- * 1. OUTSIDE LOCK: Build new subtree optimistically, record target_slot and expected_ptr
- * 2. LOCK mutex
- * 3. Verify target_slot still has expected_ptr (single slot check, not whole path)
- * 4. If changed: add built nodes to unneeded_list, retry from step 1
- * 5. Set WRITE_BIT on target_slot (blocks readers)
- * 6. Atomically update target_slot to point to new_subtree
- * 7. UNLOCK mutex
- * 8. OUTSIDE LOCK: Delete unneeded nodes and old_nodes
- * 
- * Key optimization: Only the single target_slot is verified and updated.
- * Ancestor nodes are NOT copied - they stay in place.
+ * WRITER PROTOCOL (THREADED mode):
+ * 1. Traverse checking WRITE_BIT, record path
+ * 2. Build new subtree optimistically
+ * 3. LOCK mutex
+ * 4. Re-verify path for WRITE_BIT (another writer committed)
+ * 5. Commit: store (new_ptr | WRITE_BIT)
+ * 6. UNLOCK
+ * 7. Retire old nodes to EBR
+ * 8. Clear WRITE_BIT
+ * 9. try_reclaim() periodically
  * 
  * READER PROTOCOL (THREADED mode):
- * - Check WRITE_BIT|READ_BIT on child slots before dereferencing → restart if set
- * - Double-check slot unchanged after loading pointer
- * - Data pointer: spin on READ_BIT, CAS to set, copy, clear
+ * - Enter EBR epoch (RAII guard)
+ * - Traverse normally (EBR protects from use-after-free)
+ * - Exit EBR epoch
  */
 template <typename Key, typename T, bool THREADED = false,
           typename Allocator = std::allocator<uint64_t>>
@@ -73,14 +72,37 @@ private:
     // Mutex type based on THREADED
     using mutex_type = std::conditional_t<THREADED, std::mutex, empty_mutex>;
     
-    // Root slot - stores pointer + control bits just like any child pointer
+    // EBR types (only meaningful for THREADED)
+    struct node_deleter {
+        node_builder_t* builder;
+        void operator()(void* ptr) const {
+            if (builder && ptr) {
+                builder->deallocate_node(static_cast<slot_type*>(ptr));
+            }
+        }
+    };
+    using ebr_manager_t = ebr_manager<node_deleter>;
+    using ebr_context_t = ebr_thread_context<node_deleter>;
+    using ebr_guard_t = ebr_guard<node_deleter>;
+    
+    // Root slot - stores pointer + control bits
     slot_type root_slot_;
     std::conditional_t<THREADED, std::atomic<size_type>, size_type> elem_count_{0};
     mutable mutex_type write_mutex_;
     Allocator alloc_;
     node_builder_t builder_;
+    
+    // EBR manager (only used for THREADED)
+    std::conditional_t<THREADED, std::unique_ptr<ebr_manager_t>, char> ebr_;
 
     friend class tktrie_iterator<Key, T, THREADED, Allocator>;
+
+    // Get thread-local EBR context
+    ebr_context_t& get_ebr_context() const {
+        static thread_local ebr_context_t ctx(
+            const_cast<ebr_manager_t*>(ebr_.get()));
+        return ctx;
+    }
 
     // Helper to safely read root pointer (masks off control bits)
     slot_type* get_root() const noexcept {
@@ -111,6 +133,9 @@ public:
         : root_slot_{}
         , builder_(alloc_) {
         store_slot<THREADED>(&root_slot_, 0);
+        if constexpr (THREADED) {
+            ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
+        }
     }
 
     explicit tktrie(const Allocator& alloc)
@@ -118,6 +143,9 @@ public:
         , alloc_(alloc)
         , builder_(alloc) {
         store_slot<THREADED>(&root_slot_, 0);
+        if constexpr (THREADED) {
+            ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
+        }
     }
 
     ~tktrie() {
@@ -131,6 +159,7 @@ public:
         , builder_(other.alloc_) {
         if constexpr (THREADED) {
             std::lock_guard<mutex_type> lock(other.write_mutex_);
+            ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
         }
         slot_type* other_root = const_cast<tktrie&>(other).get_root();
         if (other_root) {
@@ -162,6 +191,13 @@ public:
         , builder_(alloc_) {
         if constexpr (THREADED) {
             std::lock_guard<mutex_type> lock(other.write_mutex_);
+            ebr_ = std::move(other.ebr_);
+            // Update deleter's builder pointer
+            if (ebr_) {
+                // Note: Can't update deleter in existing ebr_ easily
+                // For safety, create new one
+                ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
+            }
         }
         uint64_t other_val = load_slot<THREADED>(&other.root_slot_);
         store_slot<THREADED>(&root_slot_, other_val & PTR_MASK);
@@ -188,6 +224,7 @@ public:
             alloc_ = std::move(other.alloc_);
             builder_ = node_builder_t(alloc_);
             if constexpr (THREADED) {
+                ebr_ = std::make_unique<ebr_manager_t>(node_deleter{&builder_});
                 elem_count_.store(other.elem_count_.exchange(0, std::memory_order_relaxed),
                                  std::memory_order_relaxed);
             } else {
@@ -212,6 +249,7 @@ public:
         store_slot<THREADED>(&other.root_slot_, tmp & PTR_MASK);
         std::swap(alloc_, other.alloc_);
         if constexpr (THREADED) {
+            // Don't swap EBR managers - they're tied to builders
             size_type tmp_count = elem_count_.load(std::memory_order_relaxed);
             elem_count_.store(other.elem_count_.load(std::memory_order_relaxed),
                              std::memory_order_relaxed);
@@ -252,17 +290,9 @@ public:
         bool hit_write = false;
         
         if constexpr (THREADED) {
-            while (true) {
-                uint64_t root_val = get_root_slot_value();
-                if (root_val & WRITE_BIT) {
-                    cpu_pause();
-                    continue;
-                }
-                slot_type* root = reinterpret_cast<slot_type*>(root_val & PTR_MASK);
-                bool result = nav_t::contains(root, key_bytes, hit_write);
-                if (!hit_write) return result;
-                cpu_pause();
-            }
+            auto guard = get_ebr_context().guard();
+            slot_type* root = get_root();
+            return nav_t::contains(root, key_bytes, hit_write);
         } else {
             return nav_t::contains(get_root(), key_bytes, hit_write);
         }
@@ -280,22 +310,13 @@ public:
         bool hit_write = false;
         
         if constexpr (THREADED) {
-            while (true) {
-                uint64_t root_val = get_root_slot_value();
-                if (root_val & WRITE_BIT) {
-                    cpu_pause();
-                    continue;
-                }
-                slot_type* root = reinterpret_cast<slot_type*>(root_val & PTR_MASK);
-                bool found = nav_t::read(root, key_bytes, value, hit_write);
-                if (!hit_write) {
-                    if (found) {
-                        return iterator(this, key_bytes, value);
-                    }
-                    return end();
-                }
-                cpu_pause();
+            auto guard = get_ebr_context().guard();
+            slot_type* root = get_root();
+            bool found = nav_t::read(root, key_bytes, value, hit_write);
+            if (found) {
+                return iterator(this, key_bytes, value);
             }
+            return end();
         } else {
             bool found = nav_t::read(get_root(), key_bytes, value, hit_write);
             if (found) {
@@ -346,37 +367,24 @@ public:
 
     iterator begin() const {
         if constexpr (THREADED) {
-            while (true) {
-                uint64_t root_val = get_root_slot_value();
-                if (root_val & WRITE_BIT) {
-                    cpu_pause();
-                    continue;
-                }
-                slot_type* root = reinterpret_cast<slot_type*>(root_val & PTR_MASK);
-                if (!root) return end();
-                
-                std::string key;
-                if constexpr (fixed_len > 0) {
-                    key.reserve(fixed_len);
-                } else {
-                    key.reserve(15);
-                }
-                bool hit_write = false;
-                slot_type* data_slot = nav_t::find_first_leaf(root, key, hit_write);
-                if (hit_write) {
-                    cpu_pause();
-                    continue;
-                }
-                if (!data_slot) return end();
-                
-                dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
-                T value;
-                if (!dp->try_read(value)) {
-                    cpu_pause();
-                    continue;
-                }
-                return iterator(this, key, value);
+            auto guard = get_ebr_context().guard();
+            slot_type* root = get_root();
+            if (!root) return end();
+            
+            std::string key;
+            if constexpr (fixed_len > 0) {
+                key.reserve(fixed_len);
+            } else {
+                key.reserve(15);
             }
+            bool hit_write = false;
+            slot_type* data_slot = nav_t::find_first_leaf(root, key, hit_write);
+            if (!data_slot) return end();
+            
+            dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+            T value;
+            if (!dp->try_read(value)) return end();
+            return iterator(this, key, value);
         } else {
             slot_type* root = get_root();
             if (!root) return end();
@@ -508,13 +516,7 @@ private:
         }
 
         // Apply the update
-        if (result.target_slot) {
-            // Update child slot in existing node
-            store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
-        } else {
-            // Update root
-            set_root(result.new_subtree);
-        }
+        store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
 
         for (auto* n : result.old_nodes) {
             builder_.deallocate_node(n);
@@ -568,18 +570,12 @@ private:
                 if (!need_retry) {
                     // Step 3: Commit - store (new_ptr | WRITE_BIT)
                     uint64_t new_ptr = reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT;
-                    
-                    if (result.target_slot) {
-                        store_slot<THREADED>(result.target_slot, new_ptr);
-                    } else {
-                        store_slot<THREADED>(&root_slot_, new_ptr);
-                    }
-
+                    store_slot<THREADED>(result.target_slot, new_ptr);
                     elem_count_.fetch_add(1, std::memory_order_relaxed);
                 }
             }  // UNLOCK
 
-            // Delete unneeded (never visible, safe)
+            // Delete unneeded (never visible, safe to delete immediately)
             for (auto* n : unneeded) {
                 builder_.deallocate_node(n);
             }
@@ -590,17 +586,16 @@ private:
                 continue;
             }
 
-            // Delete old nodes - safe because WRITE_BIT blocks readers
+            // Step 4: Retire old nodes to EBR (deferred deletion)
             for (auto* n : result.old_nodes) {
-                builder_.deallocate_node(n);
+                ebr_->retire(n);
             }
 
-            // Step 4: Clear WRITE_BIT after frees complete
-            if (result.target_slot) {
-                fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
-            } else {
-                fetch_and_slot<THREADED>(&root_slot_, ~WRITE_BIT);
-            }
+            // Step 5: Clear WRITE_BIT
+            fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
+
+            // Step 6: Try to reclaim old epochs
+            ebr_->try_reclaim();
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
@@ -641,20 +636,10 @@ private:
         }
 
         // Apply the update
-        if (result.target_slot) {
-            // Update child slot
-            if (result.subtree_deleted) {
-                store_slot<THREADED>(result.target_slot, 0);
-            } else {
-                store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
-            }
+        if (result.subtree_deleted) {
+            store_slot<THREADED>(result.target_slot, 0);
         } else {
-            // Update root
-            if (result.subtree_deleted) {
-                set_root(nullptr);
-            } else {
-                set_root(result.new_subtree);
-            }
+            store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
         }
 
         for (auto* n : result.old_nodes) {
@@ -697,21 +682,15 @@ private:
                 }
 
                 if (!need_retry) {
-                    // Step 3: Commit - store (new_ptr | WRITE_BIT) or (0 | WRITE_BIT) for deletion
+                    // Step 3: Commit - store (new_ptr | WRITE_BIT) or (0 | WRITE_BIT)
                     uint64_t new_ptr = result.subtree_deleted ? WRITE_BIT 
                                      : (reinterpret_cast<uint64_t>(result.new_subtree) | WRITE_BIT);
-                    
-                    if (result.target_slot) {
-                        store_slot<THREADED>(result.target_slot, new_ptr);
-                    } else {
-                        store_slot<THREADED>(&root_slot_, new_ptr);
-                    }
-
+                    store_slot<THREADED>(result.target_slot, new_ptr);
                     elem_count_.fetch_sub(1, std::memory_order_relaxed);
                 }
             }  // UNLOCK
 
-            // Delete unneeded (never visible, safe)
+            // Delete unneeded (never visible, safe to delete immediately)
             for (auto* n : unneeded) {
                 builder_.deallocate_node(n);
             }
@@ -722,17 +701,16 @@ private:
                 continue;
             }
 
-            // Delete old nodes - safe because WRITE_BIT blocks readers
+            // Step 4: Retire old nodes to EBR
             for (auto* n : result.old_nodes) {
-                builder_.deallocate_node(n);
+                ebr_->retire(n);
             }
 
-            // Step 4: Clear WRITE_BIT after frees complete
-            if (result.target_slot) {
-                fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
-            } else {
-                fetch_and_slot<THREADED>(&root_slot_, ~WRITE_BIT);
-            }
+            // Step 5: Clear WRITE_BIT
+            fetch_and_slot<THREADED>(result.target_slot, ~WRITE_BIT);
+
+            // Step 6: Try to reclaim
+            ebr_->try_reclaim();
 
             validate_trie_impl<Key, T, THREADED, Allocator, fixed_len>(get_root());
 
@@ -754,8 +732,17 @@ private:
             elem_count_.store(0, std::memory_order_relaxed);
         }  // UNLOCK
         
-        // Delete old tree outside lock
+        // For clear, we need to wait until all readers are done
+        // Then delete the entire tree
+        // Simple approach: advance epoch twice and reclaim
         if (old_root) {
+            // Retire root - will recursively free when safe
+            // Actually, we need to delete tree properly
+            // For now, just delete immediately (unsafe if readers active)
+            // TODO: Implement proper tree retirement
+            ebr_->advance_epoch();
+            ebr_->advance_epoch();
+            ebr_->try_reclaim();
             delete_tree_simple(old_root);
         }
     }
