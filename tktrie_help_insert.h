@@ -201,7 +201,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                                          slot_type* node,
                                          std::string_view key,
                                          U&& value,
-                                         size_t /*depth*/,
+                                         size_t depth,
                                          size_t match,
                                          result_t& result) {
         node_view_t view(node);
@@ -211,6 +211,58 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         std::string_view common = skip.substr(0, match);
         unsigned char old_char = static_cast<unsigned char>(skip[match]);
         unsigned char new_char = static_cast<unsigned char>(key[match]);
+        
+        // FIXED_LEN leaf optimization: at depth + match == FIXED_LEN - 1, 
+        // children should be inline dataptrs, not node pointers
+        if constexpr (FIXED_LEN > 0 && !THREADED) {
+            if (depth + match == FIXED_LEN - 1) {
+                // Both suffixes should be exactly 1 char (the diverging char itself)
+                // Children are inline dataptrs
+                
+                // Read old value from original node's skip_eos
+                T old_val;
+                if (view.has_skip_eos()) {
+                    view.skip_eos_data()->try_read(old_val);
+                }
+                
+                // Build branch node with inline dataptrs
+                small_list lst(old_char, new_char);
+                std::vector<uint64_t> children = {0, 0};  // Placeholders
+                
+                slot_type* branch;
+                if (common.empty()) {
+                    if (view.has_eos()) {
+                        T eos_val;
+                        view.eos_data()->try_read(eos_val);
+                        branch = builder.build_eos_list(std::move(eos_val), lst, children);
+                    } else {
+                        branch = builder.build_list(lst, children);
+                    }
+                } else {
+                    branch = builder.build_skip_list(common, lst, children);
+                }
+                result.new_nodes.push_back(branch);
+                
+                // Now set the dataptrs in the new node's child slots
+                node_view_t branch_view(branch);
+                
+                // Set old value
+                slot_type* old_slot = branch_view.find_child(old_char);
+                dataptr_t* old_dp = reinterpret_cast<dataptr_t*>(old_slot);
+                new (old_dp) dataptr_t();
+                old_dp->set(std::move(old_val));
+                
+                // Set new value
+                slot_type* new_slot = branch_view.find_child(new_char);
+                dataptr_t* new_dp = reinterpret_cast<dataptr_t*>(new_slot);
+                new (new_dp) dataptr_t();
+                new_dp->set(std::forward<U>(value));
+                
+                result.new_root = branch;
+                result.old_nodes.push_back(node);
+                return result;
+            }
+        }
         
         // Build node for old suffix (rest of original node)
         slot_type* old_suffix_node = clone_with_shorter_skip(builder, node, match + 1);
