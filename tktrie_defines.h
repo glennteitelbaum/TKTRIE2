@@ -69,7 +69,7 @@ KTRIE_FORCE_INLINE constexpr uint8_t mk_flag_switch(uint64_t flags, uint64_t mas
     
     // Process flags using Kernighan's method (low-to-high)
     for (uint64_t m = mask; m; m &= m - 1) {
-        uint64_t bit = m & static_cast<uint64_t>(-static_cast<int64_t>(m));  // isolate lowest set bit
+        uint64_t bit = m ^ (m & (m - 1));  // isolate lowest set bit (unsigned only)
         result = (result << 1) | uint8_t(bool(flags & bit));
     }
     
