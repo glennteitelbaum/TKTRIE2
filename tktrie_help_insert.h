@@ -396,7 +396,24 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             if (view.has_leaf() && view.leaf_has_children()) {
                 values = base::extract_leaf_values(view);
             } else {
-                values.resize(old_chars.size());
+                // Non-LEAF node: extract values from child nodes' eos/skip_eos data
+                values.reserve(old_chars.size());
+                for (size_t i = 0; i < old_children.size(); ++i) {
+                    T val{};
+                    if (old_children[i]) {
+                        node_view_t child(reinterpret_cast<slot_type*>(old_children[i]));
+                        if (!child.has_leaf()) {
+                            if (child.has_skip() && child.skip_eos_data()->has_data()) {
+                                child.skip_eos_data()->try_read(val);
+                            } else if (child.eos_data()->has_data()) {
+                                child.eos_data()->try_read(val);
+                            }
+                        }
+                        // Add old child nodes to be deallocated
+                        result.old_nodes.push_back(reinterpret_cast<slot_type*>(old_children[i]));
+                    }
+                    values.push_back(val);
+                }
             }
             values.push_back(std::forward<U>(value));
 
