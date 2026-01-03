@@ -255,32 +255,40 @@ private:
 
     template <typename U>
     std::pair<iterator, bool> insert_threaded(const Key& key, const std::string& kb, U&& value) {
-        std::vector<slot_type*> unneeded;
-        unneeded.reserve(16);
-        while (true) {
-            auto& slot = get_ebr_slot();
-            auto guard = slot.get_guard();
-            auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), kb, std::forward<U>(value));
-            if (result.already_exists) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                return {find(key), false};
-            }
-            bool retry = false;
-            {
-                std::lock_guard<mutex_type> lock(write_mutex_);
-                if (result.path_has_conflict()) { for (auto* n : result.new_nodes) unneeded.push_back(n); retry = true; }
-                if (!retry) { store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree)); elem_count_.fetch_add(1, std::memory_order_relaxed); }
-            }
-            for (auto* n : unneeded) builder_.deallocate_node(n);
-            unneeded.clear();
-            if (retry) { cpu_pause(); continue; }
-            for (auto* n : result.old_nodes) retire_node(n);
-            ebr_global::instance().try_reclaim();
+        // Lock first to ensure path validity during traversal
+        std::lock_guard<mutex_type> lock(write_mutex_);
+        
+        auto& slot = get_ebr_slot();
+        auto guard = slot.get_guard();
+        
+        auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), kb, std::forward<U>(value));
+        
+        if (result.already_exists) {
+            for (auto* n : result.new_nodes) builder_.deallocate_node(n);
+            return {find(key), false};
+        }
+        
+        // In-place update already done
+        if (result.in_place) {
+            elem_count_.fetch_add(1, std::memory_order_relaxed);
             T val;
             if constexpr (std::is_rvalue_reference_v<U&&>) val = std::forward<U>(value);
             else val = value;
             return {iterator(this, kb, val), true};
         }
+        
+        // Apply update - no CAS needed since we hold mutex
+        store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
+        elem_count_.fetch_add(1, std::memory_order_relaxed);
+        
+        // Retire old nodes (will be freed after readers exit epoch)
+        for (auto* n : result.old_nodes) retire_node(n);
+        ebr_global::instance().try_reclaim();
+        
+        T val;
+        if constexpr (std::is_rvalue_reference_v<U&&>) val = std::forward<U>(value);
+        else val = value;
+        return {iterator(this, kb, val), true};
     }
 
     bool erase_impl(const Key& key) {
@@ -300,30 +308,29 @@ private:
     }
 
     bool erase_threaded(const std::string& kb) {
-        std::vector<slot_type*> unneeded;
-        unneeded.reserve(16);
-        while (true) {
-            auto& slot = get_ebr_slot();
-            auto guard = slot.get_guard();
-            auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), kb);
-            if (!result.found) { for (auto* n : result.new_nodes) builder_.deallocate_node(n); return false; }
-            bool retry = false;
-            {
-                std::lock_guard<mutex_type> lock(write_mutex_);
-                if (result.path_has_conflict()) { for (auto* n : result.new_nodes) unneeded.push_back(n); retry = true; }
-                if (!retry) {
-                    uint64_t np = result.subtree_deleted ? 0 : reinterpret_cast<uint64_t>(result.new_subtree);
-                    store_slot<THREADED>(result.target_slot, np);
-                    elem_count_.fetch_sub(1, std::memory_order_relaxed);
-                }
-            }
-            for (auto* n : unneeded) builder_.deallocate_node(n);
-            unneeded.clear();
-            if (retry) { cpu_pause(); continue; }
-            for (auto* n : result.old_nodes) retire_node(n);
-            ebr_global::instance().try_reclaim();
-            return true;
+        // Lock first to ensure path validity
+        std::lock_guard<mutex_type> lock(write_mutex_);
+        
+        auto& slot = get_ebr_slot();
+        auto guard = slot.get_guard();
+        
+        auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), kb);
+        
+        if (!result.found) {
+            for (auto* n : result.new_nodes) builder_.deallocate_node(n);
+            return false;
         }
+        
+        // Apply update
+        uint64_t np = result.subtree_deleted ? 0 : reinterpret_cast<uint64_t>(result.new_subtree);
+        store_slot<THREADED>(result.target_slot, np);
+        elem_count_.fetch_sub(1, std::memory_order_relaxed);
+        
+        // Retire old nodes
+        for (auto* n : result.old_nodes) retire_node(n);
+        ebr_global::instance().try_reclaim();
+        
+        return true;
     }
 
     void clear_threaded() {

@@ -155,6 +155,42 @@ public:
         for (int i = 0; i < 4; ++i) store_slot<THREADED>(&arr_[off + i], arr[i]);
     }
 
+    // Atomic in-place operations for LEAF|FULL
+    bool leaf_full_test_bit(unsigned char c) const noexcept {
+        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
+        size_t off = children_header_offset();
+        int word = c >> 6;
+        int bit = c & 63;
+        uint64_t val = load_slot<THREADED>(&arr_[off + word]);
+        return (val & (1ULL << bit)) != 0;
+    }
+
+    void leaf_full_set_bit(unsigned char c) noexcept {
+        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
+        size_t off = children_header_offset();
+        int word = c >> 6;
+        int bit = c & 63;
+        if constexpr (THREADED) {
+            arr_[off + word].fetch_or(1ULL << bit, std::memory_order_release);
+        } else {
+            uint64_t old = arr_[off + word];
+            arr_[off + word] = old | (1ULL << bit);
+        }
+    }
+
+    void leaf_full_clear_bit(unsigned char c) noexcept {
+        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
+        size_t off = children_header_offset();
+        int word = c >> 6;
+        int bit = c & 63;
+        if constexpr (THREADED) {
+            arr_[off + word].fetch_and(~(1ULL << bit), std::memory_order_release);
+        } else {
+            uint64_t old = arr_[off + word];
+            arr_[off + word] = old & ~(1ULL << bit);
+        }
+    }
+
     size_t child_ptrs_offset() const noexcept {
         size_t off = children_header_offset();
         if (has_full()) {
@@ -378,6 +414,7 @@ public:
     }
 
     slot_type* build_skip_pop(std::string_view skip, popcount_bitmap bmp, const std::vector<uint64_t>& children) {
+        KTRIE_DEBUG_ASSERT(children.size() == static_cast<size_t>(bmp.count()));
         size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1 + 4 + bmp.count();
         slot_type* node = allocate_node(sz);
         store_slot<THREADED>(&node[0], make_header(FLAG_SKIP | FLAG_POP, static_cast<uint32_t>(sz)));
@@ -387,7 +424,7 @@ public:
         view.set_skip_chars(skip);
         new (view.skip_eos_data()) dataptr_t();
         view.set_bitmap(bmp);
-        for (size_t i = 0; i < children.size(); ++i) view.set_child_ptr(static_cast<int>(i), children[i]);
+        for (int i = 0; i < bmp.count(); ++i) view.set_child_ptr(i, children[i]);
         return node;
     }
 

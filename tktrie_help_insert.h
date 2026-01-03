@@ -12,15 +12,17 @@ namespace gteitelbaum {
 template <bool THREADED>
 struct insert_result {
     slot_type_t<THREADED>* new_subtree = nullptr;
-    slot_type_t<THREADED>* target_slot = nullptr;
+    slot_type_t<THREADED>* target_slot = nullptr;    // Slot to CAS (parent's child slot or root_slot)
     uint64_t expected_ptr = 0;
     std::vector<slot_type_t<THREADED>*> new_nodes;
     std::vector<slot_type_t<THREADED>*> old_nodes;
     bool already_exists = false;
+    bool in_place = false;  // True if update was done atomically in-place
 
     insert_result() { new_nodes.reserve(16); old_nodes.reserve(16); }
 
     bool path_has_conflict() const noexcept {
+        if (in_place) return false;
         if constexpr (THREADED) {
             if (target_slot) {
                 uint64_t cur = load_slot<THREADED>(target_slot);
@@ -44,10 +46,11 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t build_insert_path(node_builder_t& builder, slot_type* root_slot, slot_type* root,
                                        std::string_view key, U&& value, size_t depth = 0) {
         result_t result;
-        result.target_slot = root_slot;
-        result.expected_ptr = reinterpret_cast<uint64_t>(root);
 
         if (!root) {
+            // Empty trie - create new root, target root_slot
+            result.target_slot = root_slot;
+            result.expected_ptr = 0;
             slot_type* new_node;
             if (key.empty()) {
                 new_node = builder.build_empty();
@@ -63,12 +66,15 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             return result;
         }
 
-        return insert_into_node(builder, root, key, std::forward<U>(value), depth, result);
+        // Traverse with parent tracking
+        return insert_with_parent(builder, root_slot, root, nullptr, key, std::forward<U>(value), depth, result);
     }
 
+    // parent_slot: the slot in parent that points to `node`, or root_slot if node is root
     template <typename U>
-    static result_t& insert_into_node(node_builder_t& builder, slot_type* node, std::string_view key,
-                                       U&& value, size_t depth, result_t& result) {
+    static result_t& insert_with_parent(node_builder_t& builder, slot_type* parent_slot, slot_type* node,
+                                         slot_type* parent_node, std::string_view key, U&& value,
+                                         size_t depth, result_t& result) {
         node_view_t view(node);
 
         if (view.has_skip()) {
@@ -76,13 +82,20 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             size_t match = base::match_skip(skip, key);
 
             if (match < skip.size() && match < key.size()) {
+                // Diverge in skip - need to split this node
+                result.target_slot = parent_slot;
+                result.expected_ptr = reinterpret_cast<uint64_t>(node);
                 return split_skip_diverge(builder, node, key, std::forward<U>(value), depth, match, result);
             } else if (match < skip.size()) {
+                // Key is prefix of skip - split
+                result.target_slot = parent_slot;
+                result.expected_ptr = reinterpret_cast<uint64_t>(node);
                 return split_skip_prefix(builder, node, key, std::forward<U>(value), depth, match, result);
             } else {
                 key.remove_prefix(match);
                 depth += match;
                 if (key.empty()) {
+                    // Set skip_eos
                     if (view.has_leaf()) {
                         if (view.leaf_has_eos()) {
                             dataptr_t* dp = view.has_skip() ? view.skip_eos_data() : view.eos_data();
@@ -90,74 +103,83 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                         }
                     } else {
                         if (view.skip_eos_data()->has_data()) { result.already_exists = true; return result; }
+                        // In-place update only safe for non-THREADED mode
+                        if constexpr (!THREADED) {
+                            view.skip_eos_data()->set(std::forward<U>(value));
+                            result.in_place = true;
+                            return result;
+                        }
                     }
+                    result.target_slot = parent_slot;
+                    result.expected_ptr = reinterpret_cast<uint64_t>(node);
                     return set_skip_eos(builder, node, std::forward<U>(value), result);
                 }
             }
         }
 
         if (key.empty()) {
+            // Set EOS
             if (view.has_leaf()) {
                 if (view.leaf_has_eos()) {
                     if (view.eos_data()->has_data()) { result.already_exists = true; return result; }
                 }
             } else {
                 if (view.eos_data()->has_data()) { result.already_exists = true; return result; }
+                // In-place update only safe for non-THREADED mode
+                if constexpr (!THREADED) {
+                    view.eos_data()->set(std::forward<U>(value));
+                    result.in_place = true;
+                    return result;
+                }
             }
+            result.target_slot = parent_slot;
+            result.expected_ptr = reinterpret_cast<uint64_t>(node);
             return set_eos(builder, node, std::forward<U>(value), result);
         }
 
+        // Need to follow or add child
         unsigned char c = static_cast<unsigned char>(key[0]);
         slot_type* child_slot = view.find_child(c);
 
         if (child_slot) {
             if (view.has_leaf()) {
-                if (key.size() == 1) { result.already_exists = true; return result; }
+                // LEAF node: check if character actually exists
+                if (key.size() == 1) {
+                    bool exists = false;
+                    if (view.has_full()) {
+                        exists = view.leaf_full_test_bit(c);
+                    } else if (view.has_list()) {
+                        exists = true;  // find_child only returns slot if in list
+                    } else if (view.has_pop()) {
+                        exists = true;  // find_child only returns slot if in bitmap
+                    }
+                    if (exists) { result.already_exists = true; return result; }
+                    // Character doesn't exist - add it
+                    result.target_slot = parent_slot;
+                    result.expected_ptr = reinterpret_cast<uint64_t>(node);
+                    return add_child(builder, node, c, key.substr(1), std::forward<U>(value), depth, result);
+                }
                 KTRIE_DEBUG_ASSERT(false && "Key longer than FIXED_LEN at leaf");
                 return result;
             }
 
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
             if (child_ptr == 0) {
+                // Empty slot (deleted child) - add child here
+                result.target_slot = parent_slot;
+                result.expected_ptr = reinterpret_cast<uint64_t>(node);
                 return add_child(builder, node, c, key.substr(1), std::forward<U>(value), depth, result);
             }
 
+            // Recurse into child - child_slot becomes new parent_slot
             slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
-            insert_into_node(builder, child, key.substr(1), std::forward<U>(value), depth + 1, result);
-
-            if (!result.already_exists && result.new_subtree) {
-                return rebuild_with_new_child(builder, node, c, result);
-            }
-            return result;
+            return insert_with_parent(builder, child_slot, child, node, key.substr(1), std::forward<U>(value), depth + 1, result);
         } else {
+            // Need to add new child
+            result.target_slot = parent_slot;
+            result.expected_ptr = reinterpret_cast<uint64_t>(node);
             return add_child(builder, node, c, key.substr(1), std::forward<U>(value), depth, result);
         }
-    }
-
-    static result_t& rebuild_with_new_child(node_builder_t& builder, slot_type* node, unsigned char c, result_t& result) {
-        node_view_t view(node);
-        KTRIE_DEBUG_ASSERT(!view.has_leaf());
-        auto chars = base::get_child_chars(view);
-        auto children = base::extract_children(view);
-
-        int idx = base::find_char_index(chars, c);
-        if (idx >= 0) {
-            if (view.has_full()) children[c] = reinterpret_cast<uint64_t>(result.new_subtree);
-            else children[idx] = reinterpret_cast<uint64_t>(result.new_subtree);
-        }
-
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-        if (node_type == 2 && !view.has_full()) {
-            std::vector<uint64_t> full(256, 0);
-            for (size_t i = 0; i < chars.size(); ++i) full[chars[i]] = children[i];
-            children = std::move(full);
-        }
-
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
-        result.new_nodes.push_back(new_node);
-        result.old_nodes.push_back(node);
-        result.new_subtree = new_node;
-        return result;
     }
 
     template <typename U>
@@ -381,6 +403,20 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     static result_t& add_child(node_builder_t& builder, slot_type* node, unsigned char c,
                                 std::string_view rest, U&& value, size_t depth, result_t& result) {
         node_view_t view(node);
+        
+        size_t effective_depth = depth + (view.has_skip() ? view.skip_length() : 0);
+        bool at_leaf_depth = (FIXED_LEN > 0) && can_embed_leaf_v<T> && (effective_depth == FIXED_LEN - 1) && rest.empty();
+
+        // OPTIMIZATION: In-place update for LEAF|FULL (only non-THREADED - no race on bitmap)
+        if constexpr (!THREADED) {
+            if (at_leaf_depth && view.has_leaf() && view.has_full()) {
+                view.set_leaf_value(static_cast<int>(c), std::forward<U>(value));
+                view.leaf_full_set_bit(c);
+                result.in_place = true;
+                return result;
+            }
+        }
+
         auto old_children = base::extract_children(view);
         auto old_chars = base::get_child_chars(view);
 
@@ -388,10 +424,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         new_chars.push_back(c);
         auto [node_type, lst, bmp] = base::build_child_structure(new_chars);
 
-        size_t effective_depth = depth + (view.has_skip() ? view.skip_length() : 0);
-        bool make_leaf = (FIXED_LEN > 0) && can_embed_leaf_v<T> && (effective_depth == FIXED_LEN - 1) && rest.empty();
-
-        if (make_leaf) {
+        if (at_leaf_depth) {
             std::vector<T> values;
             if (view.has_leaf() && view.leaf_has_children()) {
                 values = base::extract_leaf_values(view);
@@ -422,6 +455,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
 
             if (node_type == 2) {
+                // FULL: direct-indexed by char value
                 std::vector<T> full(256);
                 popcount_bitmap valid;
                 for (size_t i = 0; i < new_chars.size() - 1; ++i) { full[new_chars[i]] = values[i]; valid.set(new_chars[i]); }
@@ -430,9 +464,18 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                 new_node = has_skip ? builder.build_leaf_skip_full(skip, valid, full)
                                     : builder.build_leaf_full(valid, full);
             } else if (node_type == 1) {
-                new_node = has_skip ? builder.build_leaf_skip_pop(skip, bmp, values)
-                                    : builder.build_leaf_pop(bmp, values);
+                // POP: values in bitmap order (sorted by char value)
+                std::vector<T> sorted_values(bmp.count());
+                for (size_t i = 0; i < new_chars.size() - 1; ++i) {
+                    int pos = bmp.index_of(new_chars[i]);
+                    sorted_values[pos] = values[i];
+                }
+                int new_pos = bmp.index_of(c);
+                sorted_values[new_pos] = values.back();
+                new_node = has_skip ? builder.build_leaf_skip_pop(skip, bmp, sorted_values)
+                                    : builder.build_leaf_pop(bmp, sorted_values);
             } else {
+                // LIST: unsorted
                 new_node = has_skip ? builder.build_leaf_skip_list(skip, lst, values)
                                     : builder.build_leaf_list(lst, values);
             }
@@ -458,6 +501,7 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
 
         std::vector<uint64_t> new_children;
         if (node_type == 2) {
+            // FULL: 256 direct-indexed slots
             new_children.resize(256, 0);
             if (view.has_full()) {
                 for (int i = 0; i < 256; ++i) new_children[i] = old_children[i];
@@ -466,10 +510,17 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
             }
             new_children[c] = reinterpret_cast<uint64_t>(child_node);
         } else if (node_type == 1) {
-            int pos = bmp.index_of(c);
-            new_children = old_children;
-            new_children.insert(new_children.begin() + pos, reinterpret_cast<uint64_t>(child_node));
+            // POP: children in bitmap order (sorted by char value)
+            // Must reorder if coming from LIST (unsorted)
+            new_children.resize(bmp.count());
+            for (size_t i = 0; i < old_chars.size(); ++i) {
+                int pos = bmp.index_of(old_chars[i]);
+                new_children[pos] = old_children[i];
+            }
+            int new_pos = bmp.index_of(c);
+            new_children[new_pos] = reinterpret_cast<uint64_t>(child_node);
         } else {
+            // LIST: unsorted, just append
             new_children = old_children;
             new_children.push_back(reinterpret_cast<uint64_t>(child_node));
         }
