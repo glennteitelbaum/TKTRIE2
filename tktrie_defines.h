@@ -153,6 +153,25 @@ struct empty_mutex {
     bool try_lock() noexcept { return true; }
 };
 
+// Striped lock array for per-subtree locking (THREADED mode)
+template <size_t N = 64>
+class striped_locks {
+    std::array<std::mutex, N> locks_;
+public:
+    std::mutex& get(const void* ptr) noexcept {
+        size_t h = reinterpret_cast<uintptr_t>(ptr);
+        h ^= (h >> 16);
+        h *= 0x85ebca6b;
+        h ^= (h >> 13);
+        return locks_[h % N];
+    }
+};
+
+inline striped_locks<64>& get_striped_locks() {
+    static striped_locks<64> instance;
+    return instance;
+}
+
 KTRIE_FORCE_INLINE void cpu_pause() noexcept {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     #if defined(_MSC_VER)
@@ -236,6 +255,19 @@ public:
         n_ = from_char_array(arr);
         return len;
     }
+
+    // Create new list with char added (for atomic CAS)
+    static uint64_t add_char(uint64_t old_list, unsigned char c) noexcept {
+        int len = static_cast<int>(old_list & 0xFF);
+        if (len >= max_count) return old_list; // Can't add
+        auto arr = to_char_array(old_list);
+        arr[len] = static_cast<char>(c);
+        arr[7] = static_cast<char>(len + 1);
+        return from_char_array(arr);
+    }
+    
+    // Check if list has room for more chars
+    KTRIE_FORCE_INLINE bool can_add() const noexcept { return count() < max_count; }
 
     std::pair<std::array<uint8_t, max_count>, int> sorted_chars() const noexcept {
         std::array<uint8_t, max_count> chars{};

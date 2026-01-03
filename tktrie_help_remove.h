@@ -18,10 +18,12 @@ struct remove_result {
     std::vector<slot_type_t<THREADED>*> old_nodes;
     bool found = false;
     bool subtree_deleted = false;
+    bool in_place = false;  // True if delete was done atomically in-place
 
     remove_result() { new_nodes.reserve(16); old_nodes.reserve(16); }
 
     bool path_has_conflict() const noexcept {
+        if (in_place) return false;
         if constexpr (THREADED) {
             if (target_slot) {
                 uint64_t cur = load_slot<THREADED>(target_slot);
@@ -251,14 +253,22 @@ private:
         node_view_t view(node);
         KTRIE_DEBUG_ASSERT(view.has_leaf() && view.leaf_has_children());
 
-        auto values = base::extract_leaf_values(view);
-        auto chars = base::get_child_chars(view);
-
-        int idx = base::find_char_index(chars, c);
-
+        // OPTIMIZATION: In-place atomic delete for LEAF|FULL if no downgrade needed
         if (view.has_full()) {
             popcount_bitmap valid_bmp = view.get_leaf_full_bitmap();
+            int cur_count = valid_bmp.count();
+            
+            // If still above FULL_THRESHOLD after delete, do in-place atomic clear
+            if (cur_count > FULL_THRESHOLD + 1) {
+                view.leaf_full_clear_bit(c);
+                result.in_place = true;
+                return result;
+            }
+            
+            // Need to downgrade or rebuild
             valid_bmp.clear(c);
+            auto values = base::extract_leaf_values(view);
+            auto chars = base::get_child_chars(view);
             chars.erase(std::remove(chars.begin(), chars.end(), c), chars.end());
 
             if (chars.empty()) {
@@ -287,6 +297,10 @@ private:
             result.old_nodes.push_back(node);
             return result;
         }
+
+        auto values = base::extract_leaf_values(view);
+        auto chars = base::get_child_chars(view);
+        int idx = base::find_char_index(chars, c);
 
         if (idx >= 0) {
             values.erase(values.begin() + idx);
