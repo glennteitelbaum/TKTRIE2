@@ -15,7 +15,7 @@
 
 #if defined(_MSC_VER)
 #define KTRIE_FORCE_INLINE __forceinline
-#include <stdlib.h>  // For _byteswap_* on MSVC
+#include <stdlib.h>
 #elif defined(__GNUC__) || defined(__clang__)
 #define KTRIE_FORCE_INLINE __attribute__((always_inline)) inline
 #else
@@ -33,16 +33,20 @@ namespace gteitelbaum {
 
 static constexpr bool k_validate = (KTRIE_VALIDATE != 0);
 
-// Flag constants
-// LIST|POP together (without FULL) = HAS_EOS for LEAF nodes
+// Header format (64 bits):
+//   Flags:   5 bits  (63-59)
+//   Version: 27 bits (58-32) - per-node version for optimistic locking
+//   Size:    32 bits (31-0)
 static constexpr uint64_t FLAG_SKIP = 1ULL << 63;
 static constexpr uint64_t FLAG_LIST = 1ULL << 62;
 static constexpr uint64_t FLAG_POP  = 1ULL << 61;
 static constexpr uint64_t FLAG_FULL = 1ULL << 60;
 static constexpr uint64_t FLAG_LEAF = 1ULL << 59;
 
-static constexpr uint64_t FLAGS_MASK = 0xF800000000000000ULL;
-static constexpr uint64_t SIZE_MASK  = 0x07FFFFFFFFFFFFFFULL;
+static constexpr uint64_t FLAGS_MASK   = 0xF800000000000000ULL;
+static constexpr uint64_t VERSION_MASK = 0x07FFFFFF00000000ULL;
+static constexpr uint64_t SIZE_MASK    = 0x00000000FFFFFFFFULL;
+static constexpr int VERSION_SHIFT = 32;
 
 static constexpr int FULL_THRESHOLD = 176;
 static constexpr int LIST_MAX = 7;
@@ -51,7 +55,6 @@ template <typename T>
 static constexpr bool can_embed_leaf_v = 
     sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>;
 
-// Derived flag checks
 KTRIE_FORCE_INLINE constexpr bool flags_has_list(uint64_t f) noexcept {
     return (f & FLAG_LIST) && !(f & FLAG_POP);
 }
@@ -72,57 +75,35 @@ KTRIE_FORCE_INLINE constexpr bool flags_has_leaf(uint64_t f) noexcept {
     return (f & FLAG_LEAF) != 0;
 }
 
-// For LEAF: LIST|POP without FULL = terminal (EOS)
 KTRIE_FORCE_INLINE constexpr bool flags_leaf_has_eos(uint64_t f) noexcept {
     return (f & (FLAG_LIST | FLAG_POP)) == (FLAG_LIST | FLAG_POP) && !(f & FLAG_FULL);
 }
 
-// For LEAF: has children = LIST xor POP xor FULL
 KTRIE_FORCE_INLINE constexpr bool flags_leaf_has_children(uint64_t f) noexcept {
     return flags_has_list(f) || flags_has_pop(f) || flags_has_full(f);
 }
 
-template <typename... Bools>
-KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(Bools... bs) noexcept {
-    uint8_t result = 0;
-    ((result = (result << 1) | uint8_t(bool(bs))), ...);
-    return result;
-}
-
 template <typename T>
 constexpr T ktrie_byteswap(T value) noexcept {
-    static_assert(std::is_integral_v<T>);
-    if constexpr (sizeof(T) == 1) {
-        return value;
-    }
+    if constexpr (std::endian::native == std::endian::big) return value;
 #if __cpp_lib_byteswap >= 202110L
-    else {
-        return std::byteswap(value);
-    }
+    return std::byteswap(value);
 #elif defined(_MSC_VER)
-    // MSVC intrinsics (not constexpr, but fast at runtime)
-    else if constexpr (sizeof(T) == 2) {
-        return static_cast<T>(_byteswap_ushort(static_cast<uint16_t>(value)));
-    } else if constexpr (sizeof(T) == 4) {
-        return static_cast<T>(_byteswap_ulong(static_cast<uint32_t>(value)));
-    } else if constexpr (sizeof(T) == 8) {
-        return static_cast<T>(_byteswap_uint64(static_cast<uint64_t>(value)));
-    }
+    if constexpr (sizeof(T) == 1) return value;
+    else if constexpr (sizeof(T) == 2) return static_cast<T>(_byteswap_ushort(static_cast<uint16_t>(value)));
+    else if constexpr (sizeof(T) == 4) return static_cast<T>(_byteswap_ulong(static_cast<uint32_t>(value)));
+    else if constexpr (sizeof(T) == 8) return static_cast<T>(_byteswap_uint64(static_cast<uint64_t>(value)));
 #elif defined(__GNUC__) || defined(__clang__)
-    // GCC/Clang builtins (constexpr-friendly)
-    else if constexpr (sizeof(T) == 2) {
-        return static_cast<T>(__builtin_bswap16(static_cast<uint16_t>(value)));
-    } else if constexpr (sizeof(T) == 4) {
-        return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(value)));
-    } else if constexpr (sizeof(T) == 8) {
-        return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(value)));
-    }
+    if constexpr (sizeof(T) == 1) return value;
+    else if constexpr (sizeof(T) == 2) return static_cast<T>(__builtin_bswap16(static_cast<uint16_t>(value)));
+    else if constexpr (sizeof(T) == 4) return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(value)));
+    else if constexpr (sizeof(T) == 8) return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(value)));
 #else
-    // Fallback manual implementation
-    else if constexpr (sizeof(T) == 2) {
+    if constexpr (sizeof(T) == 1) return value;
+    else if constexpr (sizeof(T) == 2)
         return static_cast<T>(((static_cast<uint16_t>(value) & 0x00FFu) << 8) |
                               ((static_cast<uint16_t>(value) & 0xFF00u) >> 8));
-    } else if constexpr (sizeof(T) == 4) {
+    else if constexpr (sizeof(T) == 4) {
         uint32_t v = static_cast<uint32_t>(value);
         return static_cast<T>(((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
                               ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24));
@@ -159,12 +140,26 @@ KTRIE_FORCE_INLINE uint64_t from_char_array(const std::array<char, 8>& arr) noex
     return from_big_endian(be);
 }
 
-KTRIE_FORCE_INLINE uint64_t make_header(uint64_t flags, uint32_t size) noexcept {
-    return (flags & FLAGS_MASK) | (static_cast<uint64_t>(size) & SIZE_MASK);
+KTRIE_FORCE_INLINE uint64_t make_header(uint64_t flags, uint32_t size, uint32_t version = 0) noexcept {
+    return (flags & FLAGS_MASK) | 
+           ((static_cast<uint64_t>(version) << VERSION_SHIFT) & VERSION_MASK) |
+           (static_cast<uint64_t>(size) & SIZE_MASK);
 }
 
 KTRIE_FORCE_INLINE uint64_t get_flags(uint64_t header) noexcept { return header & FLAGS_MASK; }
 KTRIE_FORCE_INLINE uint32_t get_size(uint64_t header) noexcept { return static_cast<uint32_t>(header & SIZE_MASK); }
+KTRIE_FORCE_INLINE uint32_t get_version(uint64_t header) noexcept { 
+    return static_cast<uint32_t>((header & VERSION_MASK) >> VERSION_SHIFT); 
+}
+
+KTRIE_FORCE_INLINE uint64_t set_version(uint64_t header, uint32_t ver) noexcept {
+    return (header & ~VERSION_MASK) | ((static_cast<uint64_t>(ver) << VERSION_SHIFT) & VERSION_MASK);
+}
+
+KTRIE_FORCE_INLINE uint64_t bump_version(uint64_t header) noexcept {
+    uint32_t ver = get_version(header);
+    return set_version(header, ver + 1);
+}
 
 struct empty_mutex {
     void lock() noexcept {}
@@ -190,6 +185,7 @@ KTRIE_FORCE_INLINE void cpu_pause() noexcept {
 #endif
 }
 
+// Slot type: atomic for threaded, plain for single-threaded
 template <bool THREADED>
 using slot_type_t = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
 

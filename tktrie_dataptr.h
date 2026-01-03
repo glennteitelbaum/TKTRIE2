@@ -9,6 +9,8 @@
 
 namespace gteitelbaum {
 
+// Data pointer wrapper with atomic operations for thread-safe access
+// Uses atomic pointer swap - no COW needed for data updates
 template <typename T, bool THREADED, typename Allocator>
 class dataptr {
     using alloc_traits = std::allocator_traits<Allocator>;
@@ -55,6 +57,8 @@ public:
         return true;
     }
 
+    // Atomic set - swaps pointer, deletes old value
+    // No COW needed - this is an in-place atomic update
     void set(const T& value) {
         value_alloc_t alloc;
         T* new_ptr = value_alloc_traits::allocate(alloc, 1);
