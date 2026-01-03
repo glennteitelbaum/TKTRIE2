@@ -574,7 +574,9 @@ public:
 
         int nc = sv.child_count();
         if (sv.has_leaf() && sv.leaf_has_children()) {
-            for (int i = 0; i < nc; ++i) dv.set_leaf_value(i, sv.get_leaf_value(i));
+            if constexpr (can_embed_leaf_v<T>) {
+                for (int i = 0; i < nc; ++i) dv.set_leaf_value(i, sv.get_leaf_value(i));
+            }
         } else if (!sv.leaf_has_eos()) {
             for (int i = 0; i < nc; ++i) {
                 uint64_t cp = sv.get_child_ptr(i);

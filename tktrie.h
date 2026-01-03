@@ -392,7 +392,7 @@ private:
     std::pair<iterator, bool> do_insert(const Key& key, V&& value, const std::string& kv_str) {
         std::string_view kv(kv_str);
         slot_type* cur = get_root();
-        slot_type* parent = nullptr;
+        slot_type* parent [[maybe_unused]] = nullptr;
         slot_type* parent_child_slot = &root_slot_;
 
         while (true) {
@@ -559,7 +559,7 @@ private:
     template <typename V>
     std::pair<iterator, bool> split_skip_prefix(slot_type* parent_slot, slot_type* node,
                                                   const Key& key, V&& value,
-                                                  std::string_view kv, size_t match) {
+                                                  std::string_view /*kv*/, size_t match) {
         node_view_t view(node);
         std::string_view skip = view.skip_chars();
         std::string_view prefix = skip.substr(0, match);
@@ -601,30 +601,86 @@ private:
         std::string_view skip = view.skip_chars();
         std::string_view new_skip = skip.substr(skip_prefix_len);
 
+        // The original node has data in skip_eos_data (if has skip) or eos_data
+        // We need to create a new node with shorter/no skip, preserving that data
+
         slot_type* new_node;
-        if (view.has_leaf()) {
-            if (view.leaf_has_eos()) {
-                new_node = new_skip.empty() ? builder_.build_leaf_terminal()
-                                            : builder_.build_leaf_skip_terminal(new_skip);
+        
+        // Check if original has any children
+        bool has_children = view.live_child_count() > 0;
+        
+        if (!has_children) {
+            // No children - create a simple node with just the data
+            if (new_skip.empty()) {
+                new_node = builder_.build_empty();
                 node_view_t nv(new_node);
-                if (new_skip.empty()) {
-                    nv.eos_data()->deep_copy_from(view.has_skip() ? *view.skip_eos_data() : *view.eos_data());
-                } else {
-                    nv.skip_eos_data()->deep_copy_from(view.has_skip() ? *view.skip_eos_data() : *view.eos_data());
+                // Copy data from old node's skip_eos (or eos if no skip)
+                if (view.has_skip() && view.skip_eos_data()->has_data()) {
+                    nv.eos_data()->deep_copy_from(*view.skip_eos_data());
+                } else if (!view.has_skip() && view.eos_data()->has_data()) {
+                    nv.eos_data()->deep_copy_from(*view.eos_data());
                 }
             } else {
-                // Has children - complex copy
-                new_node = builder_.deep_copy(node);
+                new_node = builder_.build_skip(new_skip);
                 node_view_t nv(new_node);
-                // Adjust skip in copied node (hacky but works for now)
-                if (new_skip.empty()) {
-                    // Remove skip flag - would need full rebuild
-                    // For simplicity, just deep copy
+                // Copy data from old node's skip_eos
+                if (view.has_skip() && view.skip_eos_data()->has_data()) {
+                    nv.skip_eos_data()->deep_copy_from(*view.skip_eos_data());
                 }
             }
         } else {
-            new_node = builder_.deep_copy(node);
+            // Has children - need to rebuild with children
+            // Extract existing children
+            std::vector<uint64_t> children;
+            std::vector<unsigned char> chars;
+            
+            if (view.has_full()) {
+                children.resize(256);
+                for (int i = 0; i < 256; ++i) {
+                    children[i] = view.get_child_ptr(i);
+                    if (children[i] != 0) chars.push_back(static_cast<unsigned char>(i));
+                }
+            } else if (view.has_list()) {
+                small_list lst = view.get_list();
+                for (int i = 0; i < lst.count(); ++i) {
+                    chars.push_back(lst.char_at(i));
+                    children.push_back(view.get_child_ptr(i));
+                }
+            } else if (view.has_pop()) {
+                popcount_bitmap bmp = view.get_bitmap();
+                for (int i = 0; i < bmp.count(); ++i) {
+                    chars.push_back(bmp.nth_char(i));
+                    children.push_back(view.get_child_ptr(i));
+                }
+            }
+            
+            // Build new node with same structure but different skip
+            if (view.has_full()) {
+                new_node = new_skip.empty() ? builder_.build_full(children)
+                                            : builder_.build_skip_full(new_skip, children);
+            } else if (chars.size() <= static_cast<size_t>(LIST_MAX)) {
+                small_list lst;
+                for (auto c : chars) lst.add(c);
+                new_node = new_skip.empty() ? builder_.build_list(lst, children)
+                                            : builder_.build_skip_list(new_skip, lst, children);
+            } else {
+                popcount_bitmap bmp;
+                for (auto c : chars) bmp.set(c);
+                new_node = new_skip.empty() ? builder_.build_pop(bmp, children)
+                                            : builder_.build_skip_pop(new_skip, bmp, children);
+            }
+            
+            node_view_t nv(new_node);
+            // Copy skip_eos data
+            if (view.has_skip() && view.skip_eos_data()->has_data()) {
+                if (new_skip.empty()) {
+                    nv.eos_data()->deep_copy_from(*view.skip_eos_data());
+                } else {
+                    nv.skip_eos_data()->deep_copy_from(*view.skip_eos_data());
+                }
+            }
         }
+        
         return new_node;
     }
 
