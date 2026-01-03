@@ -15,6 +15,7 @@
 
 #if defined(_MSC_VER)
 #define KTRIE_FORCE_INLINE __forceinline
+#include <stdlib.h>  // For _byteswap_* on MSVC
 #elif defined(__GNUC__) || defined(__clang__)
 #define KTRIE_FORCE_INLINE __attribute__((always_inline)) inline
 #else
@@ -89,13 +90,39 @@ KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(Bools... bs) noexcept {
 }
 
 template <typename T>
-constexpr T byteswap_impl(T value) noexcept {
+constexpr T ktrie_byteswap(T value) noexcept {
     static_assert(std::is_integral_v<T>);
-    if constexpr (sizeof(T) == 1) return value;
-    else if constexpr (sizeof(T) == 2)
+    if constexpr (sizeof(T) == 1) {
+        return value;
+    }
+#if __cpp_lib_byteswap >= 202110L
+    else {
+        return std::byteswap(value);
+    }
+#elif defined(_MSC_VER)
+    // MSVC intrinsics (not constexpr, but fast at runtime)
+    else if constexpr (sizeof(T) == 2) {
+        return static_cast<T>(_byteswap_ushort(static_cast<uint16_t>(value)));
+    } else if constexpr (sizeof(T) == 4) {
+        return static_cast<T>(_byteswap_ulong(static_cast<uint32_t>(value)));
+    } else if constexpr (sizeof(T) == 8) {
+        return static_cast<T>(_byteswap_uint64(static_cast<uint64_t>(value)));
+    }
+#elif defined(__GNUC__) || defined(__clang__)
+    // GCC/Clang builtins (constexpr-friendly)
+    else if constexpr (sizeof(T) == 2) {
+        return static_cast<T>(__builtin_bswap16(static_cast<uint16_t>(value)));
+    } else if constexpr (sizeof(T) == 4) {
+        return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(value)));
+    } else if constexpr (sizeof(T) == 8) {
+        return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(value)));
+    }
+#else
+    // Fallback manual implementation
+    else if constexpr (sizeof(T) == 2) {
         return static_cast<T>(((static_cast<uint16_t>(value) & 0x00FFu) << 8) |
                               ((static_cast<uint16_t>(value) & 0xFF00u) >> 8));
-    else if constexpr (sizeof(T) == 4) {
+    } else if constexpr (sizeof(T) == 4) {
         uint32_t v = static_cast<uint32_t>(value);
         return static_cast<T>(((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
                               ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24));
@@ -107,14 +134,6 @@ constexpr T byteswap_impl(T value) noexcept {
             ((v & 0x000000FF00000000ull) >> 8)  | ((v & 0x0000FF0000000000ull) >> 24) |
             ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56));
     }
-}
-
-template <typename T>
-constexpr T ktrie_byteswap(T value) noexcept {
-#if __cpp_lib_byteswap >= 202110L
-    return std::byteswap(value);
-#else
-    return byteswap_impl(value);
 #endif
 }
 
