@@ -33,27 +33,54 @@ namespace gteitelbaum {
 static constexpr bool k_validate = (KTRIE_VALIDATE != 0);
 
 // Flag constants
-// EOS slot always exists at offset 1 (nullable via dataptr)
-// SKIP_EOS slot always exists after skip chars if FLAG_SKIP set (nullable via dataptr)
-static constexpr uint64_t FLAG_SKIP     = 1ULL << 63;  // has skip sequence (implies skip_eos slot)
-static constexpr uint64_t FLAG_LIST     = 1ULL << 62;  // 1-7 children via small_list
-static constexpr uint64_t FLAG_POP      = 1ULL << 61;  // 8-176 children via popcount bitmap
-static constexpr uint64_t FLAG_FULL     = 1ULL << 60;  // 177-256 children via direct indexing
-static constexpr uint64_t FLAG_LEAF     = 1ULL << 59;  // children are embedded T values, not node*
+// LIST|POP together (without FULL) = HAS_EOS for LEAF nodes
+static constexpr uint64_t FLAG_SKIP = 1ULL << 63;
+static constexpr uint64_t FLAG_LIST = 1ULL << 62;
+static constexpr uint64_t FLAG_POP  = 1ULL << 61;
+static constexpr uint64_t FLAG_FULL = 1ULL << 60;
+static constexpr uint64_t FLAG_LEAF = 1ULL << 59;
 
-static constexpr uint64_t FLAGS_MASK    = 0xF800000000000000ULL;  // 5 flag bits
-static constexpr uint64_t SIZE_MASK     = 0x07FFFFFFFFFFFFFFULL;  // 59 bits for size
+static constexpr uint64_t FLAGS_MASK = 0xF800000000000000ULL;
+static constexpr uint64_t SIZE_MASK  = 0x07FFFFFFFFFFFFFFULL;
 
-// Thresholds for node type transitions
-static constexpr int FULL_THRESHOLD = 176;  // POP > this → FULL (0xB0)
-static constexpr int LIST_MAX = 7;          // LIST can hold at most 7
+static constexpr int FULL_THRESHOLD = 176;
+static constexpr int LIST_MAX = 7;
 
-// Leaf value embedding - only for FIXED_LEN with small trivially copyable T
 template <typename T>
 static constexpr bool can_embed_leaf_v = 
     sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>;
 
-// Switch helper for pure bool combinations
+// Derived flag checks
+KTRIE_FORCE_INLINE constexpr bool flags_has_list(uint64_t f) noexcept {
+    return (f & FLAG_LIST) && !(f & FLAG_POP);
+}
+
+KTRIE_FORCE_INLINE constexpr bool flags_has_pop(uint64_t f) noexcept {
+    return (f & FLAG_POP) && !(f & FLAG_LIST);
+}
+
+KTRIE_FORCE_INLINE constexpr bool flags_has_full(uint64_t f) noexcept {
+    return (f & FLAG_FULL) != 0;
+}
+
+KTRIE_FORCE_INLINE constexpr bool flags_has_skip(uint64_t f) noexcept {
+    return (f & FLAG_SKIP) != 0;
+}
+
+KTRIE_FORCE_INLINE constexpr bool flags_has_leaf(uint64_t f) noexcept {
+    return (f & FLAG_LEAF) != 0;
+}
+
+// For LEAF: LIST|POP without FULL = terminal (EOS)
+KTRIE_FORCE_INLINE constexpr bool flags_leaf_has_eos(uint64_t f) noexcept {
+    return (f & (FLAG_LIST | FLAG_POP)) == (FLAG_LIST | FLAG_POP) && !(f & FLAG_FULL);
+}
+
+// For LEAF: has children = LIST xor POP xor FULL
+KTRIE_FORCE_INLINE constexpr bool flags_leaf_has_children(uint64_t f) noexcept {
+    return flags_has_list(f) || flags_has_pop(f) || flags_has_full(f);
+}
+
 template <typename... Bools>
 KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(Bools... bs) noexcept {
     uint8_t result = 0;
@@ -61,33 +88,17 @@ KTRIE_FORCE_INLINE constexpr uint8_t mk_switch(Bools... bs) noexcept {
     return result;
 }
 
-// Switch helper for flag + bool combinations
-template <typename... Bools>
-KTRIE_FORCE_INLINE constexpr uint8_t mk_flag_switch(uint64_t flags, uint64_t mask, Bools... extra) noexcept {
-    uint8_t result = 0;
-    for (uint64_t m = mask; m; m &= m - 1) {
-        uint64_t bit = m ^ (m & (m - 1));
-        result = (result << 1) | uint8_t(bool(flags & bit));
-    }
-    ((result = (result << 1) | uint8_t(bool(extra))), ...);
-    return result;
-}
-
-// Byteswap
 template <typename T>
 constexpr T byteswap_impl(T value) noexcept {
-    static_assert(std::is_integral_v<T>, "byteswap requires integral type");
-    if constexpr (sizeof(T) == 1) {
-        return value;
-    } else if constexpr (sizeof(T) == 2) {
-        return static_cast<T>(
-            ((static_cast<uint16_t>(value) & 0x00FFu) << 8) |
-            ((static_cast<uint16_t>(value) & 0xFF00u) >> 8));
-    } else if constexpr (sizeof(T) == 4) {
+    static_assert(std::is_integral_v<T>);
+    if constexpr (sizeof(T) == 1) return value;
+    else if constexpr (sizeof(T) == 2)
+        return static_cast<T>(((static_cast<uint16_t>(value) & 0x00FFu) << 8) |
+                              ((static_cast<uint16_t>(value) & 0xFF00u) >> 8));
+    else if constexpr (sizeof(T) == 4) {
         uint32_t v = static_cast<uint32_t>(value);
-        return static_cast<T>(
-            ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
-            ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24));
+        return static_cast<T>(((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+                              ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24));
     } else if constexpr (sizeof(T) == 8) {
         uint64_t v = static_cast<uint64_t>(value);
         return static_cast<T>(
@@ -109,17 +120,12 @@ constexpr T ktrie_byteswap(T value) noexcept {
 
 template <typename T>
 constexpr T to_big_endian(T value) noexcept {
-    if constexpr (std::endian::native == std::endian::big) {
-        return value;
-    } else {
-        return ktrie_byteswap(value);
-    }
+    if constexpr (std::endian::native == std::endian::big) return value;
+    else return ktrie_byteswap(value);
 }
 
 template <typename T>
-constexpr T from_big_endian(T value) noexcept {
-    return to_big_endian(value);
-}
+constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
 KTRIE_FORCE_INLINE std::array<char, 8> to_char_array(uint64_t v) noexcept {
     std::array<char, 8> arr;
@@ -138,17 +144,12 @@ KTRIE_FORCE_INLINE uint64_t make_header(uint64_t flags, uint32_t size) noexcept 
     return (flags & FLAGS_MASK) | (static_cast<uint64_t>(size) & SIZE_MASK);
 }
 
-KTRIE_FORCE_INLINE uint64_t get_flags(uint64_t header) noexcept {
-    return header & FLAGS_MASK;
-}
-
-KTRIE_FORCE_INLINE uint32_t get_size(uint64_t header) noexcept {
-    return static_cast<uint32_t>(header & SIZE_MASK);
-}
+KTRIE_FORCE_INLINE uint64_t get_flags(uint64_t header) noexcept { return header & FLAGS_MASK; }
+KTRIE_FORCE_INLINE uint32_t get_size(uint64_t header) noexcept { return static_cast<uint32_t>(header & SIZE_MASK); }
 
 struct empty_mutex {
-    void lock() noexcept { }
-    void unlock() noexcept { }
+    void lock() noexcept {}
+    void unlock() noexcept {}
     bool try_lock() noexcept { return true; }
 };
 
@@ -175,50 +176,35 @@ using slot_type_t = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t
 
 template <bool THREADED>
 KTRIE_FORCE_INLINE uint64_t load_slot(const slot_type_t<THREADED>* slot) noexcept {
-    if constexpr (THREADED) {
-        return slot->load(std::memory_order_acquire);
-    } else {
-        return *slot;
-    }
+    if constexpr (THREADED) return slot->load(std::memory_order_acquire);
+    else return *slot;
 }
 
 template <bool THREADED>
 KTRIE_FORCE_INLINE void store_slot(slot_type_t<THREADED>* slot, uint64_t value) noexcept {
-    if constexpr (THREADED) {
-        slot->store(value, std::memory_order_release);
-    } else {
-        *slot = value;
-    }
+    if constexpr (THREADED) slot->store(value, std::memory_order_release);
+    else *slot = value;
 }
 
 template <bool THREADED>
 KTRIE_FORCE_INLINE bool cas_slot(slot_type_t<THREADED>* slot, uint64_t& expected, uint64_t desired) noexcept {
-    if constexpr (THREADED) {
-        return slot->compare_exchange_weak(expected, desired, 
-                                           std::memory_order_acq_rel, std::memory_order_acquire);
-    } else {
+    if constexpr (THREADED)
+        return slot->compare_exchange_weak(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    else {
         if (*slot == expected) { *slot = desired; return true; }
         expected = *slot;
         return false;
     }
 }
 
-KTRIE_FORCE_INLINE constexpr size_t bytes_to_words(size_t bytes) noexcept {
-    return (bytes + 7) / 8;
-}
-
-// =============================================================================
-// small_list
-// =============================================================================
+KTRIE_FORCE_INLINE constexpr size_t bytes_to_words(size_t bytes) noexcept { return (bytes + 7) / 8; }
 
 class small_list {
     uint64_t n_;
 public:
     static constexpr int max_count = 7;
-
     small_list() noexcept : n_{0} {}
     explicit small_list(uint64_t x) noexcept : n_{x} {}
-    
     small_list(unsigned char c1, unsigned char c2) noexcept : n_{0} {
         auto arr = to_char_array(0ULL);
         arr[0] = static_cast<char>(c1);
@@ -228,7 +214,6 @@ public:
     }
 
     KTRIE_FORCE_INLINE int count() const noexcept { return static_cast<int>(n_ & 0xFF); }
-
     KTRIE_FORCE_INLINE uint8_t char_at(int pos) const noexcept {
         auto arr = to_char_array(n_);
         return static_cast<uint8_t>(arr[pos]);
@@ -269,10 +254,6 @@ public:
     KTRIE_FORCE_INLINE uint64_t to_u64() const noexcept { return n_; }
     KTRIE_FORCE_INLINE static small_list from_u64(uint64_t v) noexcept { return small_list(v); }
 };
-
-// =============================================================================
-// popcount_bitmap
-// =============================================================================
 
 class popcount_bitmap {
     uint64_t bits_[4]{};

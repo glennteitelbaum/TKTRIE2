@@ -17,10 +17,10 @@ class ebr_slot {
     friend class ebr_global;
     std::atomic<uint64_t> epoch_{0};
     std::atomic<bool> active_{false};
-    
+
 public:
     ebr_slot() = default;
-    
+
     class guard {
         ebr_slot& slot_;
     public:
@@ -29,9 +29,9 @@ public:
         guard(const guard&) = delete;
         guard& operator=(const guard&) = delete;
     };
-    
+
     guard get_guard() { return guard(*this); }
-    
+
 private:
     void enter();
     void exit() { active_.store(false, std::memory_order_release); }
@@ -40,44 +40,44 @@ private:
 
 class ebr_global {
     std::atomic<uint64_t> epoch_{0};
-    
+
     struct retired_node {
         void* ptr;
         void (*deleter)(void*);
         uint64_t retire_epoch;
     };
-    
+
     std::mutex retire_mutex_;
     std::vector<retired_node> retired_;
     std::mutex slots_mutex_;
     std::vector<ebr_slot*> slots_;
-    
+
     ebr_global() { retired_.reserve(1024); }
-    
+
 public:
     static ebr_global& instance() {
         static ebr_global inst;
         return inst;
     }
-    
+
     uint64_t current_epoch() const { return epoch_.load(std::memory_order_acquire); }
     void advance_epoch() { epoch_.fetch_add(1, std::memory_order_acq_rel); }
-    
+
     void register_slot(ebr_slot* slot) {
         std::lock_guard<std::mutex> lock(slots_mutex_);
         slots_.push_back(slot);
     }
-    
+
     void unregister_slot(ebr_slot* slot) {
         std::lock_guard<std::mutex> lock(slots_mutex_);
         slots_.erase(std::remove(slots_.begin(), slots_.end(), slot), slots_.end());
     }
-    
+
     void retire(void* ptr, void (*deleter)(void*)) {
         std::lock_guard<std::mutex> lock(retire_mutex_);
         retired_.push_back({ptr, deleter, current_epoch()});
     }
-    
+
     void try_reclaim() {
         uint64_t min_epoch = current_epoch();
         {
@@ -89,7 +89,7 @@ public:
                 }
             }
         }
-        
+
         std::vector<retired_node> still_retired;
         {
             std::lock_guard<std::mutex> lock(retire_mutex_);

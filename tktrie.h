@@ -43,7 +43,7 @@ template <typename T>
 struct tktrie_traits<T> {
     static constexpr size_t fixed_len = sizeof(T);
     using unsigned_type = std::make_unsigned_t<T>;
-    
+
     static std::string to_bytes(T k) {
         unsigned_type sortable;
         if constexpr (std::is_signed_v<T>) {
@@ -56,7 +56,7 @@ struct tktrie_traits<T> {
         std::memcpy(buf, &be, sizeof(T));
         return std::string(buf, sizeof(T));
     }
-    
+
     static T from_bytes(std::string_view bytes) {
         KTRIE_DEBUG_ASSERT(bytes.size() == sizeof(T));
         unsigned_type be;
@@ -98,13 +98,13 @@ private:
 
 public:
     tktrie_iterator() noexcept : parent_(nullptr), valid_(false) {}
-    
+
     tktrie_iterator(const trie_type* parent, std::string_view key_bytes, const T& value)
         : parent_(parent), key_bytes_(key_bytes), value_(value), valid_(true) {}
-    
+
     tktrie_iterator(const tktrie_iterator& other)
         : parent_(other.parent_), key_bytes_(other.key_bytes_), value_(other.value_), valid_(other.valid_) {}
-    
+
     tktrie_iterator& operator=(const tktrie_iterator& other) {
         if (this != &other) {
             parent_ = other.parent_;
@@ -114,13 +114,13 @@ public:
         }
         return *this;
     }
-    
+
     tktrie_iterator(tktrie_iterator&& other) noexcept
-        : parent_(other.parent_), key_bytes_(std::move(other.key_bytes_)), 
+        : parent_(other.parent_), key_bytes_(std::move(other.key_bytes_)),
           value_(std::move(other.value_)), valid_(other.valid_) {
         other.valid_ = false;
     }
-    
+
     tktrie_iterator& operator=(tktrie_iterator&& other) noexcept {
         if (this != &other) {
             parent_ = other.parent_;
@@ -139,27 +139,27 @@ public:
     value_type operator*() const { return {key(), value_}; }
     bool valid() const noexcept { return valid_; }
     explicit operator bool() const noexcept { return valid_; }
-    
+
     bool operator==(const tktrie_iterator& other) const noexcept {
         if (!valid_ && !other.valid_) return true;
         if (valid_ != other.valid_) return false;
         return key_bytes_ == other.key_bytes_;
     }
-    
+
     bool operator!=(const tktrie_iterator& other) const noexcept { return !(*this == other); }
-    
+
     tktrie_iterator& operator++() {
         if (!valid_ || !parent_) { valid_ = false; return *this; }
         *this = parent_->next_after(key_bytes_);
         return *this;
     }
-    
+
     tktrie_iterator operator++(int) {
         tktrie_iterator tmp(*this);
         ++(*this);
         return tmp;
     }
-    
+
     static tktrie_iterator end_iterator() noexcept { return tktrie_iterator(); }
 };
 

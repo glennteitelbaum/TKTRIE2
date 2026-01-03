@@ -16,106 +16,115 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
     using node_view_t = typename base::node_view_t;
     using dataptr_t = typename base::dataptr_t;
 
-    // Find data slot for exact key match
-    // Returns: for non-leaf, pointer to dataptr slot; for leaf, pointer to embedded T slot
-    // is_leaf_out: set to true if result is embedded T (not dataptr)
+    // Returns: data slot pointer, is_leaf flag (true = embedded T, false = dataptr)
     static slot_type* find_data_slot(slot_type* root, std::string_view key, bool& is_leaf_out) noexcept {
         is_leaf_out = false;
         slot_type* cur = root;
-        
+
         while (cur) {
             node_view_t view(cur);
-            
+
             if (view.has_skip()) {
                 std::string_view skip = view.skip_chars();
                 size_t match = base::match_skip(skip, key);
-                
                 if (match < skip.size()) return nullptr;
                 key.remove_prefix(match);
-                
+
                 if (key.empty()) {
+                    if (view.has_leaf()) {
+                        if (view.leaf_has_eos()) {
+                            // LEAF terminal with skip_eos
+                            return reinterpret_cast<slot_type*>(view.skip_eos_data());
+                        }
+                        return nullptr;
+                    }
                     return reinterpret_cast<slot_type*>(view.skip_eos_data());
                 }
             }
-            
+
             if (key.empty()) {
+                if (view.has_leaf()) {
+                    if (view.leaf_has_eos()) {
+                        return reinterpret_cast<slot_type*>(view.eos_data());
+                    }
+                    return nullptr;
+                }
                 return reinterpret_cast<slot_type*>(view.eos_data());
             }
-            
+
             unsigned char c = static_cast<unsigned char>(key[0]);
             slot_type* child_slot = view.find_child(c);
             if (!child_slot) return nullptr;
-            
+
             if (view.has_leaf()) {
-                // Leaf node - child_slot contains T directly
                 if (key.size() == 1) {
                     is_leaf_out = true;
                     return child_slot;
                 }
-                return nullptr;  // Key too long for leaf
+                return nullptr;
             }
-            
+
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
             if (child_ptr == 0) return nullptr;
-            
+
             cur = reinterpret_cast<slot_type*>(child_ptr);
             key.remove_prefix(1);
         }
-        
         return nullptr;
     }
 
     static bool contains(slot_type* root, std::string_view key) noexcept {
         bool is_leaf;
-        slot_type* data_slot = find_data_slot(root, key, is_leaf);
-        if (!data_slot) return false;
-        
-        if (is_leaf) return true;  // Leaf existence = key exists
-        
-        dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+        slot_type* ds = find_data_slot(root, key, is_leaf);
+        if (!ds) return false;
+        if (is_leaf) return true;
+        dataptr_t* dp = reinterpret_cast<dataptr_t*>(ds);
         return dp->has_data();
     }
 
     static bool read(slot_type* root, std::string_view key, T& out) noexcept {
         bool is_leaf;
-        slot_type* data_slot = find_data_slot(root, key, is_leaf);
-        if (!data_slot) return false;
-        
+        slot_type* ds = find_data_slot(root, key, is_leaf);
+        if (!ds) return false;
         if (is_leaf) {
-            static_assert(can_embed_leaf_v<T>, "T must be embeddable for LEAF");
-            uint64_t raw = load_slot<THREADED>(data_slot);
+            static_assert(can_embed_leaf_v<T>);
+            uint64_t raw = load_slot<THREADED>(ds);
             std::memcpy(&out, &raw, sizeof(T));
             return true;
         }
-        
-        dataptr_t* dp = reinterpret_cast<dataptr_t*>(data_slot);
+        dataptr_t* dp = reinterpret_cast<dataptr_t*>(ds);
         return dp->try_read(out);
     }
 
-    static slot_type* find_first_leaf(slot_type* node, std::string& key_out) noexcept {
+    static slot_type* find_first_leaf(slot_type* node, std::string& key_out, bool& is_embedded) noexcept {
+        is_embedded = false;
         if (!node) return nullptr;
-        
+
         while (true) {
             node_view_t view(node);
-            
-            if (view.has_skip()) {
-                key_out.append(view.skip_chars());
+
+            if (view.has_skip()) key_out.append(view.skip_chars());
+
+            // Check EOS (non-leaf or leaf terminal without skip)
+            if (!view.has_leaf()) {
+                if (view.eos_data()->has_data())
+                    return reinterpret_cast<slot_type*>(view.eos_data());
+                if (view.has_skip() && view.skip_eos_data()->has_data())
+                    return reinterpret_cast<slot_type*>(view.skip_eos_data());
+            } else if (view.leaf_has_eos()) {
+                if (view.has_skip()) {
+                    if (view.skip_eos_data()->has_data())
+                        return reinterpret_cast<slot_type*>(view.skip_eos_data());
+                } else {
+                    if (view.eos_data()->has_data())
+                        return reinterpret_cast<slot_type*>(view.eos_data());
+                }
+                return nullptr;  // Terminal with no data
             }
-            
-            // Check EOS first
-            if (view.eos_data()->has_data()) {
-                return reinterpret_cast<slot_type*>(view.eos_data());
-            }
-            
-            // Check SKIP_EOS
-            if (view.has_skip() && view.skip_eos_data()->has_data()) {
-                return reinterpret_cast<slot_type*>(view.skip_eos_data());
-            }
-            
-            // Find first child
+
             slot_type* child_slot = nullptr;
             unsigned char c = 0;
-            
+
             if (view.has_full()) {
                 if (view.has_leaf()) {
                     popcount_bitmap bmp = view.get_leaf_full_bitmap();
@@ -153,15 +162,15 @@ struct nav_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
                     }
                 }
             }
-            
+
             if (!child_slot) return nullptr;
-            
             key_out.push_back(static_cast<char>(c));
-            
+
             if (view.has_leaf()) {
-                return child_slot;  // Return embedded T slot
+                is_embedded = true;
+                return child_slot;
             }
-            
+
             uint64_t child_ptr = load_slot<THREADED>(child_slot);
             node = reinterpret_cast<slot_type*>(child_ptr);
         }

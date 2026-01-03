@@ -9,10 +9,6 @@
 
 namespace gteitelbaum {
 
-// =============================================================================
-// dataptr - nullable pointer to T, always allocated in node
-// =============================================================================
-
 template <typename T, bool THREADED, typename Allocator>
 class dataptr {
     using alloc_traits = std::allocator_traits<Allocator>;
@@ -36,9 +32,7 @@ public:
     dataptr(const dataptr&) = delete;
     dataptr& operator=(const dataptr&) = delete;
     
-    dataptr(dataptr&& other) noexcept {
-        store_ptr(other.exchange_ptr(nullptr));
-    }
+    dataptr(dataptr&& other) noexcept { store_ptr(other.exchange_ptr(nullptr)); }
     
     dataptr& operator=(dataptr&& other) noexcept {
         if (this != &other) {
@@ -66,12 +60,8 @@ public:
         T* new_ptr = value_alloc_traits::allocate(alloc, 1);
         try { std::construct_at(new_ptr, value); }
         catch (...) { value_alloc_traits::deallocate(alloc, new_ptr, 1); throw; }
-        
         T* old = exchange_ptr(new_ptr);
-        if (old) {
-            std::destroy_at(old);
-            value_alloc_traits::deallocate(alloc, old, 1);
-        }
+        if (old) { std::destroy_at(old); value_alloc_traits::deallocate(alloc, old, 1); }
     }
 
     void set(T&& value) {
@@ -79,12 +69,8 @@ public:
         T* new_ptr = value_alloc_traits::allocate(alloc, 1);
         try { std::construct_at(new_ptr, std::move(value)); }
         catch (...) { value_alloc_traits::deallocate(alloc, new_ptr, 1); throw; }
-        
         T* old = exchange_ptr(new_ptr);
-        if (old) {
-            std::destroy_at(old);
-            value_alloc_traits::deallocate(alloc, old, 1);
-        }
+        if (old) { std::destroy_at(old); value_alloc_traits::deallocate(alloc, old, 1); }
     }
 
     void clear() noexcept {
@@ -104,29 +90,16 @@ public:
 
 private:
     T* load_ptr() const noexcept {
-        if constexpr (THREADED) {
-            return ptr_.load(std::memory_order_acquire);
-        } else {
-            return ptr_;
-        }
+        if constexpr (THREADED) return ptr_.load(std::memory_order_acquire);
+        else return ptr_;
     }
-    
     void store_ptr(T* p) noexcept {
-        if constexpr (THREADED) {
-            ptr_.store(p, std::memory_order_release);
-        } else {
-            ptr_ = p;
-        }
+        if constexpr (THREADED) ptr_.store(p, std::memory_order_release);
+        else ptr_ = p;
     }
-    
     T* exchange_ptr(T* p) noexcept {
-        if constexpr (THREADED) {
-            return ptr_.exchange(p, std::memory_order_acq_rel);
-        } else {
-            T* old = ptr_;
-            ptr_ = p;
-            return old;
-        }
+        if constexpr (THREADED) return ptr_.exchange(p, std::memory_order_acq_rel);
+        else { T* old = ptr_; ptr_ = p; return old; }
     }
 };
 

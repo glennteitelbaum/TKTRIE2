@@ -30,17 +30,22 @@ void static_node_deleter(void* ptr) {
     using slot_type = slot_type_t<THREADED>;
     using node_view_t = node_view<T, THREADED, Allocator, FIXED_LEN>;
     using dataptr_t = dataptr<T, THREADED, Allocator>;
-    
+
     slot_type* node = static_cast<slot_type*>(ptr);
     node_view_t view(node);
-    
-    view.eos_data()->~dataptr_t();
-    if (view.has_skip()) view.skip_eos_data()->~dataptr_t();
-    
+
+    if (!view.has_leaf()) {
+        view.eos_data()->~dataptr_t();
+        if (view.has_skip()) view.skip_eos_data()->~dataptr_t();
+    } else if (view.leaf_has_eos()) {
+        if (view.has_skip()) view.skip_eos_data()->~dataptr_t();
+        else view.eos_data()->~dataptr_t();
+    }
+
     using alloc_traits = std::allocator_traits<Allocator>;
     using slot_alloc_t = typename alloc_traits::template rebind_alloc<slot_type>;
     using slot_alloc_traits = std::allocator_traits<slot_alloc_t>;
-    
+
     slot_alloc_t alloc;
     slot_alloc_traits::deallocate(alloc, node, view.size());
 }
@@ -65,11 +70,10 @@ private:
     using nav_t = nav_helpers<T, THREADED, Allocator, fixed_len>;
     using insert_t = insert_helpers<T, THREADED, Allocator, fixed_len>;
     using remove_t = remove_helpers<T, THREADED, Allocator, fixed_len>;
-    using debug_t = trie_debug<Key, T, THREADED, Allocator, fixed_len>;
     using mutex_type = std::conditional_t<THREADED, std::mutex, empty_mutex>;
-    
+
     static constexpr auto node_deleter = &static_node_deleter<T, THREADED, Allocator, fixed_len>;
-    
+
     slot_type root_slot_;
     std::conditional_t<THREADED, std::atomic<size_type>, size_type> elem_count_{0};
     mutable mutex_type write_mutex_;
@@ -85,7 +89,7 @@ private:
     slot_type* get_root() const noexcept {
         return reinterpret_cast<slot_type*>(load_slot<THREADED>(const_cast<slot_type*>(&root_slot_)));
     }
-    
+
     void set_root(slot_type* r) noexcept { store_slot<THREADED>(&root_slot_, reinterpret_cast<uint64_t>(r)); }
 
 public:
@@ -186,28 +190,28 @@ public:
         else return begin_impl();
     }
 
-    iterator next_after(const std::string&) const { return end(); }  // TODO
+    iterator next_after(const std::string&) const { return end(); }
 
 private:
     iterator begin_impl() const {
         slot_type* root = get_root();
         if (!root) return end();
         std::string key;
-        slot_type* ds = nav_t::find_first_leaf(root, key);
+        bool is_embedded = false;
+        slot_type* ds = nav_t::find_first_leaf(root, key, is_embedded);
         if (!ds) return end();
-        
-        // Check if it's a leaf value or dataptr
-        // For simplicity, try reading as dataptr first
-        dataptr_t* dp = reinterpret_cast<dataptr_t*>(ds);
+
         T value;
-        if (dp->try_read(value)) return iterator(this, key, value);
-        
-        // Must be embedded leaf value
-        if constexpr (can_embed_leaf_v<T>) {
-            uint64_t raw = load_slot<THREADED>(ds);
-            std::memcpy(&value, &raw, sizeof(T));
-            return iterator(this, key, value);
+        if (is_embedded) {
+            if constexpr (can_embed_leaf_v<T>) {
+                uint64_t raw = load_slot<THREADED>(ds);
+                std::memcpy(&value, &raw, sizeof(T));
+                return iterator(this, key, value);
+            }
+            return end();
         }
+        dataptr_t* dp = reinterpret_cast<dataptr_t*>(ds);
+        if (dp->try_read(value)) return iterator(this, key, value);
         return end();
     }
 
@@ -215,8 +219,8 @@ private:
         if (!node) return;
         node_view_t view(node);
         size_t skip_len = view.has_skip() ? view.skip_length() : 0;
-        
-        if (!view.has_leaf()) {
+
+        if (!view.has_leaf() || !view.leaf_has_children()) {
             int nc = view.child_count();
             for (int i = 0; i < nc; ++i) {
                 uint64_t cp = view.get_child_ptr(i);
