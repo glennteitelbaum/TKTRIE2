@@ -255,52 +255,39 @@ private:
 
     template <typename U>
     std::pair<iterator, bool> insert_threaded(const Key& key, const std::string& kb, U&& value) {
-        while (true) {
-            auto& slot = get_ebr_slot();
-            auto guard = slot.get_guard();
-            
-            auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), kb, std::forward<U>(value));
-            
-            if (result.already_exists) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                return {find(key), false};
-            }
-            
-            // In-place update already done atomically
-            if (result.in_place) {
-                elem_count_.fetch_add(1, std::memory_order_relaxed);
-                T val;
-                if constexpr (std::is_rvalue_reference_v<U&&>) val = std::forward<U>(value);
-                else val = value;
-                return {iterator(this, kb, val), true};
-            }
-            
-            // Use striped lock based on target node address
-            void* lock_key = (result.expected_ptr != 0) 
-                ? reinterpret_cast<void*>(result.expected_ptr) 
-                : static_cast<void*>(&root_slot_);
-            std::lock_guard<std::mutex> lock(get_striped_locks().get(lock_key));
-            
-            // Verify path hasn't changed
-            if (result.path_has_conflict()) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                cpu_pause();
-                continue;
-            }
-            
-            // Commit
-            store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
+        std::lock_guard<mutex_type> lock(write_mutex_);
+        
+        auto& slot = get_ebr_slot();
+        auto guard = slot.get_guard();
+        
+        auto result = insert_t::build_insert_path(builder_, &root_slot_, get_root(), kb, std::forward<U>(value));
+        
+        if (result.already_exists) {
+            for (auto* n : result.new_nodes) builder_.deallocate_node(n);
+            return {find(key), false};
+        }
+        
+        // In-place update already done atomically
+        if (result.in_place) {
             elem_count_.fetch_add(1, std::memory_order_relaxed);
-            
-            // Retire old nodes
-            for (auto* n : result.old_nodes) retire_node(n);
-            ebr_global::instance().try_reclaim();
-            
             T val;
             if constexpr (std::is_rvalue_reference_v<U&&>) val = std::forward<U>(value);
             else val = value;
             return {iterator(this, kb, val), true};
         }
+        
+        // Commit
+        store_slot<THREADED>(result.target_slot, reinterpret_cast<uint64_t>(result.new_subtree));
+        elem_count_.fetch_add(1, std::memory_order_relaxed);
+        
+        // Retire old nodes
+        for (auto* n : result.old_nodes) retire_node(n);
+        ebr_global::instance().try_reclaim();
+        
+        T val;
+        if constexpr (std::is_rvalue_reference_v<U&&>) val = std::forward<U>(value);
+        else val = value;
+        return {iterator(this, kb, val), true};
     }
 
     bool erase_impl(const Key& key) {
@@ -320,47 +307,34 @@ private:
     }
 
     bool erase_threaded(const std::string& kb) {
-        while (true) {
-            auto& slot = get_ebr_slot();
-            auto guard = slot.get_guard();
-            
-            auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), kb);
-            
-            if (!result.found) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                return false;
-            }
-            
-            // In-place delete already done
-            if (result.in_place) {
-                elem_count_.fetch_sub(1, std::memory_order_relaxed);
-                return true;
-            }
-            
-            // Use striped lock
-            void* lock_key = (result.expected_ptr != 0) 
-                ? reinterpret_cast<void*>(result.expected_ptr) 
-                : static_cast<void*>(&root_slot_);
-            std::lock_guard<std::mutex> lock(get_striped_locks().get(lock_key));
-            
-            // Verify path
-            if (result.path_has_conflict()) {
-                for (auto* n : result.new_nodes) builder_.deallocate_node(n);
-                cpu_pause();
-                continue;
-            }
-            
-            // Commit
-            uint64_t np = result.subtree_deleted ? 0 : reinterpret_cast<uint64_t>(result.new_subtree);
-            store_slot<THREADED>(result.target_slot, np);
+        std::lock_guard<mutex_type> lock(write_mutex_);
+        
+        auto& slot = get_ebr_slot();
+        auto guard = slot.get_guard();
+        
+        auto result = remove_t::build_remove_path(builder_, &root_slot_, get_root(), kb);
+        
+        if (!result.found) {
+            for (auto* n : result.new_nodes) builder_.deallocate_node(n);
+            return false;
+        }
+        
+        // In-place delete already done
+        if (result.in_place) {
             elem_count_.fetch_sub(1, std::memory_order_relaxed);
-            
-            // Retire old nodes
-            for (auto* n : result.old_nodes) retire_node(n);
-            ebr_global::instance().try_reclaim();
-            
             return true;
         }
+        
+        // Commit
+        uint64_t np = result.subtree_deleted ? 0 : reinterpret_cast<uint64_t>(result.new_subtree);
+        store_slot<THREADED>(result.target_slot, np);
+        elem_count_.fetch_sub(1, std::memory_order_relaxed);
+        
+        // Retire old nodes
+        for (auto* n : result.old_nodes) retire_node(n);
+        ebr_global::instance().try_reclaim();
+        
+        return true;
     }
 
     void clear_threaded() {

@@ -212,45 +212,6 @@ public:
         store_slot<THREADED>(&arr_[children_header_offset()], lst.to_u64());
     }
 
-    // Atomic in-place add child to LIST node
-    // Returns true if successful, false if LIST is full or CAS failed
-    bool try_add_list_child(unsigned char c, uint64_t child_ptr) noexcept {
-        KTRIE_DEBUG_ASSERT(has_list() && !has_leaf());
-        size_t list_off = children_header_offset();
-        
-        if constexpr (THREADED) {
-            // Load current list
-            uint64_t old_list = arr_[list_off].load(std::memory_order_acquire);
-            small_list lst = small_list::from_u64(old_list);
-            
-            // Check if full
-            if (!lst.can_add()) return false;
-            
-            int slot_idx = lst.count();
-            
-            // Write child pointer first (to slot that will become valid)
-            store_slot<THREADED>(&child_ptrs()[slot_idx], child_ptr);
-            
-            // CAS the list to add char
-            uint64_t new_list = small_list::add_char(old_list, c);
-            return arr_[list_off].compare_exchange_strong(old_list, new_list,
-                std::memory_order_release, std::memory_order_relaxed);
-        } else {
-            small_list lst = get_list();
-            if (!lst.can_add()) return false;
-            int slot_idx = lst.add(c);
-            set_list(lst);
-            store_slot<THREADED>(&child_ptrs()[slot_idx], child_ptr);
-            return true;
-        }
-    }
-    
-    // Get pointer to list slot for direct atomic access
-    slot_type* list_slot() noexcept {
-        KTRIE_DEBUG_ASSERT(has_list());
-        return &arr_[children_header_offset()];
-    }
-
     popcount_bitmap get_bitmap() const noexcept {
         KTRIE_DEBUG_ASSERT(has_pop());
         size_t off = children_header_offset();

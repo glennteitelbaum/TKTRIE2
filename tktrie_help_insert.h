@@ -407,39 +407,12 @@ struct insert_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
         size_t effective_depth = depth + (view.has_skip() ? view.skip_length() : 0);
         bool at_leaf_depth = (FIXED_LEN > 0) && can_embed_leaf_v<T> && (effective_depth == FIXED_LEN - 1) && rest.empty();
 
-        // OPTIMIZATION 1: In-place update for LEAF|FULL
+        // OPTIMIZATION: In-place update for LEAF|FULL
         if (at_leaf_depth && view.has_leaf() && view.has_full()) {
             view.set_leaf_value(static_cast<int>(c), std::forward<U>(value));
             view.leaf_full_set_bit(c);
             result.in_place = true;
             return result;
-        }
-
-        // OPTIMIZATION 2: In-place add to LIST node (non-LEAF only)
-        if (!at_leaf_depth && view.has_list() && !view.has_leaf()) {
-            small_list lst = view.get_list();
-            if (lst.can_add()) {
-                // Build child node first
-                slot_type* child_node;
-                if (rest.empty()) {
-                    child_node = builder.build_empty();
-                    node_view_t cv(child_node);
-                    cv.eos_data()->set(std::forward<U>(value));
-                } else {
-                    child_node = builder.build_skip(rest);
-                    node_view_t cv(child_node);
-                    cv.skip_eos_data()->set(std::forward<U>(value));
-                }
-                
-                // Try atomic add
-                if (view.try_add_list_child(c, reinterpret_cast<uint64_t>(child_node))) {
-                    result.new_nodes.push_back(child_node);
-                    result.in_place = true;
-                    return result;
-                }
-                // CAS failed - deallocate child and fall through to COW path
-                builder.deallocate_node(child_node);
-            }
         }
 
         auto old_children = base::extract_children(view);
