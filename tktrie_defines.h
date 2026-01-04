@@ -243,12 +243,14 @@ public:
         return static_cast<unsigned char>((data_ >> (56 - idx * 8)) & 0xFF);
     }
 
+    // SWAR (SIMD Within A Register) parallel byte search
     KTRIE_FORCE_INLINE int find(unsigned char c) const noexcept {
-        int n = count();
-        for (int i = 0; i < n; ++i) {
-            if (char_at(i) == c) return i;
-        }
-        return -1;
+        constexpr uint64_t rep = 0x01'01'01'01'01'01'01'00ULL;
+        constexpr uint64_t low_bits = 0x7F'7F'7F'7F'7F'7F'7F'7FULL;
+        uint64_t diff = data_ ^ (rep * static_cast<uint64_t>(c));
+        uint64_t zeros = ~((((diff & low_bits) + low_bits) | diff) | low_bits);
+        int pos = std::countl_zero(zeros) / 8;
+        return (pos < count()) ? pos : -1;
     }
 
     KTRIE_FORCE_INLINE bool contains(unsigned char c) const noexcept {
