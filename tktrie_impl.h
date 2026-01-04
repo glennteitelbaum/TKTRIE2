@@ -25,12 +25,13 @@ template <typename Key, typename T, bool THREADED, typename Allocator> class tkt
 template <typename T, bool THREADED, typename Allocator>
 void static_node_deleter(void* ptr) {
     if (!ptr) return;
-    using node_t = trie_node<T, THREADED, Allocator>;
+    using ptr_t = node_ptr<T, THREADED, Allocator>;
     using builder_t = node_builder<T, THREADED, Allocator>;
-    
-    node_t* node = static_cast<node_t*>(ptr);
+
+    ptr_t p;
+    p.raw = ptr;
     builder_t builder;
-    builder.free_subtree(node);
+    builder.free_subtree(p);
 }
 
 template <typename Key, typename T, bool THREADED = false, typename Allocator = std::allocator<uint64_t>>
@@ -45,18 +46,19 @@ public:
     using const_iterator = iterator;
 
 private:
-    using node_t = trie_node<T, THREADED, Allocator>;
+    using ptr_t = node_ptr<T, THREADED, Allocator>;
     using builder_t = node_builder<T, THREADED, Allocator>;
     using nav_t = nav_helpers<T, THREADED, Allocator>;
     using insert_t = insert_helpers<T, THREADED, Allocator>;
     using remove_t = remove_helpers<T, THREADED, Allocator>;
     using mutex_type = std::conditional_t<THREADED, std::mutex, empty_mutex>;
-    using insert_result_t = insert_result<THREADED>;
-    using remove_result_t = remove_result<THREADED>;
+    using insert_result_t = insert_result<T, THREADED, Allocator>;
+    using remove_result_t = remove_result<T, THREADED, Allocator>;
+    using atomic_ptr_t = atomic_node_ptr<T, THREADED, Allocator>;
 
     static constexpr auto node_deleter = &static_node_deleter<T, THREADED, Allocator>;
 
-    std::conditional_t<THREADED, std::atomic<node_t*>, node_t*> root_{nullptr};
+    atomic_ptr_t root_;
     std::conditional_t<THREADED, std::atomic<size_type>, size_type> elem_count_{0};
     mutable mutex_type write_mutex_;
     Allocator alloc_;
@@ -64,34 +66,27 @@ private:
 
     friend class tktrie_iterator<Key, T, THREADED, Allocator>;
 
-    node_t* get_root() const noexcept {
-        if constexpr (THREADED) return root_.load(std::memory_order_acquire);
-        else return root_;
-    }
+    ptr_t get_root() const noexcept { return root_.load(); }
+    void set_root(ptr_t r) noexcept { root_.store(r); }
 
-    void set_root(node_t* r) noexcept {
-        if constexpr (THREADED) root_.store(r, std::memory_order_release);
-        else root_ = r;
-    }
-
-    void retire_node(node_t* node) const {
+    void retire_node(ptr_t p) const {
         if constexpr (THREADED) {
-            if (node) ebr_global::instance().retire(node, node_deleter);
+            if (p) ebr_global::instance().retire(p.raw, node_deleter);
         }
     }
 
 public:
     tktrie() : builder_(alloc_) {}
-    
+
     explicit tktrie(const Allocator& alloc) : alloc_(alloc), builder_(alloc) {}
-    
+
     ~tktrie() { clear(); }
 
     tktrie(const tktrie& other) : alloc_(other.alloc_), builder_(other.alloc_) {
         if constexpr (THREADED) {
             std::lock_guard<mutex_type> lock(other.write_mutex_);
         }
-        node_t* other_root = const_cast<tktrie&>(other).get_root();
+        ptr_t other_root = const_cast<tktrie&>(other).get_root();
         if (other_root) {
             set_root(builder_.deep_copy(other_root));
         }
@@ -112,11 +107,11 @@ public:
     tktrie(tktrie&& other) noexcept : alloc_(std::move(other.alloc_)), builder_(alloc_) {
         if constexpr (THREADED) {
             std::lock_guard<mutex_type> lock(other.write_mutex_);
-            root_.store(other.root_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
+            root_.store(other.root_.exchange(nullptr));
             elem_count_.store(other.elem_count_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
         } else {
             root_ = other.root_;
-            other.root_ = nullptr;
+            other.root_.store(nullptr);
             elem_count_ = other.elem_count_;
             other.elem_count_ = 0;
         }
@@ -127,11 +122,11 @@ public:
             clear();
             if constexpr (THREADED) {
                 std::lock_guard<mutex_type> lock(other.write_mutex_);
-                root_.store(other.root_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
+                root_.store(other.root_.exchange(nullptr));
                 elem_count_.store(other.elem_count_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
             } else {
                 root_ = other.root_;
-                other.root_ = nullptr;
+                other.root_.store(nullptr);
                 elem_count_ = other.elem_count_;
                 other.elem_count_ = 0;
             }
@@ -147,19 +142,21 @@ public:
             mutex_type* second = &write_mutex_ < &other.write_mutex_ ? &other.write_mutex_ : &write_mutex_;
             std::lock_guard<mutex_type> l1(*first);
             std::lock_guard<mutex_type> l2(*second);
-            node_t* tmp = root_.exchange(other.root_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            other.root_.store(tmp, std::memory_order_relaxed);
+            ptr_t tmp = root_.exchange(other.root_.load());
+            other.root_.store(tmp);
             size_type tc = elem_count_.exchange(other.elem_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             other.elem_count_.store(tc, std::memory_order_relaxed);
         } else {
-            std::swap(root_, other.root_);
+            ptr_t tmp = root_.load();
+            root_.store(other.root_.load());
+            other.root_.store(tmp);
             std::swap(elem_count_, other.elem_count_);
         }
         std::swap(alloc_, other.alloc_);
     }
 
     bool empty() const noexcept { return size() == 0; }
-    
+
     size_type size() const noexcept {
         if constexpr (THREADED) return elem_count_.load(std::memory_order_relaxed);
         else return elem_count_;
@@ -241,30 +238,30 @@ public:
 
 private:
     iterator begin_impl() const {
-        node_t* root = get_root();
+        ptr_t root = get_root();
         if (!root) return end();
 
         std::string key;
         bool is_skip_eos;
-        node_t* node = nav_t::find_first_leaf(root, key, is_skip_eos);
+        ptr_t node = nav_t::find_first_leaf(root, key, is_skip_eos);
         if (!node) return end();
 
-        T* val_ptr = is_skip_eos ? node->get_skip_eos() : node->get_eos();
+        T* val_ptr = is_skip_eos ? node.get_skip_eos() : node.get_eos();
         if (!val_ptr) return end();
 
         return iterator(this, key, *val_ptr);
     }
 
     iterator next_after_impl(const std::string& current_key) const {
-        node_t* root = get_root();
+        ptr_t root = get_root();
         if (!root) return end();
 
         std::string next_key;
         bool is_skip_eos;
-        node_t* node = nav_t::find_next_leaf(root, current_key, next_key, is_skip_eos);
+        ptr_t node = nav_t::find_next_leaf(root, current_key, next_key, is_skip_eos);
         if (!node) return end();
 
-        T* val_ptr = is_skip_eos ? node->get_skip_eos() : node->get_eos();
+        T* val_ptr = is_skip_eos ? node.get_skip_eos() : node.get_eos();
         if (!val_ptr) return end();
 
         return iterator(this, next_key, *val_ptr);
@@ -282,22 +279,20 @@ private:
 
     template <typename U>
     std::pair<iterator, bool> insert_single(const Key& key, const std::string& kb, U&& value) {
-        node_t* root = get_root();
+        ptr_t root = get_root();
         auto result = insert_t::build_insert_path(builder_, &root_, root, kb, std::forward<U>(value));
 
         if (result.already_exists) {
-            // Free newly allocated nodes
-            for (void* n : result.new_nodes) {
-                builder_.deallocate_node(static_cast<node_t*>(n));
+            for (auto& n : result.new_nodes) {
+                builder_.deallocate_node(n);
             }
             return {find(key), false};
         }
 
         if (!result.in_place) {
-            set_root(static_cast<node_t*>(result.new_subtree));
-            // Free old nodes
-            for (void* n : result.old_nodes) {
-                builder_.deallocate_node(static_cast<node_t*>(n));
+            set_root(result.new_subtree);
+            for (auto& n : result.old_nodes) {
+                builder_.deallocate_node(n);
             }
         }
 
@@ -317,13 +312,12 @@ private:
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
 
-        node_t* root = get_root();
-        auto result = insert_t::build_insert_path(builder_, 
-            reinterpret_cast<node_t**>(&root_), root, kb, std::forward<U>(value));
+        ptr_t root = get_root();
+        auto result = insert_t::build_insert_path(builder_, &root_, root, kb, std::forward<U>(value));
 
         if (result.already_exists) {
-            for (void* n : result.new_nodes) {
-                builder_.deallocate_node(static_cast<node_t*>(n));
+            for (auto& n : result.new_nodes) {
+                builder_.deallocate_node(n);
             }
             return {find(key), false};
         }
@@ -339,13 +333,11 @@ private:
             return {iterator(this, kb, val), true};
         }
 
-        // Commit
-        set_root(static_cast<node_t*>(result.new_subtree));
+        set_root(result.new_subtree);
         elem_count_.fetch_add(1, std::memory_order_relaxed);
 
-        // Retire old nodes
-        for (void* n : result.old_nodes) {
-            retire_node(static_cast<node_t*>(n));
+        for (auto& n : result.old_nodes) {
+            retire_node(n);
         }
         ebr_global::instance().try_reclaim();
 
@@ -368,7 +360,7 @@ private:
     }
 
     bool erase_single(const std::string& kb) {
-        node_t* root = get_root();
+        ptr_t root = get_root();
         auto result = remove_t::build_remove_path(builder_, &root_, root, kb);
 
         if (!result.found) return false;
@@ -376,15 +368,14 @@ private:
         if (result.subtree_deleted) {
             set_root(nullptr);
         } else if (!result.in_place) {
-            set_root(static_cast<node_t*>(result.new_subtree));
+            set_root(result.new_subtree);
         }
 
-        // Free old nodes and values
-        for (void* n : result.old_nodes) {
-            builder_.deallocate_node(static_cast<node_t*>(n));
+        for (auto& n : result.old_nodes) {
+            builder_.deallocate_node(n);
         }
-        for (void* v : result.old_values) {
-            builder_.free_value(static_cast<T*>(v));
+        for (auto* v : result.old_values) {
+            builder_.free_value(v);
         }
 
         --elem_count_;
@@ -396,21 +387,19 @@ private:
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
 
-        node_t* root = get_root();
-        auto result = remove_t::build_remove_path(builder_,
-            reinterpret_cast<node_t**>(&root_), root, kb);
+        ptr_t root = get_root();
+        auto result = remove_t::build_remove_path(builder_, &root_, root, kb);
 
         if (!result.found) {
-            for (void* n : result.new_nodes) {
-                builder_.deallocate_node(static_cast<node_t*>(n));
+            for (auto& n : result.new_nodes) {
+                builder_.deallocate_node(n);
             }
             return false;
         }
 
         if (result.in_place) {
             elem_count_.fetch_sub(1, std::memory_order_relaxed);
-            // Retire old values
-            for (void* v : result.old_values) {
+            for (auto* v : result.old_values) {
                 ebr_global::instance().retire(v, [](void* p) {
                     delete static_cast<T*>(p);
                 });
@@ -418,19 +407,17 @@ private:
             return true;
         }
 
-        // Commit
         if (result.subtree_deleted) {
             set_root(nullptr);
         } else {
-            set_root(static_cast<node_t*>(result.new_subtree));
+            set_root(result.new_subtree);
         }
         elem_count_.fetch_sub(1, std::memory_order_relaxed);
 
-        // Retire old nodes and values
-        for (void* n : result.old_nodes) {
-            retire_node(static_cast<node_t*>(n));
+        for (auto& n : result.old_nodes) {
+            retire_node(n);
         }
-        for (void* v : result.old_values) {
+        for (auto* v : result.old_values) {
             ebr_global::instance().retire(v, [](void* p) {
                 delete static_cast<T*>(p);
             });
@@ -441,13 +428,11 @@ private:
     }
 
     void clear_threaded() {
-        node_t* old_root = nullptr;
+        ptr_t old_root;
         {
             std::lock_guard<mutex_type> lock(write_mutex_);
-            if constexpr (THREADED) {
-                old_root = root_.exchange(nullptr, std::memory_order_relaxed);
-                elem_count_.store(0, std::memory_order_relaxed);
-            }
+            old_root = root_.exchange(nullptr);
+            elem_count_.store(0, std::memory_order_relaxed);
         }
         if (old_root) {
             ebr_global::instance().advance_epoch();
