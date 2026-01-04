@@ -1,380 +1,332 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 #include <vector>
-#include <algorithm>
 
 #include "tktrie_defines.h"
-#include "tktrie_help_common.h"
+#include "tktrie_node.h"
+#include "tktrie_help_nav.h"
 
 namespace gteitelbaum {
 
 template <bool THREADED>
 struct remove_result {
-    slot_type_t<THREADED>* new_subtree = nullptr;
-    slot_type_t<THREADED>* target_slot = nullptr;
+    void* new_subtree = nullptr;
+    void* target_slot = nullptr;
     uint64_t expected_ptr = 0;
-    std::vector<slot_type_t<THREADED>*> new_nodes;
-    std::vector<slot_type_t<THREADED>*> old_nodes;
+    std::vector<void*> new_nodes;
+    std::vector<void*> old_nodes;
+    std::vector<void*> old_values;  // T* to free on commit
     bool found = false;
     bool subtree_deleted = false;
-    bool in_place = false;  // True if delete was done atomically in-place
+    bool in_place = false;
 
-    remove_result() { new_nodes.reserve(16); old_nodes.reserve(16); }
-
-    bool path_has_conflict() const noexcept {
-        if (in_place) return false;
-        if constexpr (THREADED) {
-            if (target_slot) {
-                uint64_t cur = load_slot<THREADED>(target_slot);
-                if (cur != expected_ptr) return true;
-            }
-        }
-        return false;
+    remove_result() {
+        new_nodes.reserve(8);
+        old_nodes.reserve(8);
+        old_values.reserve(4);
     }
 };
 
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct remove_helpers : trie_helpers<T, THREADED, Allocator, FIXED_LEN> {
-    using base = trie_helpers<T, THREADED, Allocator, FIXED_LEN>;
-    using slot_type = typename base::slot_type;
-    using node_view_t = typename base::node_view_t;
-    using node_builder_t = typename base::node_builder_t;
-    using dataptr_t = typename base::dataptr_t;
+template <typename T, bool THREADED, typename Allocator>
+struct remove_helpers {
+    using node_t = trie_node<T, THREADED, Allocator>;
+    using builder_t = node_builder<T, THREADED, Allocator>;
+    using nav_t = nav_helpers<T, THREADED, Allocator>;
     using result_t = remove_result<THREADED>;
 
-    static result_t build_remove_path(node_builder_t& builder, slot_type* root_slot, slot_type* root,
-                                       std::string_view key, size_t depth = 0) {
+    static result_t build_remove_path(builder_t& builder, node_t** root_slot, node_t* root,
+                                       std::string_view key) {
         result_t result;
         if (!root) return result;
+
         result.target_slot = root_slot;
         result.expected_ptr = reinterpret_cast<uint64_t>(root);
-        return remove_from_node(builder, root, key, depth, result);
+
+        return remove_from_node(builder, root_slot, root, key, result);
     }
 
 private:
-    static result_t& remove_from_node(node_builder_t& builder, slot_type* node,
-                                       std::string_view key, size_t depth, result_t& result) {
-        node_view_t view(node);
+    static result_t& remove_from_node(builder_t& builder, node_t** parent_slot, node_t* node,
+                                       std::string_view key, result_t& result) {
+        result.target_slot = parent_slot;
+        result.expected_ptr = reinterpret_cast<uint64_t>(node);
 
-        if (view.has_skip()) {
-            std::string_view skip = view.skip_chars();
-            size_t match = base::match_skip(skip, key);
-            if (match < skip.size()) return result;
-            key.remove_prefix(match);
-            depth += match;
+        // EOS-only node
+        if (node->is_eos()) {
             if (key.empty()) {
-                if (view.has_leaf()) {
-                    if (!view.leaf_has_eos()) return result;
-                    dataptr_t* dp = view.has_skip() ? view.skip_eos_data() : view.eos_data();
-                    if (!dp->has_data()) return result;
-                } else {
-                    if (!view.skip_eos_data()->has_data()) return result;
-                }
+                T* eos = node->get_eos();
+                if (!eos) return result;  // Not found
+                
+                result.found = true;
+                result.subtree_deleted = true;
+                result.old_values.push_back(eos);
+                result.old_nodes.push_back(node);
+                return result;
+            }
+            return result;  // Key not found
+        }
+
+        // Node with skip
+        const std::string& skip = node->get_skip();
+
+        if (!skip.empty()) {
+            size_t match = nav_t::match_skip(skip, key);
+            if (match < skip.size()) return result;  // Key diverges - not found
+            key.remove_prefix(match);
+
+            if (key.empty()) {
+                // Remove skip_eos
+                T* skip_eos = node->get_skip_eos();
+                if (!skip_eos) return result;
+
+                result.found = true;
+                result.old_values.push_back(skip_eos);
+
+                // Check if node can be collapsed
                 return remove_skip_eos(builder, node, result);
             }
-        }
+        } else {
+            if (key.empty()) {
+                // Remove EOS
+                T* eos = node->get_eos();
+                if (!eos) return result;
 
-        if (key.empty()) {
-            if (view.has_leaf()) {
-                if (!view.leaf_has_eos()) return result;
-                if (!view.eos_data()->has_data()) return result;
-            } else {
-                if (!view.eos_data()->has_data()) return result;
+                result.found = true;
+                result.old_values.push_back(eos);
+
+                return remove_eos(builder, node, result);
             }
-            return remove_eos(builder, node, result);
         }
 
+        // Need to follow child
         unsigned char c = static_cast<unsigned char>(key[0]);
-        slot_type* child_slot = view.find_child(c);
-        if (!child_slot) return result;
+        key.remove_prefix(1);
 
-        if (view.has_leaf()) {
-            if (key.size() == 1) return remove_leaf_child(builder, node, c, result);
+        node_t* child = node->find_child(c);
+        if (!child) return result;
+
+        // Recurse
+        result_t child_result;
+        if (node->is_list()) {
+            int idx = node->list.chars.find(c);
+            remove_from_node(builder,
+                reinterpret_cast<node_t**>(&node->list.children[idx].ptr_),
+                child, key, child_result);
+        } else {
+            remove_from_node(builder,
+                reinterpret_cast<node_t**>(&node->full.children[c].ptr_),
+                child, key, child_result);
+        }
+
+        if (!child_result.found) {
+            result.found = false;
             return result;
         }
 
-        uint64_t child_ptr = load_slot<THREADED>(child_slot);
-        if (child_ptr == 0) return result;
-
-        slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
-        result_t child_result;
-        remove_from_node(builder, child, key.substr(1), depth + 1, child_result);
-
-        if (!child_result.found) { result.found = false; return result; }
+        // Merge results
+        result.found = true;
+        for (void* n : child_result.new_nodes) result.new_nodes.push_back(n);
+        for (void* n : child_result.old_nodes) result.old_nodes.push_back(n);
+        for (void* v : child_result.old_values) result.old_values.push_back(v);
 
         if (child_result.subtree_deleted) {
-            return remove_child(builder, node, c, child_result, result);
+            return remove_child(builder, node, c, result);
+        }
+
+        if (child_result.in_place) {
+            result.in_place = true;
+            return result;
+        }
+
+        // Child was rebuilt - need to update our pointer
+        return rebuild_with_new_child(builder, node, c, 
+            static_cast<node_t*>(child_result.new_subtree), result);
+    }
+
+    static result_t& remove_eos(builder_t& builder, node_t* node, result_t& result) {
+        // In-place clear
+        node->set_eos(nullptr);
+
+        // Check if node should be collapsed
+        if (can_delete_node(node)) {
+            result.subtree_deleted = true;
+            result.old_nodes.push_back(node);
         } else {
-            result.found = true;
-            for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
-            for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
-            return rebuild_with_new_child(builder, node, c, child_result.new_subtree, result);
+            result.in_place = true;
+            try_collapse(builder, node, result);
         }
-    }
-
-    static result_t& rebuild_with_new_child(node_builder_t& builder, slot_type* node, unsigned char c,
-                                             slot_type* new_child, result_t& result) {
-        node_view_t view(node);
-        KTRIE_DEBUG_ASSERT(!view.has_leaf());
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-
-        int idx = base::find_char_index(chars, c);
-        if (idx >= 0) {
-            if (view.has_full()) children[c] = reinterpret_cast<uint64_t>(new_child);
-            else children[idx] = reinterpret_cast<uint64_t>(new_child);
-        }
-
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
-
-        result.new_nodes.push_back(new_node);
-        result.old_nodes.push_back(node);
-        result.new_subtree = new_node;
         return result;
     }
 
-    static result_t& remove_eos(node_builder_t& builder, slot_type* node, result_t& result) {
-        node_view_t view(node);
-        result.found = true;
+    static result_t& remove_skip_eos(builder_t& builder, node_t* node, result_t& result) {
+        // In-place clear
+        node->set_skip_eos(nullptr);
 
-        bool has_skip_eos = view.has_skip() && !view.has_leaf() && view.skip_eos_data()->has_data();
-        bool has_children = view.live_child_count() > 0;
-
-        if (!has_skip_eos && !has_children) {
+        // Check if node should be collapsed
+        if (can_delete_node(node)) {
             result.subtree_deleted = true;
             result.old_nodes.push_back(node);
-            return result;
+        } else {
+            result.in_place = true;
+            try_collapse(builder, node, result);
         }
-
-        if (view.has_leaf()) {
-            result.subtree_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
-
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
-        node_view_t nv(new_node);
-        nv.eos_data()->clear();
-
-        result.new_nodes.push_back(new_node);
-        result.new_subtree = new_node;
-        result.old_nodes.push_back(node);
-        try_collapse(builder, result);
         return result;
     }
 
-    static result_t& remove_skip_eos(node_builder_t& builder, slot_type* node, result_t& result) {
-        node_view_t view(node);
-        result.found = true;
-
-        bool has_eos = !view.has_leaf() && view.eos_data()->has_data();
-        bool has_children = view.live_child_count() > 0;
-
-        if (!has_eos && !has_children) {
-            result.subtree_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
-
-        if (view.has_leaf()) {
-            result.subtree_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
-
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
-        node_view_t nv(new_node);
-        if (nv.has_skip()) nv.skip_eos_data()->clear();
-
-        result.new_nodes.push_back(new_node);
-        result.new_subtree = new_node;
-        result.old_nodes.push_back(node);
-        try_collapse(builder, result);
-        return result;
-    }
-
-    static result_t& remove_child(node_builder_t& builder, slot_type* node, unsigned char c,
-                                   result_t& child_result, result_t& result) {
-        for (auto* n : child_result.new_nodes) result.new_nodes.push_back(n);
-        for (auto* n : child_result.old_nodes) result.old_nodes.push_back(n);
-        result.found = true;
-
-        node_view_t view(node);
-        KTRIE_DEBUG_ASSERT(!view.has_leaf());
-        auto children = base::extract_children(view);
-        auto chars = base::get_child_chars(view);
-
-        int idx = base::find_char_index(chars, c);
-        if (view.has_full()) {
-            children[c] = 0;
-            chars.erase(std::remove(chars.begin(), chars.end(), c), chars.end());
-        } else if (idx >= 0) {
-            children.erase(children.begin() + idx);
-            chars.erase(chars.begin() + idx);
-        }
-
-        bool has_eos = view.eos_data()->has_data();
-        bool has_skip_eos = view.has_skip() && view.skip_eos_data()->has_data();
-
-        if (chars.empty() && !has_eos && !has_skip_eos) {
-            result.subtree_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
-
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-
-        if (node_type != 2 && view.has_full()) {
-            std::vector<uint64_t> new_children;
-            for (auto ch : chars) new_children.push_back(children[ch]);
-            children = std::move(new_children);
-        }
-
-        slot_type* new_node = base::rebuild_node(builder, view, node_type, lst, bmp, children);
-        result.new_nodes.push_back(new_node);
-        result.new_subtree = new_node;
-        result.old_nodes.push_back(node);
-        try_collapse(builder, result);
-        return result;
-    }
-
-    static result_t& remove_leaf_child(node_builder_t& builder, slot_type* node, unsigned char c, result_t& result) {
-        result.found = true;
-        node_view_t view(node);
-        KTRIE_DEBUG_ASSERT(view.has_leaf() && view.leaf_has_children());
-
-        // OPTIMIZATION: In-place atomic delete for LEAF|FULL if no downgrade needed
-        if (view.has_full()) {
-            popcount_bitmap valid_bmp = view.get_leaf_full_bitmap();
-            int cur_count = valid_bmp.count();
-            
-            // If still above FULL_THRESHOLD after delete, do in-place atomic clear
-            if (cur_count > FULL_THRESHOLD + 1) {
-                view.leaf_full_clear_bit(c);
-                result.in_place = true;
-                return result;
+    static result_t& remove_child(builder_t& builder, node_t* node, unsigned char c, result_t& result) {
+        if (node->is_list()) {
+            int idx = node->list.chars.find(c);
+            if (idx >= 0) {
+                node->list.children[idx].store(nullptr);
+                node->list.chars.remove_at(idx);
+                
+                // Shift remaining children
+                int count = node->list.chars.count();
+                for (int i = idx; i < count; ++i) {
+                    node->list.children[i].store(node->list.children[i + 1].load());
+                }
+                node->list.children[count].store(nullptr);
             }
-            
-            // Need to downgrade or rebuild
-            valid_bmp.clear(c);
-            auto values = base::extract_leaf_values(view);
-            auto chars = base::get_child_chars(view);
-            chars.erase(std::remove(chars.begin(), chars.end(), c), chars.end());
 
-            if (chars.empty()) {
+            if (can_delete_node(node)) {
                 result.subtree_deleted = true;
                 result.old_nodes.push_back(node);
-                return result;
+            } else {
+                result.in_place = true;
+                try_collapse(builder, node, result);
             }
+        } else if (node->is_full()) {
+            node->full.valid.template atomic_clear<THREADED>(c);
+            node->full.children[c].store(nullptr);
 
-            if (chars.size() <= static_cast<size_t>(FULL_THRESHOLD)) {
-                std::vector<T> new_values;
-                for (auto ch : chars) new_values.push_back(values[ch]);
-                auto [node_type, lst, bmp] = base::build_child_structure(chars);
-                slot_type* new_node = base::rebuild_leaf_node(builder, view, node_type, lst, bmp, new_values);
-                result.new_nodes.push_back(new_node);
-                result.new_subtree = new_node;
+            int count = node->full.valid.count();
+            
+            if (can_delete_node(node)) {
+                result.subtree_deleted = true;
                 result.old_nodes.push_back(node);
-                return result;
+            } else if (count <= LIST_MAX) {
+                // Convert FULL -> LIST (COW)
+                return convert_full_to_list(builder, node, result);
+            } else {
+                result.in_place = true;
             }
+        }
+        return result;
+    }
 
-            bool has_skip = view.has_skip();
-            std::string_view skip = has_skip ? view.skip_chars() : std::string_view{};
-            slot_type* new_node = has_skip ? builder.build_leaf_skip_full(skip, valid_bmp, values)
-                                           : builder.build_leaf_full(valid_bmp, values);
-            result.new_nodes.push_back(new_node);
-            result.new_subtree = new_node;
-            result.old_nodes.push_back(node);
-            return result;
+    static result_t& rebuild_with_new_child(builder_t& builder, node_t* node, unsigned char c,
+                                             node_t* new_child, result_t& result) {
+        // Create new node with updated child
+        T* eos_val = node->get_eos();
+        T* skip_eos_val = node->get_skip_eos();
+        const std::string& skip = node->get_skip();
+
+        node_t* new_node;
+
+        if (node->is_list()) {
+            new_node = builder.build_list(skip, eos_val, skip_eos_val);
+            new_node->list.chars = node->list.chars;
+            int idx = node->list.chars.find(c);
+            for (int i = 0; i < node->list.chars.count(); ++i) {
+                if (i == idx) {
+                    new_node->list.children[i].store(new_child);
+                } else {
+                    new_node->list.children[i].store(node->list.children[i].load());
+                }
+            }
+        } else {
+            new_node = builder.build_full(skip, eos_val, skip_eos_val);
+            new_node->full.valid = node->full.valid;
+            for (int i = 0; i < 256; ++i) {
+                if (node->full.valid.test(static_cast<unsigned char>(i))) {
+                    if (static_cast<unsigned char>(i) == c) {
+                        new_node->full.children[i].store(new_child);
+                    } else {
+                        new_node->full.children[i].store(node->full.children[i].load());
+                    }
+                }
+            }
         }
 
-        auto values = base::extract_leaf_values(view);
-        auto chars = base::get_child_chars(view);
-        int idx = base::find_char_index(chars, c);
-
-        if (idx >= 0) {
-            values.erase(values.begin() + idx);
-            chars.erase(chars.begin() + idx);
-        }
-
-        if (chars.empty()) {
-            result.subtree_deleted = true;
-            result.old_nodes.push_back(node);
-            return result;
-        }
-
-        auto [node_type, lst, bmp] = base::build_child_structure(chars);
-        slot_type* new_node = base::rebuild_leaf_node(builder, view, node_type, lst, bmp, values);
         result.new_nodes.push_back(new_node);
         result.new_subtree = new_node;
         result.old_nodes.push_back(node);
         return result;
     }
 
-    static void try_collapse(node_builder_t& builder, result_t& result) {
-        if (!result.new_subtree) return;
-        node_view_t view(result.new_subtree);
+    static result_t& convert_full_to_list(builder_t& builder, node_t* node, result_t& result) {
+        T* eos_val = node->get_eos();
+        T* skip_eos_val = node->get_skip_eos();
+        const std::string& skip = node->get_skip();
 
-        if (view.has_leaf()) return;
-        if (view.eos_data()->has_data()) return;
-        if (view.has_skip() && view.skip_eos_data()->has_data()) return;
-        if (view.live_child_count() != 1) return;
+        node_t* list = builder.build_list(skip, eos_val, skip_eos_val);
 
-        auto chars = base::get_child_chars(view);
-        if (chars.empty()) return;
-
-        unsigned char c = chars[0];
-        slot_type* child_slot = view.find_child(c);
-        if (!child_slot) return;
-
-        uint64_t child_ptr = load_slot<THREADED>(child_slot);
-        if (child_ptr == 0) return;
-
-        slot_type* child = reinterpret_cast<slot_type*>(child_ptr);
-        node_view_t child_view(child);
-
-        if (child_view.has_leaf()) return;
-
-        std::string new_skip;
-        if (view.has_skip()) new_skip = std::string(view.skip_chars());
-        new_skip.push_back(static_cast<char>(c));
-        if (child_view.has_skip()) new_skip.append(child_view.skip_chars());
-
-        auto child_children = base::extract_children(child_view);
-        auto child_chars = base::get_child_chars(child_view);
-
-        slot_type* collapsed;
-        if (child_children.empty()) {
-            collapsed = builder.build_skip(new_skip);
-            node_view_t cv(collapsed);
-            cv.skip_eos_data()->deep_copy_from(*child_view.eos_data());
-        } else {
-            auto [node_type, lst, bmp] = base::build_child_structure(child_chars);
-            if (node_type == 2) {
-                collapsed = builder.build_skip_full(new_skip, child_children);
-            } else if (node_type == 1) {
-                collapsed = builder.build_skip_pop(new_skip, bmp, child_children);
-            } else {
-                collapsed = builder.build_skip_list(new_skip, lst, child_children);
+        // Copy valid children
+        for (int i = 0; i < 256; ++i) {
+            if (node->full.valid.test(static_cast<unsigned char>(i))) {
+                int idx = list->list.chars.add(static_cast<unsigned char>(i));
+                list->list.children[idx].store(node->full.children[i].load());
             }
-            node_view_t cv(collapsed);
-            cv.skip_eos_data()->deep_copy_from(*child_view.eos_data());
         }
 
-        result.old_nodes.push_back(result.new_subtree);
-        result.old_nodes.push_back(child);
-        result.new_subtree = collapsed;
+        result.new_nodes.push_back(list);
+        result.new_subtree = list;
+        result.old_nodes.push_back(node);
+        return result;
+    }
+
+    static bool can_delete_node(node_t* node) {
+        // Node can be deleted if it has no EOS, no skip_eos, and no children
+        if (node->get_eos()) return false;
+
+        if (node->is_eos()) return true;
+
+        if (node->get_skip_eos()) return false;
+
+        return node->child_count() == 0;
+    }
+
+    static void try_collapse(builder_t& builder, node_t* node, result_t& result) {
+        // Try to collapse single-child node into skip
+        if (node->is_eos()) return;
+        if (node->get_eos()) return;
+        if (node->get_skip_eos()) return;
+        if (node->child_count() != 1) return;
+
+        // Get the single child
+        unsigned char c = node->first_child_char();
+        if (c == 255) return;
+
+        node_t* child = node->find_child(c);
+        if (!child) return;
+
+        // Can only collapse if child is EOS or SKIP (no children)
+        if (has_children(child->header())) return;
+
+        // Build new skip by concatenating: node.skip + c + child.skip
+        std::string new_skip = node->get_skip();
+        new_skip.push_back(static_cast<char>(c));
+        if (!child->is_eos()) {
+            new_skip.append(child->get_skip());
+        }
+
+        T* child_val = child->is_eos() ? child->get_eos() : child->get_skip_eos();
+
+        node_t* collapsed;
+        if (new_skip.empty()) {
+            collapsed = builder.build_eos(child_val);
+        } else {
+            collapsed = builder.build_skip(new_skip, nullptr, child_val);
+        }
+
+        // The in_place flag was set, need to change to COW
+        result.in_place = false;
         result.new_nodes.push_back(collapsed);
+        result.new_subtree = collapsed;
+        result.old_nodes.push_back(node);
+        result.old_nodes.push_back(child);
     }
 };
 

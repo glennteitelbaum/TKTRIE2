@@ -1,593 +1,462 @@
 #pragma once
 
+#include <atomic>
 #include <cstring>
+#include <memory>
 #include <string>
-#include <string_view>
-#include <vector>
+#include <type_traits>
 
 #include "tktrie_defines.h"
-#include "tktrie_dataptr.h"
 
 namespace gteitelbaum {
 
-/**
- * Node layouts (SKIP/LIST/POP/FULL with embedded version in header):
- * 
- * Header: FLAGS(5) | VERSION(27) | SIZE(32)
- * 
- * NON-LEAF:
- *   [header][eos]                                          - no children
- *   [header][eos][lst][ptr x N]                            - LIST
- *   [header][eos][bmp x4][ptr x N]                         - POP
- *   [header][eos][ptr x256]                                - FULL
- *   [header][eos][skip_len][chars...][skip_eos]            - SKIP, no children
- *   [header][eos][skip_len][chars...][skip_eos][lst][ptr x N]  - SKIP+LIST
- *   etc.
- * 
- * LEAF:
- *   [header][lst][T x N]                                   - LEAF|LIST
- *   [header][bmp x4][T x N]                                - LEAF|POP  
- *   [header][valid_bmp x4][T x256]                         - LEAF|FULL
- *   [header][eos]                                          - LEAF|LIST|POP (terminal)
- *   [header][skip_len][chars...][skip_eos]                 - LEAF|SKIP|LIST|POP
- *   etc.
- */
+// Forward declarations
+template <typename T, bool THREADED, typename Allocator> struct trie_node;
+template <typename T, bool THREADED, typename Allocator> class node_builder;
 
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-class node_view {
-public:
-    using slot_type = slot_type_t<THREADED>;
-    using dataptr_t = dataptr<T, THREADED, Allocator>;
-    
-private:
-    slot_type* arr_;
+// Atomic-aware pointer wrapper
+template <typename T, bool THREADED>
+struct atomic_ptr {
+    std::conditional_t<THREADED, std::atomic<T*>, T*> ptr_{nullptr};
 
-public:
-    explicit node_view(slot_type* arr) noexcept : arr_(arr) {}
-    
-    slot_type* raw() noexcept { return arr_; }
-    const slot_type* raw() const noexcept { return arr_; }
+    T* load() const noexcept {
+        if constexpr (THREADED) return ptr_.load(std::memory_order_acquire);
+        else return ptr_;
+    }
 
-    uint64_t header() const noexcept { return load_slot<THREADED>(&arr_[0]); }
-    uint64_t flags() const noexcept { return get_flags(header()); }
-    uint32_t size() const noexcept { return get_size(header()); }
-    uint32_t version() const noexcept { return get_version(header()); }
+    void store(T* p) noexcept {
+        if constexpr (THREADED) ptr_.store(p, std::memory_order_release);
+        else ptr_ = p;
+    }
 
-    bool has_skip() const noexcept { return flags_has_skip(flags()); }
-    bool has_list() const noexcept { return flags_has_list(flags()); }
-    bool has_pop() const noexcept { return flags_has_pop(flags()); }
-    bool has_full() const noexcept { return flags_has_full(flags()); }
-    bool has_leaf() const noexcept { return flags_has_leaf(flags()); }
-    bool leaf_has_eos() const noexcept { return flags_leaf_has_eos(flags()); }
-    bool leaf_has_children() const noexcept { return flags_leaf_has_children(flags()); }
+    T* exchange(T* p) noexcept {
+        if constexpr (THREADED) return ptr_.exchange(p, std::memory_order_acq_rel);
+        else { T* old = ptr_; ptr_ = p; return old; }
+    }
 
-    void set_header(uint64_t h) noexcept { store_slot<THREADED>(&arr_[0], h); }
-    
-    // Atomically increment version in header
-    void bump_version() noexcept {
+    bool cas(T*& expected, T* desired) noexcept {
         if constexpr (THREADED) {
-            uint64_t old_h = arr_[0].load(std::memory_order_acquire);
-            uint64_t new_h;
-            do {
-                new_h = gteitelbaum::bump_version(old_h);
-            } while (!arr_[0].compare_exchange_weak(old_h, new_h, 
-                std::memory_order_release, std::memory_order_acquire));
+            return ptr_.compare_exchange_weak(expected, desired, 
+                std::memory_order_acq_rel, std::memory_order_acquire);
         } else {
-            arr_[0] = gteitelbaum::bump_version(arr_[0]);
+            if (ptr_ == expected) { ptr_ = desired; return true; }
+            expected = ptr_;
+            return false;
         }
-    }
-
-    // EOS data at offset 1 for non-leaf or leaf terminal
-    dataptr_t* eos_data() noexcept {
-        KTRIE_DEBUG_ASSERT(!has_leaf() || leaf_has_eos());
-        return reinterpret_cast<dataptr_t*>(&arr_[1]);
-    }
-    const dataptr_t* eos_data() const noexcept {
-        KTRIE_DEBUG_ASSERT(!has_leaf() || leaf_has_eos());
-        return reinterpret_cast<const dataptr_t*>(&arr_[1]);
-    }
-
-    size_t skip_len_offset() const noexcept {
-        if (has_leaf()) return 1;
-        return 2;
-    }
-
-    size_t skip_chars_offset() const noexcept { return skip_len_offset() + 1; }
-
-    size_t skip_eos_offset() const noexcept {
-        return skip_chars_offset() + bytes_to_words(skip_length());
-    }
-
-    size_t skip_length() const noexcept {
-        if (!has_skip()) return 0;
-        return static_cast<size_t>(load_slot<THREADED>(&arr_[skip_len_offset()]));
-    }
-
-    std::string_view skip_chars() const noexcept {
-        if (!has_skip()) return {};
-        size_t len = skip_length();
-        const char* data = reinterpret_cast<const char*>(&arr_[skip_chars_offset()]);
-        return std::string_view(data, len);
-    }
-
-    void set_skip_length(size_t len) noexcept {
-        store_slot<THREADED>(&arr_[skip_len_offset()], static_cast<uint64_t>(len));
-    }
-
-    void set_skip_chars(std::string_view s) noexcept {
-        char* data = reinterpret_cast<char*>(&arr_[skip_chars_offset()]);
-        std::memcpy(data, s.data(), s.size());
-        size_t total = bytes_to_words(s.size()) * 8;
-        if (s.size() < total) std::memset(data + s.size(), 0, total - s.size());
-    }
-
-    dataptr_t* skip_eos_data() noexcept {
-        KTRIE_DEBUG_ASSERT(has_skip());
-        KTRIE_DEBUG_ASSERT(!has_leaf() || leaf_has_eos());
-        return reinterpret_cast<dataptr_t*>(&arr_[skip_eos_offset()]);
-    }
-    const dataptr_t* skip_eos_data() const noexcept {
-        KTRIE_DEBUG_ASSERT(has_skip());
-        KTRIE_DEBUG_ASSERT(!has_leaf() || leaf_has_eos());
-        return reinterpret_cast<const dataptr_t*>(&arr_[skip_eos_offset()]);
-    }
-
-    size_t children_header_offset() const noexcept {
-        if (has_leaf()) {
-            if (leaf_has_eos()) return 0;
-            size_t off = 1;
-            if (has_skip()) off += 1 + bytes_to_words(skip_length());
-            return off;
-        } else {
-            size_t off = 2;
-            if (has_skip()) off += 1 + bytes_to_words(skip_length()) + 1;
-            return off;
-        }
-    }
-
-    popcount_bitmap get_leaf_full_bitmap() const noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
-        size_t off = children_header_offset();
-        std::array<uint64_t, 4> arr;
-        for (int i = 0; i < 4; ++i) arr[i] = load_slot<THREADED>(&arr_[off + i]);
-        return popcount_bitmap::from_array(arr);
-    }
-
-    void set_leaf_full_bitmap(const popcount_bitmap& bmp) noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
-        size_t off = children_header_offset();
-        auto arr = bmp.to_array();
-        for (int i = 0; i < 4; ++i) store_slot<THREADED>(&arr_[off + i], arr[i]);
-    }
-
-    bool leaf_full_test_bit(unsigned char c) const noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
-        size_t off = children_header_offset();
-        int word = c >> 6, bit = c & 63;
-        uint64_t val = load_slot<THREADED>(&arr_[off + word]);
-        return (val & (1ULL << bit)) != 0;
-    }
-
-    void leaf_full_set_bit(unsigned char c) noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
-        size_t off = children_header_offset();
-        int word = c >> 6, bit = c & 63;
-        if constexpr (THREADED) {
-            arr_[off + word].fetch_or(1ULL << bit, std::memory_order_release);
-        } else {
-            arr_[off + word] |= (1ULL << bit);
-        }
-    }
-
-    void leaf_full_clear_bit(unsigned char c) noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && has_full());
-        size_t off = children_header_offset();
-        int word = c >> 6, bit = c & 63;
-        if constexpr (THREADED) {
-            arr_[off + word].fetch_and(~(1ULL << bit), std::memory_order_release);
-        } else {
-            arr_[off + word] &= ~(1ULL << bit);
-        }
-    }
-
-    size_t child_ptrs_offset() const noexcept {
-        size_t off = children_header_offset();
-        if (has_full()) {
-            if (has_leaf()) off += 4;
-            return off;
-        }
-        if (has_list()) off += 1;
-        else if (has_pop()) off += 4;
-        return off;
-    }
-
-    small_list get_list() const noexcept {
-        KTRIE_DEBUG_ASSERT(has_list());
-        return small_list::from_u64(load_slot<THREADED>(&arr_[children_header_offset()]));
-    }
-
-    void set_list(small_list lst) noexcept {
-        KTRIE_DEBUG_ASSERT(has_list());
-        store_slot<THREADED>(&arr_[children_header_offset()], lst.to_u64());
-    }
-
-    popcount_bitmap get_bitmap() const noexcept {
-        KTRIE_DEBUG_ASSERT(has_pop());
-        size_t off = children_header_offset();
-        std::array<uint64_t, 4> arr;
-        for (int i = 0; i < 4; ++i) arr[i] = load_slot<THREADED>(&arr_[off + i]);
-        return popcount_bitmap::from_array(arr);
-    }
-
-    void set_bitmap(const popcount_bitmap& bmp) noexcept {
-        KTRIE_DEBUG_ASSERT(has_pop());
-        size_t off = children_header_offset();
-        auto arr = bmp.to_array();
-        for (int i = 0; i < 4; ++i) store_slot<THREADED>(&arr_[off + i], arr[i]);
-    }
-
-    slot_type* child_ptrs() noexcept { return &arr_[child_ptrs_offset()]; }
-    const slot_type* child_ptrs() const noexcept { return &arr_[child_ptrs_offset()]; }
-
-    int child_count() const noexcept {
-        if (leaf_has_eos()) return 0;
-        if (has_full()) return 256;
-        if (has_list()) return get_list().count();
-        if (has_pop()) return get_bitmap().count();
-        return 0;
-    }
-
-    int live_child_count() const noexcept {
-        if (leaf_has_eos()) return 0;
-        if (has_leaf() && has_full()) return get_leaf_full_bitmap().count();
-        if (has_full()) {
-            int c = 0;
-            for (int i = 0; i < 256; ++i) if (load_slot<THREADED>(&child_ptrs()[i]) != 0) ++c;
-            return c;
-        }
-        if (has_list()) {
-            if (has_leaf()) return get_list().count();
-            int c = 0;
-            for (int i = 0; i < get_list().count(); ++i) if (load_slot<THREADED>(&child_ptrs()[i]) != 0) ++c;
-            return c;
-        }
-        if (has_pop()) {
-            if (has_leaf()) return get_bitmap().count();
-            int c = 0;
-            for (int i = 0; i < get_bitmap().count(); ++i) if (load_slot<THREADED>(&child_ptrs()[i]) != 0) ++c;
-            return c;
-        }
-        return 0;
-    }
-
-    slot_type* find_child(unsigned char c) noexcept {
-        if (leaf_has_eos()) return nullptr;
-        if (has_full()) {
-            if (has_leaf() && !get_leaf_full_bitmap().contains(c)) return nullptr;
-            return &child_ptrs()[c];
-        }
-        if (has_list()) {
-            int off = get_list().offset(c);
-            if (off == 0) return nullptr;
-            return &child_ptrs()[off - 1];
-        }
-        if (has_pop()) {
-            int idx;
-            if (!get_bitmap().find(c, &idx)) return nullptr;
-            return &child_ptrs()[idx];
-        }
-        return nullptr;
-    }
-
-    const slot_type* find_child(unsigned char c) const noexcept {
-        return const_cast<node_view*>(this)->find_child(c);
-    }
-
-    uint64_t get_child_ptr(int idx) const noexcept { return load_slot<THREADED>(&child_ptrs()[idx]); }
-    void set_child_ptr(int idx, uint64_t ptr) noexcept { store_slot<THREADED>(&child_ptrs()[idx], ptr); }
-
-    T get_leaf_value(int idx) const noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && leaf_has_children());
-        static_assert(can_embed_leaf_v<T>);
-        T val{};
-        uint64_t raw = load_slot<THREADED>(&child_ptrs()[idx]);
-        std::memcpy(&val, &raw, sizeof(T));
-        return val;
-    }
-
-    void set_leaf_value(int idx, const T& val) noexcept {
-        KTRIE_DEBUG_ASSERT(has_leaf() && leaf_has_children());
-        static_assert(can_embed_leaf_v<T>);
-        uint64_t raw = 0;
-        std::memcpy(&raw, &val, sizeof(T));
-        store_slot<THREADED>(&child_ptrs()[idx], raw);
     }
 };
 
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+// Atomic-aware node pointer
+template <typename T, bool THREADED, typename Allocator>
+using node_ptr = atomic_ptr<trie_node<T, THREADED, Allocator>, THREADED>;
+
+// EOS-only node data (NODE_EOS)
+template <typename T, bool THREADED>
+struct eos_data {
+    atomic_ptr<T, THREADED> eos;
+};
+
+// Skip node data (NODE_SKIP) - has skip but no children
+template <typename T, bool THREADED, typename Allocator>
+struct skip_data {
+    atomic_ptr<T, THREADED> eos;
+    std::string skip;
+    atomic_ptr<T, THREADED> skip_eos;
+};
+
+// List node data (NODE_LIST) - skip + up to 7 children
+template <typename T, bool THREADED, typename Allocator>
+struct list_data {
+    atomic_ptr<T, THREADED> eos;
+    std::string skip;
+    atomic_ptr<T, THREADED> skip_eos;
+    small_list chars;
+    node_ptr<T, THREADED, Allocator> children[LIST_MAX];
+};
+
+// Full node data (NODE_FULL) - skip + 256 children with bitmap
+template <typename T, bool THREADED, typename Allocator>
+struct full_data {
+    atomic_ptr<T, THREADED> eos;
+    std::string skip;
+    atomic_ptr<T, THREADED> skip_eos;
+    bitmap256 valid;
+    node_ptr<T, THREADED, Allocator> children[256];
+};
+
+// Main trie node - union of all types
+template <typename T, bool THREADED, typename Allocator>
+struct trie_node {
+    using self_t = trie_node<T, THREADED, Allocator>;
+    
+    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> header_;
+    
+    union {
+        eos_data<T, THREADED> eos;
+        skip_data<T, THREADED, Allocator> skip;
+        list_data<T, THREADED, Allocator> list;
+        full_data<T, THREADED, Allocator> full;
+    };
+
+    // Header access
+    uint64_t header() const noexcept {
+        if constexpr (THREADED) return header_.load(std::memory_order_acquire);
+        else return header_;
+    }
+
+    void set_header(uint64_t h) noexcept {
+        if constexpr (THREADED) header_.store(h, std::memory_order_release);
+        else header_ = h;
+    }
+
+    uint64_t node_type() const noexcept { return get_node_type(header()); }
+    uint64_t version() const noexcept { return get_version(header()); }
+
+    // Type checks
+    bool is_eos() const noexcept { return is_eos_node(header()); }
+    bool is_skip() const noexcept { return is_skip_node(header()); }
+    bool is_list() const noexcept { return is_list_node(header()); }
+    bool is_full() const noexcept { return is_full_node(header()); }
+
+    // EOS access (available on all node types)
+    T* get_eos() const noexcept {
+        switch (node_type()) {
+            case NODE_EOS:  return eos.eos.load();
+            case NODE_SKIP: return skip.eos.load();
+            case NODE_LIST: return list.eos.load();
+            case NODE_FULL: return full.eos.load();
+            default: return nullptr;
+        }
+    }
+
+    void set_eos(T* p) noexcept {
+        switch (node_type()) {
+            case NODE_EOS:  eos.eos.store(p); break;
+            case NODE_SKIP: skip.eos.store(p); break;
+            case NODE_LIST: list.eos.store(p); break;
+            case NODE_FULL: full.eos.store(p); break;
+        }
+    }
+
+    T* exchange_eos(T* p) noexcept {
+        switch (node_type()) {
+            case NODE_EOS:  return eos.eos.exchange(p);
+            case NODE_SKIP: return skip.eos.exchange(p);
+            case NODE_LIST: return list.eos.exchange(p);
+            case NODE_FULL: return full.eos.exchange(p);
+            default: return nullptr;
+        }
+    }
+
+    // Skip access (not available on NODE_EOS)
+    const std::string& get_skip() const noexcept {
+        KTRIE_DEBUG_ASSERT(!is_eos());
+        switch (node_type()) {
+            case NODE_SKIP: return skip.skip;
+            case NODE_LIST: return list.skip;
+            case NODE_FULL: return full.skip;
+            default: {
+                static const std::string empty;
+                return empty;
+            }
+        }
+    }
+
+    T* get_skip_eos() const noexcept {
+        KTRIE_DEBUG_ASSERT(!is_eos());
+        switch (node_type()) {
+            case NODE_SKIP: return skip.skip_eos.load();
+            case NODE_LIST: return list.skip_eos.load();
+            case NODE_FULL: return full.skip_eos.load();
+            default: return nullptr;
+        }
+    }
+
+    void set_skip_eos(T* p) noexcept {
+        KTRIE_DEBUG_ASSERT(!is_eos());
+        switch (node_type()) {
+            case NODE_SKIP: skip.skip_eos.store(p); break;
+            case NODE_LIST: list.skip_eos.store(p); break;
+            case NODE_FULL: full.skip_eos.store(p); break;
+        }
+    }
+
+    T* exchange_skip_eos(T* p) noexcept {
+        KTRIE_DEBUG_ASSERT(!is_eos());
+        switch (node_type()) {
+            case NODE_SKIP: return skip.skip_eos.exchange(p);
+            case NODE_LIST: return list.skip_eos.exchange(p);
+            case NODE_FULL: return full.skip_eos.exchange(p);
+            default: return nullptr;
+        }
+    }
+
+    // Child access (only for LIST and FULL)
+    int child_count() const noexcept {
+        switch (node_type()) {
+            case NODE_LIST: return list.chars.count();
+            case NODE_FULL: return full.valid.count();
+            default: return 0;
+        }
+    }
+
+    // Find child slot for character c, returns nullptr if not found
+    self_t* find_child(unsigned char c) const noexcept {
+        switch (node_type()) {
+            case NODE_LIST: {
+                int idx = list.chars.find(c);
+                if (idx < 0) return nullptr;
+                return list.children[idx].load();
+            }
+            case NODE_FULL: {
+                if (!full.valid.test(c)) return nullptr;
+                return full.children[c].load();
+            }
+            default: return nullptr;
+        }
+    }
+
+    // Get child at specific index (for iteration)
+    self_t* get_child_at(int idx) const noexcept {
+        switch (node_type()) {
+            case NODE_LIST: {
+                if (idx >= list.chars.count()) return nullptr;
+                return list.children[idx].load();
+            }
+            case NODE_FULL: {
+                // idx is the actual character value for FULL
+                if (!full.valid.test(static_cast<unsigned char>(idx))) return nullptr;
+                return full.children[idx].load();
+            }
+            default: return nullptr;
+        }
+    }
+
+    // Get character at index (for LIST iteration)
+    unsigned char get_char_at(int idx) const noexcept {
+        KTRIE_DEBUG_ASSERT(is_list());
+        return list.chars.char_at(idx);
+    }
+
+    // Get smallest child character (for iteration)
+    unsigned char first_child_char() const noexcept {
+        switch (node_type()) {
+            case NODE_LIST: return list.chars.smallest();
+            case NODE_FULL: return full.valid.first_set();
+            default: return 255;
+        }
+    }
+
+    // Get next child character after c (for iteration)
+    unsigned char next_child_char(unsigned char c) const noexcept {
+        switch (node_type()) {
+            case NODE_LIST: {
+                // Find next smallest char > c
+                unsigned char next = 255;
+                int n = list.chars.count();
+                for (int i = 0; i < n; ++i) {
+                    unsigned char ch = list.chars.char_at(i);
+                    if (ch > c && ch < next) next = ch;
+                }
+                return next;
+            }
+            case NODE_FULL: return full.valid.next_set(c);
+            default: return 255;
+        }
+    }
+};
+
+// Node builder - handles allocation and construction
+template <typename T, bool THREADED, typename Allocator>
 class node_builder {
 public:
-    using slot_type = slot_type_t<THREADED>;
-    using dataptr_t = dataptr<T, THREADED, Allocator>;
-    using node_view_t = node_view<T, THREADED, Allocator, FIXED_LEN>;
-    
+    using node_t = trie_node<T, THREADED, Allocator>;
     using alloc_traits = std::allocator_traits<Allocator>;
-    using slot_alloc_t = typename alloc_traits::template rebind_alloc<slot_type>;
-    using slot_alloc_traits = std::allocator_traits<slot_alloc_t>;
+    using node_alloc_t = typename alloc_traits::template rebind_alloc<node_t>;
+    using node_alloc_traits = std::allocator_traits<node_alloc_t>;
+    using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
+    using value_alloc_traits = std::allocator_traits<value_alloc_t>;
 
 private:
-    slot_alloc_t alloc_;
-
-    slot_type* allocate_node(size_t num_slots) {
-        slot_type* node = slot_alloc_traits::allocate(alloc_, num_slots);
-        for (size_t i = 0; i < num_slots; ++i) store_slot<THREADED>(&node[i], 0);
-        return node;
-    }
+    node_alloc_t node_alloc_;
+    value_alloc_t value_alloc_;
 
 public:
-    explicit node_builder(const Allocator& alloc = Allocator()) : alloc_(alloc) {}
+    explicit node_builder(const Allocator& alloc = Allocator())
+        : node_alloc_(alloc), value_alloc_(alloc) {}
 
-    void deallocate_node(slot_type* node) noexcept {
-        if (!node) return;
-        node_view_t view(node);
-        if (!view.has_leaf()) {
-            view.eos_data()->~dataptr_t();
-            if (view.has_skip()) view.skip_eos_data()->~dataptr_t();
-        } else if (view.leaf_has_eos()) {
-            if (view.has_skip()) view.skip_eos_data()->~dataptr_t();
-            else view.eos_data()->~dataptr_t();
+    // Allocate and copy a value
+    T* alloc_value(const T& val) {
+        T* p = value_alloc_traits::allocate(value_alloc_, 1);
+        try {
+            std::construct_at(p, val);
+        } catch (...) {
+            value_alloc_traits::deallocate(value_alloc_, p, 1);
+            throw;
         }
-        slot_alloc_traits::deallocate(alloc_, node, view.size());
+        return p;
     }
 
-    // NON-LEAF builders
-    slot_type* build_empty() {
-        size_t sz = 2;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(0, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        return node;
+    T* alloc_value(T&& val) {
+        T* p = value_alloc_traits::allocate(value_alloc_, 1);
+        try {
+            std::construct_at(p, std::move(val));
+        } catch (...) {
+            value_alloc_traits::deallocate(value_alloc_, p, 1);
+            throw;
+        }
+        return p;
     }
 
-    slot_type* build_skip(std::string_view skip) {
-        size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_SKIP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        new (view.skip_eos_data()) dataptr_t();
-        return node;
+    void free_value(T* p) noexcept {
+        if (p) {
+            std::destroy_at(p);
+            value_alloc_traits::deallocate(value_alloc_, p, 1);
+        }
     }
 
-    slot_type* build_list(small_list lst, const std::vector<uint64_t>& children) {
-        // Pre-allocate LIST_MAX slots to allow in-place expansion
-        size_t sz = 2 + 1 + LIST_MAX;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LIST, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        view.set_list(lst);
-        for (size_t i = 0; i < children.size(); ++i) view.set_child_ptr(static_cast<int>(i), children[i]);
-        return node;
+    // Build EOS node
+    node_t* build_eos(T* eos_val = nullptr) {
+        node_t* n = node_alloc_traits::allocate(node_alloc_, 1);
+        n->set_header(make_header(NODE_EOS));
+        new (&n->eos) eos_data<T, THREADED>{};
+        n->eos.eos.store(eos_val);
+        return n;
     }
 
-    slot_type* build_pop(popcount_bitmap bmp, const std::vector<uint64_t>& children) {
-        size_t sz = 2 + 4 + bmp.count();
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_POP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        view.set_bitmap(bmp);
-        for (size_t i = 0; i < children.size(); ++i) view.set_child_ptr(static_cast<int>(i), children[i]);
-        return node;
+    // Build SKIP node
+    node_t* build_skip(const std::string& skip_str, T* eos_val = nullptr, T* skip_eos_val = nullptr) {
+        node_t* n = node_alloc_traits::allocate(node_alloc_, 1);
+        n->set_header(make_header(NODE_SKIP));
+        new (&n->skip) skip_data<T, THREADED, Allocator>{};
+        n->skip.eos.store(eos_val);
+        n->skip.skip = skip_str;
+        n->skip.skip_eos.store(skip_eos_val);
+        return n;
     }
 
-    slot_type* build_full(const std::vector<uint64_t>& children) {
-        KTRIE_DEBUG_ASSERT(children.size() == 256);
-        size_t sz = 2 + 256;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_FULL, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        for (int i = 0; i < 256; ++i) view.set_child_ptr(i, children[i]);
-        return node;
+    // Build LIST node
+    node_t* build_list(const std::string& skip_str, T* eos_val = nullptr, T* skip_eos_val = nullptr) {
+        node_t* n = node_alloc_traits::allocate(node_alloc_, 1);
+        n->set_header(make_header(NODE_LIST));
+        new (&n->list) list_data<T, THREADED, Allocator>{};
+        n->list.eos.store(eos_val);
+        n->list.skip = skip_str;
+        n->list.skip_eos.store(skip_eos_val);
+        n->list.chars = small_list{};
+        for (int i = 0; i < LIST_MAX; ++i) n->list.children[i].store(nullptr);
+        return n;
     }
 
-    slot_type* build_skip_list(std::string_view skip, small_list lst, const std::vector<uint64_t>& children) {
-        // Pre-allocate LIST_MAX slots to allow in-place expansion
-        size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1 + 1 + LIST_MAX;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_SKIP | FLAG_LIST, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        new (view.skip_eos_data()) dataptr_t();
-        view.set_list(lst);
-        for (size_t i = 0; i < children.size(); ++i) view.set_child_ptr(static_cast<int>(i), children[i]);
-        return node;
+    // Build FULL node
+    node_t* build_full(const std::string& skip_str, T* eos_val = nullptr, T* skip_eos_val = nullptr) {
+        node_t* n = node_alloc_traits::allocate(node_alloc_, 1);
+        n->set_header(make_header(NODE_FULL));
+        new (&n->full) full_data<T, THREADED, Allocator>{};
+        n->full.eos.store(eos_val);
+        n->full.skip = skip_str;
+        n->full.skip_eos.store(skip_eos_val);
+        n->full.valid = bitmap256{};
+        for (int i = 0; i < 256; ++i) n->full.children[i].store(nullptr);
+        return n;
     }
 
-    slot_type* build_skip_pop(std::string_view skip, popcount_bitmap bmp, const std::vector<uint64_t>& children) {
-        size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1 + 4 + bmp.count();
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_SKIP | FLAG_POP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        new (view.skip_eos_data()) dataptr_t();
-        view.set_bitmap(bmp);
-        for (int i = 0; i < bmp.count(); ++i) view.set_child_ptr(i, children[i]);
-        return node;
+    // Deallocate node (does NOT free children or values - caller responsibility)
+    void deallocate_node(node_t* n) noexcept {
+        if (!n) return;
+        switch (n->node_type()) {
+            case NODE_EOS:
+                n->eos.~eos_data<T, THREADED>();
+                break;
+            case NODE_SKIP:
+                n->skip.~skip_data<T, THREADED, Allocator>();
+                break;
+            case NODE_LIST:
+                n->list.~list_data<T, THREADED, Allocator>();
+                break;
+            case NODE_FULL:
+                n->full.~full_data<T, THREADED, Allocator>();
+                break;
+        }
+        node_alloc_traits::deallocate(node_alloc_, n, 1);
     }
 
-    slot_type* build_skip_full(std::string_view skip, const std::vector<uint64_t>& children) {
-        KTRIE_DEBUG_ASSERT(children.size() == 256);
-        size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1 + 256;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_SKIP | FLAG_FULL, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        new (view.skip_eos_data()) dataptr_t();
-        for (int i = 0; i < 256; ++i) view.set_child_ptr(i, children[i]);
-        return node;
-    }
-
-    // LEAF builders
-    slot_type* build_leaf_terminal() {
-        static_assert(can_embed_leaf_v<T>);
-        size_t sz = 2;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_LIST | FLAG_POP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        new (view.eos_data()) dataptr_t();
-        return node;
-    }
-
-    slot_type* build_leaf_skip_terminal(std::string_view skip) {
-        static_assert(can_embed_leaf_v<T>);
-        size_t sz = 1 + 1 + bytes_to_words(skip.size()) + 1;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        new (view.skip_eos_data()) dataptr_t();
-        return node;
-    }
-
-    slot_type* build_leaf_list(small_list lst, const std::vector<T>& values) {
-        static_assert(can_embed_leaf_v<T>);
-        // Pre-allocate LIST_MAX slots for in-place expansion
-        size_t sz = 1 + 1 + LIST_MAX;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_LIST, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_list(lst);
-        for (size_t i = 0; i < values.size(); ++i) view.set_leaf_value(static_cast<int>(i), values[i]);
-        return node;
-    }
-
-    slot_type* build_leaf_pop(popcount_bitmap bmp, const std::vector<T>& values) {
-        static_assert(can_embed_leaf_v<T>);
-        size_t sz = 1 + 4 + bmp.count();
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_POP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_bitmap(bmp);
-        for (size_t i = 0; i < values.size(); ++i) view.set_leaf_value(static_cast<int>(i), values[i]);
-        return node;
-    }
-
-    slot_type* build_leaf_full(popcount_bitmap valid_bmp, const std::vector<T>& values) {
-        static_assert(can_embed_leaf_v<T>);
-        KTRIE_DEBUG_ASSERT(values.size() == 256);
-        size_t sz = 1 + 4 + 256;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_FULL, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_leaf_full_bitmap(valid_bmp);
-        for (int i = 0; i < 256; ++i) view.set_leaf_value(i, values[i]);
-        return node;
-    }
-
-    slot_type* build_leaf_skip_list(std::string_view skip, small_list lst, const std::vector<T>& values) {
-        static_assert(can_embed_leaf_v<T>);
-        // Pre-allocate LIST_MAX slots for in-place expansion
-        size_t sz = 1 + 1 + bytes_to_words(skip.size()) + 1 + LIST_MAX;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_SKIP | FLAG_LIST, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        view.set_list(lst);
-        for (size_t i = 0; i < values.size(); ++i) view.set_leaf_value(static_cast<int>(i), values[i]);
-        return node;
-    }
-
-    slot_type* build_leaf_skip_pop(std::string_view skip, popcount_bitmap bmp, const std::vector<T>& values) {
-        static_assert(can_embed_leaf_v<T>);
-        size_t sz = 1 + 1 + bytes_to_words(skip.size()) + 4 + bmp.count();
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_SKIP | FLAG_POP, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        view.set_bitmap(bmp);
-        for (size_t i = 0; i < values.size(); ++i) view.set_leaf_value(static_cast<int>(i), values[i]);
-        return node;
-    }
-
-    slot_type* build_leaf_skip_full(std::string_view skip, popcount_bitmap valid_bmp, const std::vector<T>& values) {
-        static_assert(can_embed_leaf_v<T>);
-        KTRIE_DEBUG_ASSERT(values.size() == 256);
-        size_t sz = 1 + 1 + bytes_to_words(skip.size()) + 4 + 256;
-        slot_type* node = allocate_node(sz);
-        store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_SKIP | FLAG_FULL, static_cast<uint32_t>(sz)));
-        node_view_t view(node);
-        view.set_skip_length(skip.size());
-        view.set_skip_chars(skip);
-        view.set_leaf_full_bitmap(valid_bmp);
-        for (int i = 0; i < 256; ++i) view.set_leaf_value(i, values[i]);
-        return node;
-    }
-
-    slot_type* deep_copy(slot_type* src) {
+    // Deep copy a node (recursive)
+    node_t* deep_copy(node_t* src) {
         if (!src) return nullptr;
-        node_view_t sv(src);
-        size_t sz = sv.size();
-        slot_type* dst = allocate_node(sz);
-        store_slot<THREADED>(&dst[0], load_slot<THREADED>(&src[0]));
-        node_view_t dv(dst);
 
-        if (!sv.has_leaf()) {
-            new (dv.eos_data()) dataptr_t();
-            dv.eos_data()->deep_copy_from(*sv.eos_data());
-            if (sv.has_skip()) {
-                dv.set_skip_length(sv.skip_length());
-                dv.set_skip_chars(sv.skip_chars());
-                new (dv.skip_eos_data()) dataptr_t();
-                dv.skip_eos_data()->deep_copy_from(*sv.skip_eos_data());
-            }
-        } else if (sv.leaf_has_eos()) {
-            if (sv.has_skip()) {
-                dv.set_skip_length(sv.skip_length());
-                dv.set_skip_chars(sv.skip_chars());
-                new (dv.skip_eos_data()) dataptr_t();
-                dv.skip_eos_data()->deep_copy_from(*sv.skip_eos_data());
-            } else {
-                new (dv.eos_data()) dataptr_t();
-                dv.eos_data()->deep_copy_from(*sv.eos_data());
-            }
-        } else {
-            if (sv.has_skip()) {
-                dv.set_skip_length(sv.skip_length());
-                dv.set_skip_chars(sv.skip_chars());
-            }
-        }
+        node_t* dst = nullptr;
+        T* eos_copy = nullptr;
+        T* skip_eos_copy = nullptr;
 
-        if (sv.has_list()) dv.set_list(sv.get_list());
-        else if (sv.has_pop()) dv.set_bitmap(sv.get_bitmap());
-        else if (sv.has_leaf() && sv.has_full()) dv.set_leaf_full_bitmap(sv.get_leaf_full_bitmap());
+        // Copy EOS value if present
+        T* src_eos = src->get_eos();
+        if (src_eos) eos_copy = alloc_value(*src_eos);
 
-        int nc = sv.child_count();
-        if (sv.has_leaf() && sv.leaf_has_children()) {
-            if constexpr (can_embed_leaf_v<T>) {
-                for (int i = 0; i < nc; ++i) dv.set_leaf_value(i, sv.get_leaf_value(i));
-            }
-        } else if (!sv.leaf_has_eos()) {
-            for (int i = 0; i < nc; ++i) {
-                uint64_t cp = sv.get_child_ptr(i);
-                if (cp) dv.set_child_ptr(i, reinterpret_cast<uint64_t>(deep_copy(reinterpret_cast<slot_type*>(cp))));
-            }
+        switch (src->node_type()) {
+            case NODE_EOS:
+                dst = build_eos(eos_copy);
+                break;
+
+            case NODE_SKIP:
+                if (src->get_skip_eos()) skip_eos_copy = alloc_value(*src->get_skip_eos());
+                dst = build_skip(src->get_skip(), eos_copy, skip_eos_copy);
+                break;
+
+            case NODE_LIST:
+                if (src->get_skip_eos()) skip_eos_copy = alloc_value(*src->get_skip_eos());
+                dst = build_list(src->get_skip(), eos_copy, skip_eos_copy);
+                dst->list.chars = src->list.chars;
+                for (int i = 0; i < src->list.chars.count(); ++i) {
+                    dst->list.children[i].store(deep_copy(src->list.children[i].load()));
+                }
+                break;
+
+            case NODE_FULL:
+                if (src->get_skip_eos()) skip_eos_copy = alloc_value(*src->get_skip_eos());
+                dst = build_full(src->get_skip(), eos_copy, skip_eos_copy);
+                dst->full.valid = src->full.valid;
+                for (int i = 0; i < 256; ++i) {
+                    if (src->full.valid.test(static_cast<unsigned char>(i))) {
+                        dst->full.children[i].store(deep_copy(src->full.children[i].load()));
+                    }
+                }
+                break;
         }
         return dst;
+    }
+
+    // Free entire subtree (recursive)
+    void free_subtree(node_t* n) noexcept {
+        if (!n) return;
+
+        // Free EOS value
+        free_value(n->get_eos());
+
+        // Free skip_eos if not EOS node
+        if (!n->is_eos()) {
+            free_value(n->get_skip_eos());
+        }
+
+        // Recurse into children
+        switch (n->node_type()) {
+            case NODE_LIST:
+                for (int i = 0; i < n->list.chars.count(); ++i) {
+                    free_subtree(n->list.children[i].load());
+                }
+                break;
+            case NODE_FULL:
+                for (int i = 0; i < 256; ++i) {
+                    if (n->full.valid.test(static_cast<unsigned char>(i))) {
+                        free_subtree(n->full.children[i].load());
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+
+        deallocate_node(n);
     }
 };
 

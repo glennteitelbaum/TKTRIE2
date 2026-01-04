@@ -15,7 +15,6 @@
 
 #if defined(_MSC_VER)
 #define KTRIE_FORCE_INLINE __forceinline
-#include <stdlib.h>
 #elif defined(__GNUC__) || defined(__clang__)
 #define KTRIE_FORCE_INLINE __attribute__((always_inline)) inline
 #else
@@ -33,132 +32,54 @@ namespace gteitelbaum {
 
 static constexpr bool k_validate = (KTRIE_VALIDATE != 0);
 
-// Header format (64 bits):
-//   Flags:   5 bits  (63-59)
-//   Version: 27 bits (58-32) - per-node version for optimistic locking
-//   Size:    32 bits (31-0)
-static constexpr uint64_t FLAG_SKIP = 1ULL << 63;
-static constexpr uint64_t FLAG_LIST = 1ULL << 62;
-static constexpr uint64_t FLAG_POP  = 1ULL << 61;
-static constexpr uint64_t FLAG_FULL = 1ULL << 60;
-static constexpr uint64_t FLAG_LEAF = 1ULL << 59;
+// Node type constants (2 bits)
+static constexpr uint64_t NODE_TYPE_MASK = 0x03ULL;
+static constexpr uint64_t NODE_EOS  = 0x00ULL;  // Just EOS pointer
+static constexpr uint64_t NODE_SKIP = 0x01ULL;  // EOS + skip + skip_eos
+static constexpr uint64_t NODE_LIST = 0x02ULL;  // EOS + skip + skip_eos + ≤7 children
+static constexpr uint64_t NODE_FULL = 0x03ULL;  // EOS + skip + skip_eos + 256 children
 
-static constexpr uint64_t FLAGS_MASK   = 0xF800000000000000ULL;
-static constexpr uint64_t VERSION_MASK = 0x07FFFFFF00000000ULL;
-static constexpr uint64_t SIZE_MASK    = 0x00000000FFFFFFFFULL;
-static constexpr int VERSION_SHIFT = 32;
+// Version starts at bit 2
+static constexpr uint64_t VERSION_SHIFT = 2;
+static constexpr uint64_t VERSION_MASK = ~NODE_TYPE_MASK;
 
-static constexpr int FULL_THRESHOLD = 176;
 static constexpr int LIST_MAX = 7;
 
-template <typename T>
-static constexpr bool can_embed_leaf_v = 
-    sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>;
-
-KTRIE_FORCE_INLINE constexpr bool flags_has_list(uint64_t f) noexcept {
-    return (f & FLAG_LIST) && !(f & FLAG_POP);
+KTRIE_FORCE_INLINE constexpr uint64_t get_node_type(uint64_t header) noexcept {
+    return header & NODE_TYPE_MASK;
 }
 
-KTRIE_FORCE_INLINE constexpr bool flags_has_pop(uint64_t f) noexcept {
-    return (f & FLAG_POP) && !(f & FLAG_LIST);
+KTRIE_FORCE_INLINE constexpr uint64_t get_version(uint64_t header) noexcept {
+    return header >> VERSION_SHIFT;
 }
 
-KTRIE_FORCE_INLINE constexpr bool flags_has_full(uint64_t f) noexcept {
-    return (f & FLAG_FULL) != 0;
+KTRIE_FORCE_INLINE constexpr uint64_t make_header(uint64_t type, uint64_t version = 0) noexcept {
+    return (version << VERSION_SHIFT) | (type & NODE_TYPE_MASK);
 }
 
-KTRIE_FORCE_INLINE constexpr bool flags_has_skip(uint64_t f) noexcept {
-    return (f & FLAG_SKIP) != 0;
+KTRIE_FORCE_INLINE constexpr bool is_eos_node(uint64_t header) noexcept {
+    return get_node_type(header) == NODE_EOS;
 }
 
-KTRIE_FORCE_INLINE constexpr bool flags_has_leaf(uint64_t f) noexcept {
-    return (f & FLAG_LEAF) != 0;
+KTRIE_FORCE_INLINE constexpr bool is_skip_node(uint64_t header) noexcept {
+    return get_node_type(header) == NODE_SKIP;
 }
 
-KTRIE_FORCE_INLINE constexpr bool flags_leaf_has_eos(uint64_t f) noexcept {
-    return (f & (FLAG_LIST | FLAG_POP)) == (FLAG_LIST | FLAG_POP) && !(f & FLAG_FULL);
+KTRIE_FORCE_INLINE constexpr bool is_list_node(uint64_t header) noexcept {
+    return get_node_type(header) == NODE_LIST;
 }
 
-KTRIE_FORCE_INLINE constexpr bool flags_leaf_has_children(uint64_t f) noexcept {
-    return flags_has_list(f) || flags_has_pop(f) || flags_has_full(f);
+KTRIE_FORCE_INLINE constexpr bool is_full_node(uint64_t header) noexcept {
+    return get_node_type(header) == NODE_FULL;
 }
 
-template <typename T>
-constexpr T ktrie_byteswap(T value) noexcept {
-    if constexpr (std::endian::native == std::endian::big) return value;
-#if __cpp_lib_byteswap >= 202110L
-    return std::byteswap(value);
-#elif defined(_MSC_VER)
-    if constexpr (sizeof(T) == 1) return value;
-    else if constexpr (sizeof(T) == 2) return static_cast<T>(_byteswap_ushort(static_cast<uint16_t>(value)));
-    else if constexpr (sizeof(T) == 4) return static_cast<T>(_byteswap_ulong(static_cast<uint32_t>(value)));
-    else if constexpr (sizeof(T) == 8) return static_cast<T>(_byteswap_uint64(static_cast<uint64_t>(value)));
-#elif defined(__GNUC__) || defined(__clang__)
-    if constexpr (sizeof(T) == 1) return value;
-    else if constexpr (sizeof(T) == 2) return static_cast<T>(__builtin_bswap16(static_cast<uint16_t>(value)));
-    else if constexpr (sizeof(T) == 4) return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(value)));
-    else if constexpr (sizeof(T) == 8) return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(value)));
-#else
-    if constexpr (sizeof(T) == 1) return value;
-    else if constexpr (sizeof(T) == 2)
-        return static_cast<T>(((static_cast<uint16_t>(value) & 0x00FFu) << 8) |
-                              ((static_cast<uint16_t>(value) & 0xFF00u) >> 8));
-    else if constexpr (sizeof(T) == 4) {
-        uint32_t v = static_cast<uint32_t>(value);
-        return static_cast<T>(((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
-                              ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24));
-    } else if constexpr (sizeof(T) == 8) {
-        uint64_t v = static_cast<uint64_t>(value);
-        return static_cast<T>(
-            ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) |
-            ((v & 0x0000000000FF0000ull) << 24) | ((v & 0x00000000FF000000ull) << 8)  |
-            ((v & 0x000000FF00000000ull) >> 8)  | ((v & 0x0000FF0000000000ull) >> 24) |
-            ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56));
-    }
-#endif
+KTRIE_FORCE_INLINE constexpr bool has_skip(uint64_t header) noexcept {
+    return get_node_type(header) != NODE_EOS;
 }
 
-template <typename T>
-constexpr T to_big_endian(T value) noexcept {
-    if constexpr (std::endian::native == std::endian::big) return value;
-    else return ktrie_byteswap(value);
-}
-
-template <typename T>
-constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
-
-KTRIE_FORCE_INLINE std::array<char, 8> to_char_array(uint64_t v) noexcept {
-    std::array<char, 8> arr;
-    uint64_t be = to_big_endian(v);
-    std::memcpy(arr.data(), &be, 8);
-    return arr;
-}
-
-KTRIE_FORCE_INLINE uint64_t from_char_array(const std::array<char, 8>& arr) noexcept {
-    uint64_t be;
-    std::memcpy(&be, arr.data(), 8);
-    return from_big_endian(be);
-}
-
-KTRIE_FORCE_INLINE uint64_t make_header(uint64_t flags, uint32_t size, uint32_t version = 0) noexcept {
-    return (flags & FLAGS_MASK) | 
-           ((static_cast<uint64_t>(version) << VERSION_SHIFT) & VERSION_MASK) |
-           (static_cast<uint64_t>(size) & SIZE_MASK);
-}
-
-KTRIE_FORCE_INLINE uint64_t get_flags(uint64_t header) noexcept { return header & FLAGS_MASK; }
-KTRIE_FORCE_INLINE uint32_t get_size(uint64_t header) noexcept { return static_cast<uint32_t>(header & SIZE_MASK); }
-KTRIE_FORCE_INLINE uint32_t get_version(uint64_t header) noexcept { 
-    return static_cast<uint32_t>((header & VERSION_MASK) >> VERSION_SHIFT); 
-}
-
-KTRIE_FORCE_INLINE uint64_t set_version(uint64_t header, uint32_t ver) noexcept {
-    return (header & ~VERSION_MASK) | ((static_cast<uint64_t>(ver) << VERSION_SHIFT) & VERSION_MASK);
-}
-
-KTRIE_FORCE_INLINE uint64_t bump_version(uint64_t header) noexcept {
-    uint32_t ver = get_version(header);
-    return set_version(header, ver + 1);
+KTRIE_FORCE_INLINE constexpr bool has_children(uint64_t header) noexcept {
+    uint64_t t = get_node_type(header);
+    return t == NODE_LIST || t == NODE_FULL;
 }
 
 struct empty_mutex {
@@ -185,136 +106,62 @@ KTRIE_FORCE_INLINE void cpu_pause() noexcept {
 #endif
 }
 
-// Slot type: atomic for threaded, plain for single-threaded
-template <bool THREADED>
-using slot_type_t = std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t>;
-
-template <bool THREADED>
-KTRIE_FORCE_INLINE uint64_t load_slot(const slot_type_t<THREADED>* slot) noexcept {
-    if constexpr (THREADED) return slot->load(std::memory_order_acquire);
-    else return *slot;
-}
-
-template <bool THREADED>
-KTRIE_FORCE_INLINE void store_slot(slot_type_t<THREADED>* slot, uint64_t value) noexcept {
-    if constexpr (THREADED) slot->store(value, std::memory_order_release);
-    else *slot = value;
-}
-
-template <bool THREADED>
-KTRIE_FORCE_INLINE bool cas_slot(slot_type_t<THREADED>* slot, uint64_t& expected, uint64_t desired) noexcept {
-    if constexpr (THREADED)
-        return slot->compare_exchange_weak(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
-    else {
-        if (*slot == expected) { *slot = desired; return true; }
-        expected = *slot;
-        return false;
+// Byteswap utilities for endian-independent key encoding
+template <typename T>
+constexpr T byteswap_impl(T value) noexcept {
+    static_assert(std::is_integral_v<T>);
+    if constexpr (sizeof(T) == 1) return value;
+    else if constexpr (sizeof(T) == 2)
+        return static_cast<T>(((static_cast<uint16_t>(value) & 0x00FFu) << 8) |
+                              ((static_cast<uint16_t>(value) & 0xFF00u) >> 8));
+    else if constexpr (sizeof(T) == 4) {
+        uint32_t v = static_cast<uint32_t>(value);
+        return static_cast<T>(((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+                              ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24));
+    } else if constexpr (sizeof(T) == 8) {
+        uint64_t v = static_cast<uint64_t>(value);
+        return static_cast<T>(
+            ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) |
+            ((v & 0x0000000000FF0000ull) << 24) | ((v & 0x00000000FF000000ull) << 8)  |
+            ((v & 0x000000FF00000000ull) >> 8)  | ((v & 0x0000FF0000000000ull) >> 24) |
+            ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56));
     }
 }
 
-KTRIE_FORCE_INLINE constexpr size_t bytes_to_words(size_t bytes) noexcept { return (bytes + 7) / 8; }
+template <typename T>
+constexpr T ktrie_byteswap(T value) noexcept {
+#if __cpp_lib_byteswap >= 202110L
+    return std::byteswap(value);
+#else
+    return byteswap_impl(value);
+#endif
+}
 
-class small_list {
-    uint64_t n_;
-public:
-    static constexpr int max_count = 7;
-    small_list() noexcept : n_{0} {}
-    explicit small_list(uint64_t x) noexcept : n_{x} {}
-    small_list(unsigned char c1, unsigned char c2) noexcept : n_{0} {
-        auto arr = to_char_array(0ULL);
-        arr[0] = static_cast<char>(c1);
-        arr[1] = static_cast<char>(c2);
-        arr[7] = 2;
-        n_ = from_char_array(arr);
-    }
+template <typename T>
+constexpr T to_big_endian(T value) noexcept {
+    if constexpr (std::endian::native == std::endian::big) return value;
+    else return ktrie_byteswap(value);
+}
 
-    KTRIE_FORCE_INLINE int count() const noexcept { return static_cast<int>(n_ & 0xFF); }
-    KTRIE_FORCE_INLINE uint8_t char_at(int pos) const noexcept {
-        auto arr = to_char_array(n_);
-        return static_cast<uint8_t>(arr[pos]);
-    }
+template <typename T>
+constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
-    KTRIE_FORCE_INLINE int offset(unsigned char c) const noexcept {
-        constexpr uint64_t rep = 0x01'01'01'01'01'01'01'00ULL;
-        constexpr uint64_t low_bits = 0x7F'7F'7F'7F'7F'7F'7F'7FULL;
-        uint64_t diff = n_ ^ (rep * static_cast<uint64_t>(c));
-        uint64_t zeros = ~((((diff & low_bits) + low_bits) | diff) | low_bits);
-        int pos = std::countl_zero(zeros) / 8;
-        return (pos + 1 <= count()) ? pos + 1 : 0;
-    }
-
-    int add(unsigned char c) noexcept {
-        int len = count();
-        auto arr = to_char_array(n_);
-        arr[len] = static_cast<char>(c);
-        arr[7] = static_cast<char>(len + 1);
-        n_ = from_char_array(arr);
-        return len;
-    }
-
-    std::pair<std::array<uint8_t, max_count>, int> sorted_chars() const noexcept {
-        std::array<uint8_t, max_count> chars{};
-        int len = count();
-        auto arr = to_char_array(n_);
-        for (int i = 0; i < len; ++i) chars[i] = static_cast<uint8_t>(arr[i]);
-        for (int i = 1; i < len; ++i) {
-            uint8_t key = chars[i];
-            int j = i - 1;
-            while (j >= 0 && chars[j] > key) { chars[j + 1] = chars[j]; --j; }
-            chars[j + 1] = key;
-        }
-        return {chars, len};
-    }
-
-    KTRIE_FORCE_INLINE uint64_t to_u64() const noexcept { return n_; }
-    KTRIE_FORCE_INLINE static small_list from_u64(uint64_t v) noexcept { return small_list(v); }
-};
-
-class popcount_bitmap {
+// 256-bit bitmap for FULL node validity
+class bitmap256 {
     uint64_t bits_[4]{};
 public:
-    popcount_bitmap() noexcept = default;
-    explicit popcount_bitmap(const std::array<uint64_t, 4>& arr) noexcept {
-        bits_[0] = arr[0]; bits_[1] = arr[1]; bits_[2] = arr[2]; bits_[3] = arr[3];
-    }
+    bitmap256() noexcept = default;
 
-    KTRIE_FORCE_INLINE bool find(unsigned char c, int* idx) const noexcept {
-        int word = c >> 6, bit = c & 63;
-        uint64_t mask = 1ULL << bit;
-        if (!(bits_[word] & mask)) return false;
-        *idx = std::popcount(bits_[word] & (mask - 1));
-        for (int w = 0; w < word; ++w) *idx += std::popcount(bits_[w]);
-        return true;
-    }
-
-    KTRIE_FORCE_INLINE bool contains(unsigned char c) const noexcept {
+    KTRIE_FORCE_INLINE bool test(unsigned char c) const noexcept {
         return (bits_[c >> 6] & (1ULL << (c & 63))) != 0;
     }
 
-    KTRIE_FORCE_INLINE int set(unsigned char c) noexcept {
-        int word = c >> 6, bit = c & 63;
-        uint64_t mask = 1ULL << bit;
-        int idx = std::popcount(bits_[word] & (mask - 1));
-        for (int w = 0; w < word; ++w) idx += std::popcount(bits_[w]);
-        bits_[word] |= mask;
-        return idx;
+    KTRIE_FORCE_INLINE void set(unsigned char c) noexcept {
+        bits_[c >> 6] |= (1ULL << (c & 63));
     }
 
-    KTRIE_FORCE_INLINE int clear(unsigned char c) noexcept {
-        int word = c >> 6, bit = c & 63;
-        uint64_t mask = 1ULL << bit;
-        if (!(bits_[word] & mask)) return -1;
-        int idx = std::popcount(bits_[word] & (mask - 1));
-        for (int w = 0; w < word; ++w) idx += std::popcount(bits_[w]);
-        bits_[word] &= ~mask;
-        return idx;
-    }
-
-    KTRIE_FORCE_INLINE int index_of(unsigned char c) const noexcept {
-        int word = c >> 6, bit = c & 63;
-        int idx = std::popcount(bits_[word] & ((1ULL << bit) - 1));
-        for (int w = 0; w < word; ++w) idx += std::popcount(bits_[w]);
-        return idx;
+    KTRIE_FORCE_INLINE void clear(unsigned char c) noexcept {
+        bits_[c >> 6] &= ~(1ULL << (c & 63));
     }
 
     KTRIE_FORCE_INLINE int count() const noexcept {
@@ -326,28 +173,132 @@ public:
         return (bits_[0] | bits_[1] | bits_[2] | bits_[3]) == 0;
     }
 
-    unsigned char nth_char(int n) const noexcept {
-        int remaining = n;
-        for (int word = 0; word < 4; ++word) {
-            int wc = std::popcount(bits_[word]);
-            if (remaining < wc) {
-                uint64_t b = bits_[word];
-                for (int bit = 0; bit < 64; ++bit) {
-                    if (b & (1ULL << bit)) {
-                        if (remaining == 0) return static_cast<unsigned char>((word << 6) | bit);
-                        --remaining;
-                    }
-                }
-            }
-            remaining -= wc;
+    // Atomic set for THREADED mode
+    template <bool THREADED>
+    void atomic_set(unsigned char c) noexcept {
+        if constexpr (THREADED) {
+            auto* atomic_word = reinterpret_cast<std::atomic<uint64_t>*>(&bits_[c >> 6]);
+            atomic_word->fetch_or(1ULL << (c & 63), std::memory_order_release);
+        } else {
+            set(c);
         }
-        return 0;
     }
 
-    std::array<uint64_t, 4> to_array() const noexcept { return {bits_[0], bits_[1], bits_[2], bits_[3]}; }
-    static popcount_bitmap from_array(const std::array<uint64_t, 4>& arr) noexcept { return popcount_bitmap(arr); }
-    uint64_t word(int i) const noexcept { return bits_[i]; }
-    void set_word(int i, uint64_t v) noexcept { bits_[i] = v; }
+    // Atomic clear for THREADED mode
+    template <bool THREADED>
+    void atomic_clear(unsigned char c) noexcept {
+        if constexpr (THREADED) {
+            auto* atomic_word = reinterpret_cast<std::atomic<uint64_t>*>(&bits_[c >> 6]);
+            atomic_word->fetch_and(~(1ULL << (c & 63)), std::memory_order_release);
+        } else {
+            clear(c);
+        }
+    }
+
+    // Find first set bit, returns 256 if none
+    unsigned char first_set() const noexcept {
+        for (int w = 0; w < 4; ++w) {
+            if (bits_[w] != 0) {
+                return static_cast<unsigned char>((w << 6) | std::countr_zero(bits_[w]));
+            }
+        }
+        return 255;  // None found (use 255 as sentinel)
+    }
+
+    // Find next set bit after c, returns 256 if none
+    unsigned char next_set(unsigned char c) const noexcept {
+        int start_word = (c + 1) >> 6;
+        int start_bit = (c + 1) & 63;
+        
+        // Check rest of current word
+        if (start_word < 4) {
+            uint64_t mask = bits_[start_word] & (~0ULL << start_bit);
+            if (mask != 0) {
+                return static_cast<unsigned char>((start_word << 6) | std::countr_zero(mask));
+            }
+        }
+        
+        // Check subsequent words
+        for (int w = start_word + 1; w < 4; ++w) {
+            if (bits_[w] != 0) {
+                return static_cast<unsigned char>((w << 6) | std::countr_zero(bits_[w]));
+            }
+        }
+        return 255;
+    }
+};
+
+// Small list: up to 7 chars + count packed in 64 bits
+class small_list {
+    uint64_t data_{0};  // [char0..char6][count] - big-endian layout
+public:
+    small_list() noexcept = default;
+
+    KTRIE_FORCE_INLINE int count() const noexcept {
+        return static_cast<int>(data_ & 0xFF);
+    }
+
+    KTRIE_FORCE_INLINE unsigned char char_at(int idx) const noexcept {
+        KTRIE_DEBUG_ASSERT(idx < count());
+        return static_cast<unsigned char>((data_ >> (56 - idx * 8)) & 0xFF);
+    }
+
+    KTRIE_FORCE_INLINE int find(unsigned char c) const noexcept {
+        int n = count();
+        for (int i = 0; i < n; ++i) {
+            if (char_at(i) == c) return i;
+        }
+        return -1;
+    }
+
+    KTRIE_FORCE_INLINE bool contains(unsigned char c) const noexcept {
+        return find(c) >= 0;
+    }
+
+    // Add char, returns index. Caller must ensure count < 7
+    int add(unsigned char c) noexcept {
+        int n = count();
+        KTRIE_DEBUG_ASSERT(n < LIST_MAX);
+        data_ &= ~0xFFULL;  // Clear count
+        data_ |= (static_cast<uint64_t>(c) << (56 - n * 8));
+        data_ |= static_cast<uint64_t>(n + 1);
+        return n;
+    }
+
+    // Remove char at index, shifts remaining. Returns new count
+    int remove_at(int idx) noexcept {
+        int n = count();
+        KTRIE_DEBUG_ASSERT(idx < n);
+        // Shift chars after idx
+        for (int i = idx; i < n - 1; ++i) {
+            unsigned char next = char_at(i + 1);
+            data_ &= ~(0xFFULL << (56 - i * 8));
+            data_ |= (static_cast<uint64_t>(next) << (56 - i * 8));
+        }
+        // Clear last slot and decrement count
+        data_ &= ~(0xFFULL << (56 - (n - 1) * 8));
+        data_ &= ~0xFFULL;
+        data_ |= static_cast<uint64_t>(n - 1);
+        return n - 1;
+    }
+
+    // Get first char (for iteration)
+    unsigned char first() const noexcept {
+        if (count() == 0) return 255;
+        return char_at(0);
+    }
+
+    // Get smallest char (sorted first)
+    unsigned char smallest() const noexcept {
+        int n = count();
+        if (n == 0) return 255;
+        unsigned char min_c = char_at(0);
+        for (int i = 1; i < n; ++i) {
+            unsigned char c = char_at(i);
+            if (c < min_c) min_c = c;
+        }
+        return min_c;
+    }
 };
 
 }  // namespace gteitelbaum
