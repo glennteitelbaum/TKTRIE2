@@ -43,11 +43,40 @@ struct erase_spec_info {
     uint64_t target_header = 0;
     unsigned char c = 0;
     
+    // For collapse when removing eos from target
     ptr_t collapse_child = nullptr;
     uint64_t collapse_child_header = 0;
     unsigned char collapse_char = 0;
-    std::string parent_skip;
+    std::string target_skip;
     std::string child_skip;
+    bool child_is_leaf = false;
+    uint64_t child_type = 0;
+    
+    // For parent collapse when deleting leaf/child
+    ptr_t parent = nullptr;
+    uint64_t parent_header = 0;
+    unsigned char parent_edge = 0;
+    ptr_t parent_collapse_child = nullptr;
+    uint64_t parent_collapse_child_header = 0;
+    unsigned char parent_collapse_char = 0;
+    std::string parent_skip;
+    std::string parent_child_skip;
+    bool parent_child_is_leaf = false;
+    uint64_t parent_child_type = 0;
+    bool parent_needs_collapse = false;
+};
+
+// Pre-allocated nodes for speculative erase
+struct erase_pre_alloc {
+    ptr_t merged = nullptr;           // For COLLAPSE_AFTER_REMOVE
+    ptr_t parent_merged = nullptr;    // For parent collapse after child removal
+    T* deferred_eos = nullptr;        // eos_ptr to delete after lock
+    
+    void clear() {
+        merged = nullptr;
+        parent_merged = nullptr;
+        deferred_eos = nullptr;
+    }
 };
 
 // =========================================================================
@@ -81,6 +110,7 @@ erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept {
                 info.op = erase_op::DELETE_LEAF_EOS;
                 info.target = n;
                 info.target_header = n->header();
+                capture_parent_collapse_info(info);
                 return info;
             }
             
@@ -92,6 +122,7 @@ erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept {
                 info.op = erase_op::DELETE_LEAF_SKIP;
                 info.target = n;
                 info.target_header = n->header();
+                capture_parent_collapse_info(info);
                 return info;
             }
             
@@ -113,6 +144,7 @@ erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept {
                 }
                 if (n->as_list()->chars.count() == 1) {
                     info.op = erase_op::DELETE_LAST_LEAF_LIST;
+                    capture_parent_collapse_info(info);
                 } else {
                     info.op = erase_op::IN_PLACE_LEAF_LIST;
                 }
@@ -143,11 +175,12 @@ erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept {
             }
             info.target = n;
             info.target_header = n->header();
-            info.parent_skip = std::string(skip);
+            info.target_skip = std::string(skip);
             
             int child_cnt = n->child_count();
             if (child_cnt == 0) {
                 info.op = erase_op::DELETE_EOS_INTERIOR;
+                capture_parent_collapse_info(info);
                 return info;
             }
             if (child_cnt == 1) {
@@ -162,6 +195,8 @@ erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept {
                 if (info.collapse_child) {
                     info.collapse_child_header = info.collapse_child->header();
                     info.child_skip = std::string(get_skip(info.collapse_child));
+                    info.child_is_leaf = info.collapse_child->is_leaf();
+                    info.child_type = info.collapse_child->type();
                 }
                 return info;
             }
@@ -185,6 +220,64 @@ erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept {
     
     info.op = erase_op::NOT_FOUND;
     return info;
+}
+
+// Helper to capture parent collapse info for leaf deletion cases
+void capture_parent_collapse_info(erase_spec_info& info) const noexcept {
+    if (info.path_len <= 1) return;
+    
+    ptr_t parent = info.path[info.path_len - 2].node;
+    unsigned char edge = info.path[info.path_len - 1].edge;
+    
+    info.parent = parent;
+    info.parent_header = parent->header();
+    info.parent_edge = edge;
+    info.parent_skip = std::string(get_skip(parent));
+    
+    // Check if removing this child would cause parent collapse
+    T* eos = get_eos_ptr(parent);
+    if (eos) return;  // Has eos, won't collapse
+    
+    int remaining = parent->child_count();
+    if (parent->is_list()) {
+        int idx = parent->as_list()->chars.find(edge);
+        if (idx >= 0) remaining--;
+    } else if (parent->is_full()) {
+        if (parent->as_full()->valid.test(edge)) remaining--;
+    }
+    
+    if (remaining != 1) return;  // Won't collapse to single child
+    
+    info.parent_needs_collapse = true;
+    
+    // Find the remaining child
+    if (parent->is_list()) {
+        int cnt = parent->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            unsigned char ch = parent->as_list()->chars.char_at(i);
+            if (ch != edge) {
+                info.parent_collapse_char = ch;
+                info.parent_collapse_child = parent->as_list()->children[i].load();
+                break;
+            }
+        }
+    } else if (parent->is_full()) {
+        bool found = false;
+        parent->as_full()->valid.for_each_set([&](unsigned char ch) {
+            if (!found && ch != edge) {
+                info.parent_collapse_char = ch;
+                info.parent_collapse_child = parent->as_full()->children[ch].load();
+                found = true;
+            }
+        });
+    }
+    
+    if (info.parent_collapse_child) {
+        info.parent_collapse_child_header = info.parent_collapse_child->header();
+        info.parent_child_skip = std::string(get_skip(info.parent_collapse_child));
+        info.parent_child_is_leaf = info.parent_collapse_child->is_leaf();
+        info.parent_child_type = info.parent_collapse_child->type();
+    }
 }
 
 // =========================================================================
@@ -232,33 +325,119 @@ bool check_collapse_needed(ptr_t parent, unsigned char removed_c,
 }
 
 // =========================================================================
-// ALLOCATE MERGED NODE FOR COLLAPSE
+// ALLOCATE MERGE NODE SHELL (for COLLAPSE_AFTER_REMOVE)
 // =========================================================================
 ptr_t allocate_collapse_node(const erase_spec_info& info) {
-    std::string new_skip = info.parent_skip;
+    std::string new_skip = info.target_skip;
     new_skip.push_back(static_cast<char>(info.collapse_char));
     new_skip.append(info.child_skip);
     
-    ptr_t child = info.collapse_child;
-    if (!child) return nullptr;
+    if (!info.collapse_child) return nullptr;
     
-    if (child->is_leaf()) {
-        if (child->is_eos() || child->is_skip()) {
+    if (info.child_is_leaf) {
+        if (info.child_type == TYPE_EOS || info.child_type == TYPE_SKIP) {
             return builder_.make_leaf_skip(new_skip, T{});
-        } else if (child->is_list()) {
+        } else if (info.child_type == TYPE_LIST) {
             return builder_.make_leaf_list(new_skip);
         } else {
             return builder_.make_leaf_full(new_skip);
         }
     } else {
-        if (child->is_eos() || child->is_skip()) {
+        if (info.child_type == TYPE_EOS || info.child_type == TYPE_SKIP) {
             return builder_.make_interior_skip(new_skip);
-        } else if (child->is_list()) {
+        } else if (info.child_type == TYPE_LIST) {
             return builder_.make_interior_list(new_skip);
         } else {
             return builder_.make_interior_full(new_skip);
         }
     }
+}
+
+// =========================================================================
+// ALLOCATE PARENT MERGE NODE SHELL (for parent collapse after child removal)
+// =========================================================================
+ptr_t allocate_parent_collapse_node(const erase_spec_info& info) {
+    if (!info.parent_needs_collapse || !info.parent_collapse_child) return nullptr;
+    
+    std::string new_skip = info.parent_skip;
+    new_skip.push_back(static_cast<char>(info.parent_collapse_char));
+    new_skip.append(info.parent_child_skip);
+    
+    if (info.parent_child_is_leaf) {
+        if (info.parent_child_type == TYPE_EOS || info.parent_child_type == TYPE_SKIP) {
+            return builder_.make_leaf_skip(new_skip, T{});
+        } else if (info.parent_child_type == TYPE_LIST) {
+            return builder_.make_leaf_list(new_skip);
+        } else {
+            return builder_.make_leaf_full(new_skip);
+        }
+    } else {
+        if (info.parent_child_type == TYPE_EOS || info.parent_child_type == TYPE_SKIP) {
+            return builder_.make_interior_skip(new_skip);
+        } else if (info.parent_child_type == TYPE_LIST) {
+            return builder_.make_interior_list(new_skip);
+        } else {
+            return builder_.make_interior_full(new_skip);
+        }
+    }
+}
+
+// =========================================================================
+// ALLOCATE FOR SPECULATIVE ERASE (called outside lock)
+// =========================================================================
+erase_pre_alloc allocate_erase_speculative(const erase_spec_info& info) {
+    erase_pre_alloc alloc;
+    
+    switch (info.op) {
+    case erase_op::COLLAPSE_AFTER_REMOVE:
+        alloc.merged = allocate_collapse_node(info);
+        break;
+        
+    case erase_op::DELETE_LEAF_EOS:
+    case erase_op::DELETE_LEAF_SKIP:
+    case erase_op::DELETE_LAST_LEAF_LIST:
+        if (info.parent_needs_collapse) {
+            alloc.parent_merged = allocate_parent_collapse_node(info);
+        }
+        break;
+        
+    case erase_op::DELETE_EOS_INTERIOR:
+        // May need parent collapse if child_cnt becomes 0 after eos removal
+        // But we don't know child_cnt until under lock, so pre-allocate if path allows
+        if (info.parent_needs_collapse) {
+            alloc.parent_merged = allocate_parent_collapse_node(info);
+        }
+        break;
+        
+    default:
+        break;
+    }
+    
+    return alloc;
+}
+
+// =========================================================================
+// DEALLOCATE FAILED SPECULATION (called outside lock)
+// =========================================================================
+void dealloc_erase_speculation(erase_pre_alloc& alloc) {
+    if (alloc.merged) {
+        switch (alloc.merged->type()) {
+            case TYPE_EOS: delete alloc.merged->as_eos(); break;
+            case TYPE_SKIP: delete alloc.merged->as_skip(); break;
+            case TYPE_LIST: delete alloc.merged->as_list(); break;
+            case TYPE_FULL: delete alloc.merged->as_full(); break;
+        }
+    }
+    if (alloc.parent_merged) {
+        switch (alloc.parent_merged->type()) {
+            case TYPE_EOS: delete alloc.parent_merged->as_eos(); break;
+            case TYPE_SKIP: delete alloc.parent_merged->as_skip(); break;
+            case TYPE_LIST: delete alloc.parent_merged->as_list(); break;
+            case TYPE_FULL: delete alloc.parent_merged->as_full(); break;
+        }
+    }
+    // deferred_eos is deleted separately after lock release
+    alloc.clear();
 }
 
 // =========================================================================
@@ -323,6 +502,16 @@ bool validate_erase_path(const erase_spec_info& info) const noexcept {
     }
     if (info.collapse_child) {
         if (info.collapse_child->header() != info.collapse_child_header) {
+            return false;
+        }
+    }
+    if (info.parent) {
+        if (info.parent->header() != info.parent_header) {
+            return false;
+        }
+    }
+    if (info.parent_collapse_child) {
+        if (info.parent_collapse_child->header() != info.parent_collapse_child_header) {
             return false;
         }
     }
@@ -408,6 +597,10 @@ bool erase_locked(std::string_view kb) {
                 return false;
             }
             
+            // Pre-allocate everything outside lock
+            erase_pre_alloc alloc = allocate_erase_speculative(info);
+            
+            // IN_PLACE operations - no allocation needed
             if (info.op == erase_op::IN_PLACE_LEAF_LIST ||
                 info.op == erase_op::IN_PLACE_LEAF_FULL ||
                 info.op == erase_op::IN_PLACE_INTERIOR_LIST ||
@@ -415,7 +608,10 @@ bool erase_locked(std::string_view kb) {
                 
                 std::lock_guard<mutex_t> lock(mutex_);
                 
-                if (!validate_erase_path(info)) continue;
+                if (!validate_erase_path(info)) {
+                    dealloc_erase_speculation(alloc);
+                    continue;
+                }
                 
                 bool success = false;
                 switch (info.op) {
@@ -437,182 +633,237 @@ bool erase_locked(std::string_view kb) {
                 
                 if (success) {
                     size_.fetch_sub(1);
+                    dealloc_erase_speculation(alloc);
                     return true;
                 }
+                dealloc_erase_speculation(alloc);
                 continue;
             }
             
+            // DELETE_LEAF cases - may need parent collapse
             if (info.op == erase_op::DELETE_LEAF_EOS ||
                 info.op == erase_op::DELETE_LEAF_SKIP ||
                 info.op == erase_op::DELETE_LAST_LEAF_LIST) {
                 
-                std::lock_guard<mutex_t> lock(mutex_);
+                T* deferred_eos = nullptr;
+                ptr_t retired_target = nullptr;
+                ptr_t retired_parent = nullptr;
+                ptr_t retired_sibling = nullptr;
+                bool success = false;
                 
-                if (!validate_erase_path(info)) continue;
-                
-                if (info.path_len <= 1) {
-                    root_.store(nullptr);
-                    retire_node(info.target);
-                    size_.fetch_sub(1);
-                    return true;
-                }
-                
-                ptr_t parent = info.path[info.path_len - 2].node;
-                unsigned char edge = info.path[info.path_len - 1].edge;
-                
-                unsigned char collapse_c = 0;
-                ptr_t collapse_child = nullptr;
-                bool needs_collapse = check_collapse_needed(parent, edge, collapse_c, collapse_child);
-                
-                if (needs_collapse) {
-                    ptr_t root = root_.load();
-                    auto res = erase_impl(&root_, root, kb);
-                    if (!res.erased) return false;
+                {
+                    std::lock_guard<mutex_t> lock(mutex_);
                     
-                    if (res.deleted_subtree) root_.store(nullptr);
-                    else if (res.new_node) root_.store(res.new_node);
+                    if (!validate_erase_path(info)) {
+                        dealloc_erase_speculation(alloc);
+                        continue;
+                    }
                     
-                    for (int i = 0; i < res.old_count; ++i) retire_node(res.old_nodes[i]);
-                    size_.fetch_sub(1);
-                    return true;
-                }
-                
-                if (parent->is_list()) {
-                    do_inplace_interior_list_erase(parent, edge);
-                } else if (parent->is_full()) {
-                    do_inplace_interior_full_erase(parent, edge);
-                }
-                
-                retire_node(info.target);
-                size_.fetch_sub(1);
-                return true;
-            }
-            
-            if (info.op == erase_op::DELETE_EOS_INTERIOR) {
-                std::lock_guard<mutex_t> lock(mutex_);
-                
-                if (!validate_erase_path(info)) continue;
-                
-                T* p = get_eos_ptr(info.target);
-                if (!p) continue;
-                
-                delete p;
-                set_eos_ptr(info.target, nullptr);
-                info.target->bump_version();
-                
-                int child_cnt = info.target->child_count();
-                if (child_cnt == 0) {
                     if (info.path_len <= 1) {
+                        // Deleting root
                         root_.store(nullptr);
-                        retire_node(info.target);
+                        retired_target = info.target;
+                        success = true;
+                    } else if (info.parent_needs_collapse && alloc.parent_merged) {
+                        // Parent will collapse - use pre-allocated merged node
+                        fill_collapse_node(alloc.parent_merged, info.parent_collapse_child);
+                        
+                        if (info.path_len <= 2) {
+                            // Parent is root
+                            root_.store(alloc.parent_merged);
+                        } else {
+                            ptr_t grandparent = info.path[info.path_len - 3].node;
+                            unsigned char parent_edge = info.path[info.path_len - 2].edge;
+                            atomic_ptr* slot = get_child_slot(grandparent, parent_edge);
+                            if (slot) {
+                                slot->store(alloc.parent_merged);
+                                grandparent->bump_version();
+                            }
+                        }
+                        
+                        alloc.parent_merged = nullptr;  // Transferred ownership
+                        retired_target = info.target;
+                        retired_parent = info.parent;
+                        retired_sibling = info.parent_collapse_child;
+                        success = true;
                     } else {
+                        // Simple removal from parent
                         ptr_t parent = info.path[info.path_len - 2].node;
                         unsigned char edge = info.path[info.path_len - 1].edge;
-                        
-                        unsigned char collapse_c = 0;
-                        ptr_t collapse_child = nullptr;
-                        if (check_collapse_needed(parent, edge, collapse_c, collapse_child)) {
-                            ptr_t root = root_.load();
-                            auto res = erase_impl(&root_, root, kb);
-                            if (res.new_node) root_.store(res.new_node);
-                            for (int i = 0; i < res.old_count; ++i) retire_node(res.old_nodes[i]);
-                            size_.fetch_sub(1);
-                            return true;
-                        }
                         
                         if (parent->is_list()) {
                             do_inplace_interior_list_erase(parent, edge);
                         } else if (parent->is_full()) {
                             do_inplace_interior_full_erase(parent, edge);
                         }
-                        retire_node(info.target);
+                        
+                        retired_target = info.target;
+                        success = true;
                     }
-                } else if (child_cnt == 1) {
-                    ptr_t root = root_.load();
-                    auto res = erase_impl(&root_, root, kb);
-                    if (res.new_node) {
-                        if (info.path_len <= 1) {
-                            root_.store(res.new_node);
-                        } else {
-                            ptr_t parent = info.path[info.path_len - 2].node;
-                            unsigned char edge = info.path[info.path_len - 1].edge;
-                            atomic_ptr* slot = get_child_slot(parent, edge);
-                            if (slot) slot->store(res.new_node);
-                            parent->bump_version();
-                        }
-                    }
-                    for (int i = 0; i < res.old_count; ++i) retire_node(res.old_nodes[i]);
                 }
                 
-                size_.fetch_sub(1);
-                return true;
-            }
-            
-            if (info.op == erase_op::COLLAPSE_AFTER_REMOVE) {
-                ptr_t merged = allocate_collapse_node(info);
-                if (!merged) {
-                    std::lock_guard<mutex_t> lock(mutex_);
-                    ptr_t root = root_.load();
-                    auto res = erase_impl(&root_, root, kb);
-                    if (!res.erased) return false;
-                    if (res.deleted_subtree) root_.store(nullptr);
-                    else if (res.new_node) root_.store(res.new_node);
-                    for (int i = 0; i < res.old_count; ++i) retire_node(res.old_nodes[i]);
+                // Outside lock: cleanup
+                dealloc_erase_speculation(alloc);
+                if (deferred_eos) delete deferred_eos;
+                if (retired_target) retire_node(retired_target);
+                if (retired_parent) retire_node(retired_parent);
+                if (retired_sibling) retire_node(retired_sibling);
+                
+                if (success) {
                     size_.fetch_sub(1);
                     return true;
                 }
+                continue;
+            }
+            
+            // DELETE_EOS_INTERIOR - remove eos, may cause collapse
+            if (info.op == erase_op::DELETE_EOS_INTERIOR) {
+                T* deferred_eos = nullptr;
+                ptr_t retired_target = nullptr;
+                ptr_t retired_parent = nullptr;
+                ptr_t retired_sibling = nullptr;
+                bool success = false;
                 
                 {
                     std::lock_guard<mutex_t> lock(mutex_);
                     
                     if (!validate_erase_path(info)) {
-                        switch (merged->type()) {
-                            case TYPE_EOS: delete merged->as_eos(); break;
-                            case TYPE_SKIP: delete merged->as_skip(); break;
-                            case TYPE_LIST: delete merged->as_list(); break;
-                            case TYPE_FULL: delete merged->as_full(); break;
+                        dealloc_erase_speculation(alloc);
+                        continue;
+                    }
+                    
+                    T* p = get_eos_ptr(info.target);
+                    if (!p) {
+                        dealloc_erase_speculation(alloc);
+                        continue;
+                    }
+                    
+                    // Defer eos deletion
+                    deferred_eos = p;
+                    set_eos_ptr(info.target, nullptr);
+                    info.target->bump_version();
+                    
+                    int child_cnt = info.target->child_count();
+                    
+                    if (child_cnt == 0) {
+                        // Target becomes empty - delete it
+                        if (info.path_len <= 1) {
+                            root_.store(nullptr);
+                            retired_target = info.target;
+                        } else if (info.parent_needs_collapse && alloc.parent_merged) {
+                            // Parent collapses
+                            fill_collapse_node(alloc.parent_merged, info.parent_collapse_child);
+                            
+                            if (info.path_len <= 2) {
+                                root_.store(alloc.parent_merged);
+                            } else {
+                                ptr_t grandparent = info.path[info.path_len - 3].node;
+                                unsigned char parent_edge = info.path[info.path_len - 2].edge;
+                                atomic_ptr* slot = get_child_slot(grandparent, parent_edge);
+                                if (slot) {
+                                    slot->store(alloc.parent_merged);
+                                    grandparent->bump_version();
+                                }
+                            }
+                            alloc.parent_merged = nullptr;
+                            retired_target = info.target;
+                            retired_parent = info.parent;
+                            retired_sibling = info.parent_collapse_child;
+                        } else {
+                            // Simple removal from parent
+                            ptr_t parent = info.path[info.path_len - 2].node;
+                            unsigned char edge = info.path[info.path_len - 1].edge;
+                            
+                            if (parent->is_list()) {
+                                do_inplace_interior_list_erase(parent, edge);
+                            } else if (parent->is_full()) {
+                                do_inplace_interior_full_erase(parent, edge);
+                            }
+                            retired_target = info.target;
                         }
+                    }
+                    // child_cnt > 0: target stays, just eos removed (already done above)
+                    success = true;
+                }
+                
+                // Outside lock: cleanup
+                dealloc_erase_speculation(alloc);
+                if (deferred_eos) delete deferred_eos;
+                if (retired_target) retire_node(retired_target);
+                if (retired_parent) retire_node(retired_parent);
+                if (retired_sibling) retire_node(retired_sibling);
+                
+                if (success) {
+                    size_.fetch_sub(1);
+                    return true;
+                }
+                continue;
+            }
+            
+            // COLLAPSE_AFTER_REMOVE - target has eos + 1 child, removing eos causes collapse
+            if (info.op == erase_op::COLLAPSE_AFTER_REMOVE) {
+                if (!alloc.merged) {
+                    // Allocation failed, retry
+                    dealloc_erase_speculation(alloc);
+                    continue;
+                }
+                
+                T* deferred_eos = nullptr;
+                ptr_t retired_target = nullptr;
+                ptr_t retired_child = nullptr;
+                bool success = false;
+                
+                {
+                    std::lock_guard<mutex_t> lock(mutex_);
+                    
+                    if (!validate_erase_path(info)) {
+                        dealloc_erase_speculation(alloc);
                         continue;
                     }
                     
                     T* p = get_eos_ptr(info.target);
                     if (p) {
-                        delete p;
+                        deferred_eos = p;
                         set_eos_ptr(info.target, nullptr);
                     }
                     
-                    fill_collapse_node(merged, info.collapse_child);
+                    // Fill the pre-allocated merged node
+                    fill_collapse_node(alloc.merged, info.collapse_child);
                     
                     if (info.path_len <= 1) {
-                        root_.store(merged);
+                        root_.store(alloc.merged);
                     } else {
                         ptr_t parent = info.path[info.path_len - 2].node;
                         unsigned char edge = info.path[info.path_len - 1].edge;
                         atomic_ptr* slot = get_child_slot(parent, edge);
                         if (slot) {
-                            slot->store(merged);
+                            slot->store(alloc.merged);
                             parent->bump_version();
                         }
                     }
                     
-                    retire_node(info.target);
-                    retire_node(info.collapse_child);
+                    alloc.merged = nullptr;  // Transferred ownership
+                    retired_target = info.target;
+                    retired_child = info.collapse_child;
+                    success = true;
+                }
+                
+                // Outside lock: cleanup
+                dealloc_erase_speculation(alloc);
+                if (deferred_eos) delete deferred_eos;
+                if (retired_target) retire_node(retired_target);
+                if (retired_child) retire_node(retired_child);
+                
+                if (success) {
                     size_.fetch_sub(1);
                     return true;
                 }
+                continue;
             }
             
-            {
-                std::lock_guard<mutex_t> lock(mutex_);
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) root_.store(nullptr);
-                else if (res.new_node) root_.store(res.new_node);
-                for (int i = 0; i < res.old_count; ++i) retire_node(res.old_nodes[i]);
-                size_.fetch_sub(1);
-                return true;
-            }
+            // Fallback - should not reach here normally
+            dealloc_erase_speculation(alloc);
+            continue;
         }
     }
 }
