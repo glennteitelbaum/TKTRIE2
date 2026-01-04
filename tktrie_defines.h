@@ -26,6 +26,7 @@ static constexpr uint64_t TYPE_SKIP = 1ULL << 61;
 static constexpr uint64_t TYPE_LIST = 2ULL << 61;
 static constexpr uint64_t TYPE_FULL = 3ULL << 61;
 static constexpr uint64_t TYPE_MASK = 3ULL << 61;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | TYPE_MASK;
 static constexpr uint64_t VERSION_MASK = (1ULL << 61) - 1;
 
 static constexpr int LIST_MAX = 7;
@@ -36,8 +37,12 @@ inline constexpr uint64_t make_header(bool is_leaf, uint64_t type, uint64_t vers
 inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0; }
 inline constexpr uint64_t get_type(uint64_t h) noexcept { return h & TYPE_MASK; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
+
+// Bump version preserving flags
 inline constexpr uint64_t bump_version(uint64_t h) noexcept {
-    return (h & ~VERSION_MASK) | (((h & VERSION_MASK) + 1) & VERSION_MASK);
+    uint64_t flags = h & FLAGS_MASK;
+    uint64_t ver = (h & VERSION_MASK) + 1;
+    return flags | (ver & VERSION_MASK);
 }
 
 template <typename T>
@@ -78,11 +83,35 @@ public:
     unsigned char char_at(int i) const noexcept {
         return static_cast<unsigned char>((data_ >> (i * 8)) & 0xFF);
     }
+    
+    // SWAR find - O(1) regardless of list size
     int find(unsigned char c) const noexcept {
         int n = count();
-        for (int i = 0; i < n; ++i) if (char_at(i) == c) return i;
-        return -1;
+        if (n == 0) return -1;
+        
+        // Broadcast c to all 7 data bytes
+        uint64_t broadcast = 0x0101010101010101ULL * c;
+        // Mask to only compare the bytes that contain data (first n bytes)
+        uint64_t mask = (1ULL << (n * 8)) - 1;
+        uint64_t data_masked = data_ & mask;
+        uint64_t broadcast_masked = broadcast & mask;
+        
+        // XOR - matching bytes become 0
+        uint64_t xored = data_masked ^ broadcast_masked;
+        
+        // SWAR zero-byte detection: ((v - 0x01...) & ~v & 0x80...)
+        // A byte is zero iff its high bit is set in the result
+        uint64_t zero_detect = (xored - 0x0101010101010101ULL) & ~xored & 0x8080808080808080ULL;
+        
+        if (zero_detect == 0) return -1;
+        
+        // Find position of first zero byte (first match)
+        int bit_pos = std::countr_zero(zero_detect);
+        int byte_pos = bit_pos >> 3;
+        
+        return byte_pos < n ? byte_pos : -1;
     }
+    
     int add(unsigned char c) noexcept {
         int n = count();
         data_ = (data_ & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
@@ -117,6 +146,20 @@ public:
             if (bits_[w]) return static_cast<unsigned char>((w << 6) | std::countr_zero(bits_[w]));
         return 0;
     }
+    
+    // Kernighan's method iteration - O(k) where k = popcount
+    template <typename Fn>
+    void for_each_set(Fn&& fn) const noexcept {
+        for (int w = 0; w < 4; ++w) {
+            uint64_t bits = bits_[w];
+            while (bits) {
+                unsigned char c = static_cast<unsigned char>((w << 6) | std::countr_zero(bits));
+                fn(c);
+                bits &= bits - 1;  // Clear LSB - safe for uint64_t when bits != 0
+            }
+        }
+    }
+    
     template <bool THREADED>
     void atomic_set(unsigned char c) noexcept {
         if constexpr (THREADED)
@@ -135,5 +178,27 @@ struct empty_mutex {
     void lock() noexcept {}
     void unlock() noexcept {}
 };
+
+// Fast skip matching - uses memcmp for longer strings
+inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexcept {
+    size_t min_len = skip.size() < key.size() ? skip.size() : key.size();
+    
+    // For short strings, byte-by-byte is fine (cache-friendly)
+    if (min_len <= 8) {
+        size_t i = 0;
+        while (i < min_len && skip[i] == key[i]) ++i;
+        return i;
+    }
+    
+    // For longer strings, use memcmp to find if they match fully
+    if (std::memcmp(skip.data(), key.data(), min_len) == 0) {
+        return min_len;
+    }
+    
+    // Find first mismatch
+    size_t i = 0;
+    while (i < min_len && skip[i] == key[i]) ++i;
+    return i;
+}
 
 }  // namespace gteitelbaum

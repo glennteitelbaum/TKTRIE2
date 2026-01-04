@@ -2,13 +2,19 @@
 // This file is included inside the tktrie class body
 
 // =========================================================================
-// INSERT RESULT
+// INSERT RESULT - use small fixed array instead of vector for old_nodes
 // =========================================================================
 struct insert_result {
+    static constexpr int MAX_OLD = 8;
     ptr_t new_node = nullptr;
-    std::vector<ptr_t> old_nodes;
+    ptr_t old_nodes[MAX_OLD] = {};
+    int old_count = 0;
     bool inserted = false;
     bool in_place = false;
+    
+    void add_old(ptr_t n) {
+        if (n && old_count < MAX_OLD) old_nodes[old_count++] = n;
+    }
 };
 
 // =========================================================================
@@ -37,7 +43,7 @@ insert_result insert_into_leaf(atomic_ptr*, ptr_t leaf, std::string_view key, co
     }
     
     if (leaf->is_skip()) {
-        size_t m = match_skip(leaf_skip, key);
+        size_t m = match_skip_impl(leaf_skip, key);
         if (m == leaf_skip.size() && m == key.size()) return res;  // Exists
         if (m < leaf_skip.size() && m < key.size()) return split_leaf_skip(leaf, key, value, m);
         if (m == key.size()) return prefix_leaf_skip(leaf, key, value, m);
@@ -45,7 +51,7 @@ insert_result insert_into_leaf(atomic_ptr*, ptr_t leaf, std::string_view key, co
     }
     
     // LIST or FULL
-    size_t m = match_skip(leaf_skip, key);
+    size_t m = match_skip_impl(leaf_skip, key);
     if (m < leaf_skip.size() && m < key.size()) return split_leaf_list(leaf, key, value, m);
     if (m < leaf_skip.size()) return prefix_leaf_list(leaf, key, value, m);
     key.remove_prefix(m);
@@ -62,7 +68,7 @@ insert_result insert_into_interior(atomic_ptr*, ptr_t n, std::string_view key, c
     insert_result res;
     std::string_view skip = get_skip(n);
     
-    size_t m = match_skip(skip, key);
+    size_t m = match_skip_impl(skip, key);
     if (m < skip.size() && m < key.size()) return split_interior(n, key, value, m);
     if (m < skip.size()) return prefix_interior(n, key, value, m);
     key.remove_prefix(m);
@@ -81,7 +87,7 @@ insert_result insert_into_interior(atomic_ptr*, ptr_t n, std::string_view key, c
         }
         res.inserted = child_res.inserted;
         res.in_place = child_res.in_place;
-        res.old_nodes = std::move(child_res.old_nodes);
+        for (int i = 0; i < child_res.old_count; ++i) res.add_old(child_res.old_nodes[i]);
         return res;
     }
     
@@ -127,7 +133,7 @@ insert_result demote_leaf_eos(ptr_t leaf, std::string_view key, const T& value) 
     interior->as_list()->children[0].store(child);
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -151,7 +157,7 @@ insert_result split_leaf_skip(ptr_t leaf, std::string_view key, const T& value, 
     interior->as_list()->children[1].store(new_child);
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -170,7 +176,7 @@ insert_result prefix_leaf_skip(ptr_t leaf, std::string_view key, const T& value,
     interior->as_list()->children[0].store(child);
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -189,7 +195,7 @@ insert_result extend_leaf_skip(ptr_t leaf, std::string_view key, const T& value,
     interior->as_list()->children[0].store(child);
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -215,7 +221,7 @@ insert_result split_leaf_list(ptr_t leaf, std::string_view key, const T& value, 
     interior->as_list()->children[1].store(new_child);
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -234,7 +240,7 @@ insert_result prefix_leaf_list(ptr_t leaf, std::string_view key, const T& value,
     interior->as_list()->children[0].store(old_child);
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -243,19 +249,18 @@ ptr_t clone_leaf_with_skip(ptr_t leaf, std::string_view new_skip) {
     if (leaf->is_list()) {
         ptr_t n = builder_.make_leaf_list(new_skip);
         n->as_list()->chars = leaf->as_list()->chars;
-        for (int i = 0; i < leaf->as_list()->chars.count(); ++i) {
+        int cnt = leaf->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
             n->as_list()->leaf_values[i] = leaf->as_list()->leaf_values[i];
         }
         return n;
     }
-    // FULL
+    // FULL - use Kernighan iteration
     ptr_t n = builder_.make_leaf_full(new_skip);
     n->as_full()->valid = leaf->as_full()->valid;
-    for (int c = 0; c < 256; ++c) {
-        if (leaf->as_full()->valid.test(static_cast<unsigned char>(c))) {
-            n->as_full()->leaf_values[c] = leaf->as_full()->leaf_values[c];
-        }
-    }
+    leaf->as_full()->valid.for_each_set([leaf, n](unsigned char c) {
+        n->as_full()->leaf_values[c] = leaf->as_full()->leaf_values[c];
+    });
     return n;
 }
 
@@ -269,24 +274,24 @@ insert_result add_eos_to_leaf_list(ptr_t leaf, const T& value) {
     
     // Each char in leaf becomes a leaf_eos child
     if (leaf->is_list()) {
-        for (int i = 0; i < leaf->as_list()->chars.count(); ++i) {
+        int cnt = leaf->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
             unsigned char c = leaf->as_list()->chars.char_at(i);
             ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
             interior->as_list()->chars.add(c);
             interior->as_list()->children[i].store(child);
         }
     } else {
-        for (int c = 0; c < 256; ++c) {
-            if (leaf->as_full()->valid.test(static_cast<unsigned char>(c))) {
-                ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
-                int idx = interior->as_list()->chars.add(static_cast<unsigned char>(c));
-                interior->as_list()->children[idx].store(child);
-            }
-        }
+        // FULL - use Kernighan iteration
+        leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
+            ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
+            int idx = interior->as_list()->chars.add(c);
+            interior->as_list()->children[idx].store(child);
+        });
     }
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -307,9 +312,10 @@ insert_result add_char_to_leaf(ptr_t leaf, unsigned char c, const T& value) {
             return res;
         }
         
-        // Convert to FULL
+        // Convert to FULL - use Kernighan iteration
         ptr_t full = builder_.make_leaf_full(leaf->as_list()->skip);
-        for (int i = 0; i < leaf->as_list()->chars.count(); ++i) {
+        int cnt = leaf->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
             unsigned char ch = leaf->as_list()->chars.char_at(i);
             full->as_full()->valid.set(ch);
             full->as_full()->leaf_values[ch] = leaf->as_list()->leaf_values[i];
@@ -318,7 +324,7 @@ insert_result add_char_to_leaf(ptr_t leaf, unsigned char c, const T& value) {
         full->as_full()->leaf_values[c] = value;
         
         res.new_node = full;
-        res.old_nodes.push_back(leaf);
+        res.add_old(leaf);
         res.inserted = true;
         return res;
     }
@@ -342,20 +348,20 @@ insert_result demote_leaf_list(ptr_t leaf, std::string_view key, const T& value)
     
     // Convert existing chars to leaf_eos children
     if (leaf->is_list()) {
-        for (int i = 0; i < leaf->as_list()->chars.count(); ++i) {
+        int cnt = leaf->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
             unsigned char c = leaf->as_list()->chars.char_at(i);
             ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
             interior->as_list()->chars.add(c);
             interior->as_list()->children[i].store(child);
         }
     } else {
-        for (int c = 0; c < 256; ++c) {
-            if (leaf->as_full()->valid.test(static_cast<unsigned char>(c))) {
-                ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
-                int idx = interior->as_list()->chars.add(static_cast<unsigned char>(c));
-                interior->as_list()->children[idx].store(child);
-            }
-        }
+        // FULL - use Kernighan iteration
+        leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
+            ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
+            int idx = interior->as_list()->chars.add(c);
+            interior->as_list()->children[idx].store(child);
+        });
     }
     
     // Add new key
@@ -366,7 +372,7 @@ insert_result demote_leaf_list(ptr_t leaf, std::string_view key, const T& value)
         if (child_res.new_node) {
             interior->as_list()->children[existing_idx].store(child_res.new_node);
         }
-        for (auto* old : child_res.old_nodes) res.old_nodes.push_back(old);
+        for (int i = 0; i < child_res.old_count; ++i) res.add_old(child_res.old_nodes[i]);
     } else {
         ptr_t child = create_leaf_for_key(key.substr(1), value);
         int idx = interior->as_list()->chars.add(first_c);
@@ -374,7 +380,7 @@ insert_result demote_leaf_list(ptr_t leaf, std::string_view key, const T& value)
     }
     
     res.new_node = interior;
-    res.old_nodes.push_back(leaf);
+    res.add_old(leaf);
     res.inserted = true;
     return res;
 }
@@ -398,7 +404,7 @@ insert_result split_interior(ptr_t n, std::string_view key, const T& value, size
     new_int->as_list()->children[1].store(new_child);
     
     res.new_node = new_int;
-    res.old_nodes.push_back(n);
+    res.add_old(n);
     res.inserted = true;
     return res;
 }
@@ -409,7 +415,8 @@ ptr_t clone_interior_with_skip(ptr_t n, std::string_view new_skip) {
         clone->as_list()->chars = n->as_list()->chars;
         clone->as_list()->eos_ptr = n->as_list()->eos_ptr;
         n->as_list()->eos_ptr = nullptr;
-        for (int i = 0; i < n->as_list()->chars.count(); ++i) {
+        int cnt = n->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
             clone->as_list()->children[i].store(n->as_list()->children[i].load());
             n->as_list()->children[i].store(nullptr);
         }
@@ -420,12 +427,11 @@ ptr_t clone_interior_with_skip(ptr_t n, std::string_view new_skip) {
         clone->as_full()->valid = n->as_full()->valid;
         clone->as_full()->eos_ptr = n->as_full()->eos_ptr;
         n->as_full()->eos_ptr = nullptr;
-        for (int c = 0; c < 256; ++c) {
-            if (n->as_full()->valid.test(static_cast<unsigned char>(c))) {
-                clone->as_full()->children[c].store(n->as_full()->children[c].load());
-                n->as_full()->children[c].store(nullptr);
-            }
-        }
+        // Use Kernighan iteration
+        n->as_full()->valid.for_each_set([n, clone](unsigned char c) {
+            clone->as_full()->children[c].store(n->as_full()->children[c].load());
+            n->as_full()->children[c].store(nullptr);
+        });
         return clone;
     }
     // EOS or SKIP
@@ -449,7 +455,7 @@ insert_result prefix_interior(ptr_t n, std::string_view key, const T& value, siz
     new_int->as_list()->children[0].store(old_child);
     
     res.new_node = new_int;
-    res.old_nodes.push_back(n);
+    res.add_old(n);
     res.inserted = true;
     return res;
 }
@@ -483,7 +489,8 @@ insert_result add_child_to_interior(ptr_t n, unsigned char c, std::string_view r
         ptr_t full = builder_.make_interior_full(n->as_list()->skip);
         full->as_full()->eos_ptr = n->as_list()->eos_ptr;
         n->as_list()->eos_ptr = nullptr;
-        for (int i = 0; i < n->as_list()->chars.count(); ++i) {
+        int cnt = n->as_list()->chars.count();
+        for (int i = 0; i < cnt; ++i) {
             unsigned char ch = n->as_list()->chars.char_at(i);
             full->as_full()->valid.set(ch);
             full->as_full()->children[ch].store(n->as_list()->children[i].load());
@@ -493,7 +500,7 @@ insert_result add_child_to_interior(ptr_t n, unsigned char c, std::string_view r
         full->as_full()->children[c].store(child);
         
         res.new_node = full;
-        res.old_nodes.push_back(n);
+        res.add_old(n);
         res.inserted = true;
         return res;
     }
@@ -514,7 +521,7 @@ insert_result add_child_to_interior(ptr_t n, unsigned char c, std::string_view r
     list->as_list()->children[0].store(child);
     
     res.new_node = list;
-    res.old_nodes.push_back(n);
+    res.add_old(n);
     res.inserted = true;
     return res;
 }

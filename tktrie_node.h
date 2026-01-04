@@ -52,7 +52,6 @@ struct node_base {
     
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     uint64_t type() const noexcept { return get_type(header()); }
-    uint64_t version() const noexcept { return get_version(header()); }
     
     void bump_version() noexcept {
         if constexpr (THREADED) {
@@ -114,7 +113,6 @@ struct node_base {
 };
 
 // EOS node - minimal, just a value (leaf) or eos_ptr (interior)
-// Size: ~16 bytes for leaf, ~16 bytes for interior
 template <typename T, bool THREADED, typename Allocator>
 struct eos_node : node_base<T, THREADED, Allocator> {
     union {
@@ -126,7 +124,6 @@ struct eos_node : node_base<T, THREADED, Allocator> {
 };
 
 // SKIP node - skip string + value
-// Size: ~48 bytes (with SSO)
 template <typename T, bool THREADED, typename Allocator>
 struct skip_node : node_base<T, THREADED, Allocator> {
     std::string skip;
@@ -139,7 +136,6 @@ struct skip_node : node_base<T, THREADED, Allocator> {
 };
 
 // LIST node - skip + up to 7 children
-// Size: ~88 bytes for leaf, ~96 bytes for interior
 template <typename T, bool THREADED, typename Allocator>
 struct list_node : node_base<T, THREADED, Allocator> {
     using base_t = node_base<T, THREADED, Allocator>;
@@ -156,7 +152,6 @@ struct list_node : node_base<T, THREADED, Allocator> {
     T* eos_ptr;  // interior only
     
     list_node() : eos_ptr(nullptr) {
-        // Zero-initialize children
         for (int i = 0; i < MAX_CHILDREN; ++i) {
             children[i].store(nullptr);
         }
@@ -164,7 +159,6 @@ struct list_node : node_base<T, THREADED, Allocator> {
 };
 
 // FULL node - skip + 256 children
-// Size: ~2KB for leaf, ~2KB for interior
 template <typename T, bool THREADED, typename Allocator>
 struct full_node : node_base<T, THREADED, Allocator> {
     using base_t = node_base<T, THREADED, Allocator>;
@@ -179,7 +173,6 @@ struct full_node : node_base<T, THREADED, Allocator> {
     T* eos_ptr;  // interior only
     
     full_node() : eos_ptr(nullptr) {
-        // Zero-initialize children
         for (int i = 0; i < 256; ++i) {
             children[i].store(nullptr);
         }
@@ -268,18 +261,18 @@ public:
         if (!n->is_leaf()) {
             if (n->is_list()) {
                 auto* ln = n->as_list();
-                for (int i = 0; i < ln->chars.count(); ++i) {
+                int cnt = ln->chars.count();
+                for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
                 }
                 delete ln->eos_ptr;
                 delete ln;
             } else if (n->is_full()) {
                 auto* fn = n->as_full();
-                for (int c = 0; c < 256; ++c) {
-                    if (fn->valid.test(static_cast<unsigned char>(c))) {
-                        dealloc_node(fn->children[c].load());
-                    }
-                }
+                // Use Kernighan iteration - O(k) where k = child count
+                fn->valid.for_each_set([this, fn](unsigned char c) {
+                    dealloc_node(fn->children[c].load());
+                });
                 delete fn->eos_ptr;
                 delete fn;
             } else if (n->is_skip()) {
@@ -323,7 +316,8 @@ public:
                     d->set_header(s->header());
                     d->skip = s->skip;
                     d->chars = s->chars;
-                    for (int i = 0; i < s->chars.count(); ++i) {
+                    int cnt = s->chars.count();
+                    for (int i = 0; i < cnt; ++i) {
                         d->leaf_values[i] = s->leaf_values[i];
                     }
                     return d;
@@ -334,11 +328,10 @@ public:
                     d->set_header(s->header());
                     d->skip = s->skip;
                     d->valid = s->valid;
-                    for (int c = 0; c < 256; ++c) {
-                        if (s->valid.test(static_cast<unsigned char>(c))) {
-                            d->leaf_values[c] = s->leaf_values[c];
-                        }
-                    }
+                    // Use Kernighan iteration
+                    s->valid.for_each_set([s, d](unsigned char c) {
+                        d->leaf_values[c] = s->leaf_values[c];
+                    });
                     return d;
                 }
             }
@@ -366,7 +359,8 @@ public:
                     d->skip = s->skip;
                     d->chars = s->chars;
                     d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
-                    for (int i = 0; i < s->chars.count(); ++i) {
+                    int cnt = s->chars.count();
+                    for (int i = 0; i < cnt; ++i) {
                         d->children[i].store(deep_copy(s->children[i].load()));
                     }
                     return d;
@@ -378,11 +372,10 @@ public:
                     d->skip = s->skip;
                     d->valid = s->valid;
                     d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
-                    for (int c = 0; c < 256; ++c) {
-                        if (s->valid.test(static_cast<unsigned char>(c))) {
-                            d->children[c].store(deep_copy(s->children[c].load()));
-                        }
-                    }
+                    // Use Kernighan iteration
+                    s->valid.for_each_set([this, s, d](unsigned char c) {
+                        d->children[c].store(deep_copy(s->children[c].load()));
+                    });
                     return d;
                 }
             }

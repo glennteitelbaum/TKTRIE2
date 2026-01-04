@@ -20,7 +20,7 @@ public:
         ebr_slot* slot_;
     public:
         explicit guard(ebr_slot* s) : slot_(s) { slot_->enter(); }
-        ~guard() { slot_->exit(); }
+        ~guard() { if (slot_) slot_->exit(); }
         guard(const guard&) = delete;
         guard& operator=(const guard&) = delete;
         guard(guard&& o) noexcept : slot_(o.slot_) { o.slot_ = nullptr; }

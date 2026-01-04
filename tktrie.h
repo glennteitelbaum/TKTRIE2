@@ -16,7 +16,7 @@ namespace gteitelbaum {
 // Key traits
 template <typename Key> struct tktrie_traits;
 
-// String specialization: return string_view to avoid copy on lookups
+// String specialization: return string_view to avoid copy
 template <>
 struct tktrie_traits<std::string> {
     static std::string_view to_bytes(const std::string& k) noexcept { return k; }
@@ -93,12 +93,6 @@ private:
         }
     }
     
-    static size_t match_skip(std::string_view skip, std::string_view key) noexcept {
-        size_t i = 0;
-        while (i < skip.size() && i < key.size() && skip[i] == key[i]) ++i;
-        return i;
-    }
-    
     static std::string_view get_skip(ptr_t n) noexcept {
         switch (n->type()) {
             case TYPE_SKIP: return n->as_skip()->skip;
@@ -136,7 +130,7 @@ private:
             if (n->is_leaf()) return read_from_leaf(n, key, out);
             
             std::string_view skip = get_skip(n);
-            size_t m = match_skip(skip, key);
+            size_t m = match_skip_impl(skip, key);
             if (m < skip.size()) return false;
             key.remove_prefix(m);
             
@@ -158,7 +152,7 @@ private:
     
     bool read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept {
         std::string_view skip = get_skip(leaf);
-        size_t m = match_skip(skip, key);
+        size_t m = match_skip_impl(skip, key);
         if (m < skip.size()) return false;
         key.remove_prefix(m);
         
@@ -280,7 +274,6 @@ public:
     bool empty() const noexcept { return size() == 0; }
     
     bool contains(const Key& key) const {
-        // Use auto to avoid copy for string keys (returns string_view)
         auto kb = traits::to_bytes(key);
         if constexpr (THREADED) {
             auto& slot = get_ebr_slot();
@@ -292,27 +285,22 @@ public:
     }
     
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& kv) {
-        // For insert, we pass string_view to insert_locked
-        // The iterator creation inside will convert to string if needed
         auto kb = traits::to_bytes(kv.first);
         return insert_locked(kv.first, kb, kv.second);
     }
     
     bool erase(const Key& key) {
-        // erase_locked now takes string_view
         auto kb = traits::to_bytes(key);
         return erase_locked(kb);
     }
     
     iterator find(const Key& key) const {
-        // Use auto to avoid copy for string keys
         auto kb = traits::to_bytes(key);
         T value;
         if constexpr (THREADED) {
             auto& slot = get_ebr_slot();
             auto guard = slot.get_guard();
             if (read_impl(root_.load(), kb, value)) {
-                // Convert to string for iterator storage
                 return iterator(this, std::string(kb), value);
             }
         } else {
