@@ -94,32 +94,23 @@ private:
     }
     
     static std::string_view get_skip(ptr_t n) noexcept {
-        switch (n->type()) {
-            case TYPE_SKIP: return n->as_skip()->skip;
-            case TYPE_LIST: return n->as_list()->skip;
-            case TYPE_FULL: return n->as_full()->skip;
-            default: return {};
-        }
+        // eos_node has no skip
+        if (n->type() == TYPE_EOS) return {};
+        // skip is at NODE_SKIP_OFFSET for skip/list/full (consistent layout)
+        const std::string* skip_ptr = reinterpret_cast<const std::string*>(
+            reinterpret_cast<const char*>(n) + NODE_SKIP_OFFSET);
+        return *skip_ptr;
     }
     
     static T* get_eos_ptr(ptr_t n) noexcept {
         if (n->is_leaf()) return nullptr;
-        switch (n->type()) {
-            case TYPE_EOS: return n->as_eos()->eos_ptr;
-            case TYPE_SKIP: return n->as_skip()->eos_ptr;
-            case TYPE_LIST: return n->as_list()->eos_ptr;
-            case TYPE_FULL: return n->as_full()->eos_ptr;
-            default: return nullptr;
-        }
+        // eos_ptr is at NODE_EOS_OFFSET for all types (consistent layout)
+        return *reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
     }
     
     static void set_eos_ptr(ptr_t n, T* p) noexcept {
-        switch (n->type()) {
-            case TYPE_EOS: n->as_eos()->eos_ptr = p; break;
-            case TYPE_SKIP: n->as_skip()->eos_ptr = p; break;
-            case TYPE_LIST: n->as_list()->eos_ptr = p; break;
-            case TYPE_FULL: n->as_full()->eos_ptr = p; break;
-        }
+        // eos_ptr is at NODE_EOS_OFFSET for all types (consistent layout)
+        *reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET) = p;
     }
     
     // =========================================================================

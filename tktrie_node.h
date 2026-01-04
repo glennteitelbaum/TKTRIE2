@@ -183,6 +183,11 @@ struct full_node : node_base<T, THREADED, Allocator> {
     }
 };
 
+// Layout constants for offset-based access
+// All node types have eos_ptr/leaf_value at offset 8, skip at offset 16
+static constexpr size_t NODE_EOS_OFFSET = 8;
+static constexpr size_t NODE_SKIP_OFFSET = 16;
+
 // Node builder - handles allocation and type-safe construction
 template <typename T, bool THREADED, typename Allocator>
 class node_builder {
