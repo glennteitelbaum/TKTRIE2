@@ -363,7 +363,8 @@ public:
     }
 
     slot_type* build_list(small_list lst, const std::vector<uint64_t>& children) {
-        size_t sz = 2 + 1 + lst.count();
+        // Pre-allocate LIST_MAX slots to allow in-place expansion
+        size_t sz = 2 + 1 + LIST_MAX;
         slot_type* node = allocate_node(sz);
         store_slot<THREADED>(&node[0], make_header(FLAG_LIST, static_cast<uint32_t>(sz)));
         node_view_t view(node);
@@ -396,7 +397,8 @@ public:
     }
 
     slot_type* build_skip_list(std::string_view skip, small_list lst, const std::vector<uint64_t>& children) {
-        size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1 + 1 + lst.count();
+        // Pre-allocate LIST_MAX slots to allow in-place expansion
+        size_t sz = 2 + 1 + bytes_to_words(skip.size()) + 1 + 1 + LIST_MAX;
         slot_type* node = allocate_node(sz);
         store_slot<THREADED>(&node[0], make_header(FLAG_SKIP | FLAG_LIST, static_cast<uint32_t>(sz)));
         node_view_t view(node);
@@ -462,7 +464,8 @@ public:
 
     slot_type* build_leaf_list(small_list lst, const std::vector<T>& values) {
         static_assert(can_embed_leaf_v<T>);
-        size_t sz = 1 + 1 + lst.count();
+        // Pre-allocate LIST_MAX slots for in-place expansion
+        size_t sz = 1 + 1 + LIST_MAX;
         slot_type* node = allocate_node(sz);
         store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_LIST, static_cast<uint32_t>(sz)));
         node_view_t view(node);
@@ -496,7 +499,8 @@ public:
 
     slot_type* build_leaf_skip_list(std::string_view skip, small_list lst, const std::vector<T>& values) {
         static_assert(can_embed_leaf_v<T>);
-        size_t sz = 1 + 1 + bytes_to_words(skip.size()) + 1 + lst.count();
+        // Pre-allocate LIST_MAX slots for in-place expansion
+        size_t sz = 1 + 1 + bytes_to_words(skip.size()) + 1 + LIST_MAX;
         slot_type* node = allocate_node(sz);
         store_slot<THREADED>(&node[0], make_header(FLAG_LEAF | FLAG_SKIP | FLAG_LIST, static_cast<uint32_t>(sz)));
         node_view_t view(node);

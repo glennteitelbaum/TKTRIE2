@@ -484,7 +484,26 @@ private:
 
                 uint64_t child_ptr = load_slot<THREADED>(child_slot);
                 if (child_ptr == 0) {
-                    // Empty slot - add child (COW)
+                    // Empty slot - try in-place first for FULL nodes
+                    if (view.has_full()) {
+                        // Build child and store directly
+                        slot_type* child_node;
+                        std::string_view rest = kv.substr(1);
+                        if (rest.empty()) {
+                            child_node = builder_.build_empty();
+                            node_view_t cv(child_node);
+                            cv.eos_data()->set(std::forward<V>(value));
+                        } else {
+                            child_node = builder_.build_skip(rest);
+                            node_view_t cv(child_node);
+                            cv.skip_eos_data()->set(std::forward<V>(value));
+                        }
+                        store_slot<THREADED>(child_slot, reinterpret_cast<uint64_t>(child_node));
+                        view.bump_version();
+                        elem_count_.fetch_add(1, std::memory_order_relaxed);
+                        return {iterator(key, value), true};
+                    }
+                    // Non-FULL: use add_child which may still do in-place for LIST
                     return add_child(parent_child_slot, cur, key, std::forward<V>(value), kv);
                 }
 
@@ -664,10 +683,11 @@ private:
                 new_node = new_skip.empty() ? builder_.build_list(lst, children)
                                             : builder_.build_skip_list(new_skip, lst, children);
             } else {
-                popcount_bitmap bmp;
-                for (auto c : chars) bmp.set(c);
-                new_node = new_skip.empty() ? builder_.build_pop(bmp, children)
-                                            : builder_.build_skip_pop(new_skip, bmp, children);
+                // Skip POP - go directly to FULL
+                std::vector<uint64_t> full(256, 0);
+                for (size_t i = 0; i < chars.size(); ++i) full[chars[i]] = children[i];
+                new_node = new_skip.empty() ? builder_.build_full(full)
+                                            : builder_.build_skip_full(new_skip, full);
             }
             
             node_view_t nv(new_node);
@@ -691,7 +711,7 @@ private:
         unsigned char c = static_cast<unsigned char>(kv[0]);
         std::string_view rest = kv.substr(1);
 
-        // Build new child node
+        // Build new child node first
         slot_type* child_node;
         if (rest.empty()) {
             child_node = builder_.build_empty();
@@ -703,7 +723,13 @@ private:
             cv.skip_eos_data()->set(std::forward<V>(value));
         }
 
-        // COW: rebuild node with new child
+        // Try in-place atomic expansion first
+        if (try_add_child_inplace(node, c, child_node)) {
+            elem_count_.fetch_add(1, std::memory_order_relaxed);
+            return {iterator(key, value), true};
+        }
+
+        // Fall back to COW: rebuild node with new child
         slot_type* new_node = rebuild_with_new_child(node, c, child_node);
 
         store_slot<THREADED>(parent_slot, reinterpret_cast<uint64_t>(new_node));
@@ -715,6 +741,44 @@ private:
 
         elem_count_.fetch_add(1, std::memory_order_relaxed);
         return {iterator(key, value), true};
+    }
+
+    // Returns true if child was added in-place (no COW needed)
+    bool try_add_child_inplace(slot_type* node, unsigned char c, slot_type* child_node) {
+        node_view_t view(node);
+        
+        // FULL nodes: slot already exists, just atomic store
+        if (view.has_full()) {
+            slot_type* child_slot = view.find_child(c);
+            if (child_slot) {
+                store_slot<THREADED>(child_slot, reinterpret_cast<uint64_t>(child_node));
+                view.bump_version();
+                return true;
+            }
+        }
+        
+        // LIST nodes with room: add character and child atomically
+        // (LIST nodes are pre-allocated with LIST_MAX slots)
+        if (view.has_list()) {
+            small_list lst = view.get_list();
+            int count = lst.count();
+            
+            if (count < LIST_MAX) {
+                // 1. Store child at position [count]
+                store_slot<THREADED>(&view.child_ptrs()[count], reinterpret_cast<uint64_t>(child_node));
+                
+                // 2. Atomically update list to include new char
+                lst.add(c);
+                store_slot<THREADED>(&node[view.children_header_offset()], lst.to_u64());
+                
+                view.bump_version();
+                return true;
+            }
+            // LIST is full (7 children) - need COW to upgrade to POP
+        }
+        
+        // POP nodes and LIST->POP transitions require COW
+        return false;
     }
 
     slot_type* rebuild_with_new_child(slot_type* node, unsigned char c, slot_type* new_child) {
@@ -768,23 +832,8 @@ private:
             } else {
                 result = builder_.build_list(new_lst, children);
             }
-        } else if (chars.size() <= static_cast<size_t>(FULL_THRESHOLD)) {
-            popcount_bitmap bmp;
-            std::vector<uint64_t> sorted_children(chars.size());
-            for (size_t i = 0; i < chars.size(); ++i) {
-                int idx = bmp.set(chars[i]);
-                // Insert at correct position
-                for (size_t j = sorted_children.size() - 1; j > static_cast<size_t>(idx); --j) {
-                    sorted_children[j] = sorted_children[j - 1];
-                }
-                sorted_children[idx] = children[i];
-            }
-            if (view.has_skip()) {
-                result = builder_.build_skip_pop(view.skip_chars(), bmp, sorted_children);
-            } else {
-                result = builder_.build_pop(bmp, sorted_children);
-            }
         } else {
+            // Skip POP - go directly to FULL for O(1) in-place inserts
             std::vector<uint64_t> full(256, 0);
             for (size_t i = 0; i < chars.size(); ++i) full[chars[i]] = children[i];
             if (view.has_skip()) {
