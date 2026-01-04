@@ -5,7 +5,7 @@
 | Use Case | Recommendation |
 |----------|----------------|
 | Single-threaded, need fastest lookups | `std::unordered_map` |
-| Single-threaded, need ordered iteration | `tktrie` or `std::map` |
+| Single-threaded, need ordered iteration | `tktrie` or `std::map` *(small N)* |
 | Multi-threaded, read-heavy (>90% reads) | `concurrent_tktrie` |
 | Multi-threaded, many readers + few writers | `concurrent_tktrie` |
 | Multi-threaded, write-heavy | `guarded unordered_map` |
