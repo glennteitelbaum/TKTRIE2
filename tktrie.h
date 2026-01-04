@@ -1082,24 +1082,249 @@ public:
     iterator end() const noexcept { return iterator(); }
     
 private:
-    std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, const T& value) {
-        std::lock_guard<mutex_t> lock(mutex_);
+    // Result of probing for in-place insert possibility
+    enum class probe_result { NOT_FOUND, EXISTS, IN_PLACE_LEAF, IN_PLACE_INTERIOR, NEEDS_COW };
+    
+    struct probe_info {
+        probe_result result = probe_result::NOT_FOUND;
+        ptr_t target = nullptr;        // Node to modify
+        unsigned char c = 0;           // Char to add (for leaf/interior child)
+        bool is_eos = false;           // True if setting eos_ptr
+    };
+    
+    // Read-only traversal to check if in-place insert is possible
+    // Called under EBR guard, no mutex
+    probe_info probe_insert(ptr_t n, std::string_view key) const noexcept {
+        probe_info info;
         
-        ptr_t root = root_.load();
-        auto res = insert_impl(&root_, root, kb, value);
-        
-        if (!res.inserted) {
-            for (auto* old : res.old_nodes) retire_node(old);
-            return {find(key), false};
+        while (n) {
+            if (n->is_leaf()) {
+                std::string_view skip = get_skip(n);
+                size_t m = match_skip(skip, key);
+                if (m < skip.size()) {
+                    info.result = probe_result::NEEDS_COW;
+                    return info;
+                }
+                key.remove_prefix(m);
+                
+                if (n->is_eos() || n->is_skip()) {
+                    info.result = key.empty() ? probe_result::EXISTS : probe_result::NEEDS_COW;
+                    return info;
+                }
+                
+                // LIST or FULL leaf
+                if (key.empty()) {
+                    info.result = probe_result::NEEDS_COW;  // Need to add EOS to leaf
+                    return info;
+                }
+                if (key.size() != 1) {
+                    info.result = probe_result::NEEDS_COW;  // Key too long
+                    return info;
+                }
+                
+                unsigned char c = static_cast<unsigned char>(key[0]);
+                if (n->is_list()) {
+                    if (n->as_list()->chars.find(c) >= 0) {
+                        info.result = probe_result::EXISTS;
+                        return info;
+                    }
+                    if (n->as_list()->chars.count() < LIST_MAX) {
+                        info.result = probe_result::IN_PLACE_LEAF;
+                        info.target = n;
+                        info.c = c;
+                        return info;
+                    }
+                    info.result = probe_result::NEEDS_COW;  // LIST -> FULL conversion
+                    return info;
+                }
+                // FULL leaf
+                if (n->as_full()->valid.test(c)) {
+                    info.result = probe_result::EXISTS;
+                    return info;
+                }
+                info.result = probe_result::IN_PLACE_LEAF;
+                info.target = n;
+                info.c = c;
+                return info;
+            }
+            
+            // Interior node
+            std::string_view skip = get_skip(n);
+            size_t m = match_skip(skip, key);
+            if (m < skip.size()) {
+                info.result = probe_result::NEEDS_COW;
+                return info;
+            }
+            key.remove_prefix(m);
+            
+            if (key.empty()) {
+                T* p = get_eos_ptr(n);
+                if (p) {
+                    info.result = probe_result::EXISTS;
+                    return info;
+                }
+                info.result = probe_result::IN_PLACE_INTERIOR;
+                info.target = n;
+                info.is_eos = true;
+                return info;
+            }
+            
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            ptr_t child = find_child(n, c);
+            
+            if (!child) {
+                // Need to add new child
+                if (n->is_list() && n->as_list()->chars.count() < LIST_MAX) {
+                    info.result = probe_result::IN_PLACE_INTERIOR;
+                    info.target = n;
+                    info.c = c;
+                    return info;
+                }
+                if (n->is_full()) {
+                    info.result = probe_result::IN_PLACE_INTERIOR;
+                    info.target = n;
+                    info.c = c;
+                    return info;
+                }
+                info.result = probe_result::NEEDS_COW;
+                return info;
+            }
+            
+            key.remove_prefix(1);
+            n = child;
         }
         
-        if (res.new_node) root_.store(res.new_node);
-        for (auto* old : res.old_nodes) retire_node(old);
+        // Empty tree
+        info.result = probe_result::NEEDS_COW;
+        return info;
+    }
+    
+    // Try in-place insert under mutex, return true if succeeded
+    bool try_in_place_insert(const probe_info& info, std::string_view key, const T& value) {
+        if (info.result == probe_result::IN_PLACE_LEAF) {
+            ptr_t n = info.target;
+            unsigned char c = info.c;
+            
+            if (n->is_list()) {
+                // Re-verify conditions
+                if (n->as_list()->chars.find(c) >= 0) return false;  // Now exists
+                if (n->as_list()->chars.count() >= LIST_MAX) return false;  // Now full
+                
+                int idx = n->as_list()->chars.add(c);
+                n->as_list()->leaf_values[idx] = value;
+                return true;
+            }
+            // FULL
+            if (n->as_full()->valid.test(c)) return false;  // Now exists
+            n->as_full()->valid.template atomic_set<THREADED>(c);
+            n->as_full()->leaf_values[c] = value;
+            return true;
+        }
         
-        if constexpr (THREADED) size_.fetch_add(1);
-        else ++size_;
+        if (info.result == probe_result::IN_PLACE_INTERIOR) {
+            ptr_t n = info.target;
+            
+            if (info.is_eos) {
+                if (get_eos_ptr(n)) return false;  // Now has eos
+                set_eos_ptr(n, new T(value));
+                return true;
+            }
+            
+            unsigned char c = info.c;
+            
+            // Build the child node (allocation, but outside critical section would be better)
+            // For now, do it here
+            std::string_view remaining = key;
+            // Skip to find remaining key after this node
+            std::string_view skip = get_skip(n);
+            remaining.remove_prefix(skip.size() + 1);  // skip + the char c
+            
+            ptr_t child = create_leaf_for_key(remaining, value);
+            
+            if (n->is_list()) {
+                if (n->as_list()->chars.find(c) >= 0) {
+                    builder_.dealloc_node(child);
+                    return false;  // Child now exists
+                }
+                if (n->as_list()->chars.count() >= LIST_MAX) {
+                    builder_.dealloc_node(child);
+                    return false;  // List now full
+                }
+                int idx = n->as_list()->chars.add(c);
+                n->as_list()->children[idx].store(child);
+                return true;
+            }
+            // FULL
+            if (find_child(n, c)) {
+                builder_.dealloc_node(child);
+                return false;  // Child now exists
+            }
+            n->as_full()->valid.template atomic_set<THREADED>(c);
+            n->as_full()->children[c].store(child);
+            return true;
+        }
         
-        return {iterator(this, kb, value), true};
+        return false;
+    }
+    
+    std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, const T& value) {
+        if constexpr (!THREADED) {
+            // Non-threaded: simple path
+            std::lock_guard<mutex_t> lock(mutex_);
+            
+            ptr_t root = root_.load();
+            auto res = insert_impl(&root_, root, kb, value);
+            
+            if (!res.inserted) {
+                for (auto* old : res.old_nodes) retire_node(old);
+                return {find(key), false};
+            }
+            
+            if (res.new_node) root_.store(res.new_node);
+            for (auto* old : res.old_nodes) retire_node(old);
+            ++size_;
+            
+            return {iterator(this, kb, value), true};
+        } else {
+            // Threaded: try in-place first with short lock
+            probe_info info;
+            {
+                auto& slot = get_ebr_slot();
+                auto guard = slot.get_guard();
+                info = probe_insert(root_.load(), kb);
+            }
+            
+            if (info.result == probe_result::EXISTS) {
+                return {find(key), false};
+            }
+            
+            if (info.result == probe_result::IN_PLACE_LEAF || 
+                info.result == probe_result::IN_PLACE_INTERIOR) {
+                std::lock_guard<mutex_t> lock(mutex_);
+                if (try_in_place_insert(info, kb, value)) {
+                    size_.fetch_add(1);
+                    return {iterator(this, kb, value), true};
+                }
+                // Fall through to full COW
+            }
+            
+            // Full COW path
+            std::lock_guard<mutex_t> lock(mutex_);
+            
+            ptr_t root = root_.load();
+            auto res = insert_impl(&root_, root, kb, value);
+            
+            if (!res.inserted) {
+                for (auto* old : res.old_nodes) retire_node(old);
+                return {find(key), false};
+            }
+            
+            if (res.new_node) root_.store(res.new_node);
+            for (auto* old : res.old_nodes) retire_node(old);
+            size_.fetch_add(1);
+            
+            return {iterator(this, kb, value), true};
+        }
     }
     
     bool erase_locked(const std::string& kb) {
