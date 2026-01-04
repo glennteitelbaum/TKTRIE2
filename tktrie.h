@@ -16,9 +16,10 @@ namespace gteitelbaum {
 // Key traits
 template <typename Key> struct tktrie_traits;
 
+// String specialization: return string_view to avoid copy on lookups
 template <>
 struct tktrie_traits<std::string> {
-    static std::string to_bytes(const std::string& k) { return k; }
+    static std::string_view to_bytes(const std::string& k) noexcept { return k; }
     static std::string from_bytes(std::string_view b) { return std::string(b); }
 };
 
@@ -279,7 +280,8 @@ public:
     bool empty() const noexcept { return size() == 0; }
     
     bool contains(const Key& key) const {
-        std::string kb = traits::to_bytes(key);
+        // Use auto to avoid copy for string keys (returns string_view)
+        auto kb = traits::to_bytes(key);
         if constexpr (THREADED) {
             auto& slot = get_ebr_slot();
             auto guard = slot.get_guard();
@@ -290,25 +292,32 @@ public:
     }
     
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& kv) {
-        return insert_locked(kv.first, traits::to_bytes(kv.first), kv.second);
+        // For insert, we pass string_view to insert_locked
+        // The iterator creation inside will convert to string if needed
+        auto kb = traits::to_bytes(kv.first);
+        return insert_locked(kv.first, kb, kv.second);
     }
     
     bool erase(const Key& key) {
-        return erase_locked(traits::to_bytes(key));
+        // erase_locked now takes string_view
+        auto kb = traits::to_bytes(key);
+        return erase_locked(kb);
     }
     
     iterator find(const Key& key) const {
-        std::string kb = traits::to_bytes(key);
+        // Use auto to avoid copy for string keys
+        auto kb = traits::to_bytes(key);
         T value;
         if constexpr (THREADED) {
             auto& slot = get_ebr_slot();
             auto guard = slot.get_guard();
             if (read_impl(root_.load(), kb, value)) {
-                return iterator(this, kb, value);
+                // Convert to string for iterator storage
+                return iterator(this, std::string(kb), value);
             }
         } else {
             if (read_impl(root_.load(), kb, value)) {
-                return iterator(this, kb, value);
+                return iterator(this, std::string(kb), value);
             }
         }
         return end();

@@ -402,7 +402,7 @@ atomic_ptr* find_slot_for_commit(const speculative_info& info) noexcept {
 }
 
 // Commit speculative allocation (called under lock after validation)
-bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& value) {
+bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& /*value*/) {
     switch (info.op) {
     case spec_op::EMPTY_TREE:
         root_.store(alloc.root_replacement);
@@ -736,7 +736,7 @@ bool try_in_place_insert(const probe_info& info, std::string_view key, const T& 
     return false;
 }
 
-std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, const T& value) {
+std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value) {
     if constexpr (!THREADED) {
         // Non-threaded: simple path
         std::lock_guard<mutex_t> lock(mutex_);
@@ -753,7 +753,7 @@ std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, c
         for (auto* old : res.old_nodes) retire_node(old);
         ++size_;
         
-        return {iterator(this, kb, value), true};
+        return {iterator(this, std::string(kb), value), true};
     } else {
         // Threaded: speculative allocation path
         while (true) {
@@ -787,7 +787,7 @@ std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, c
                 
                 if (try_in_place_insert(info, kb, value)) {
                     size_.fetch_add(1);
-                    return {iterator(this, kb, value), true};
+                    return {iterator(this, std::string(kb), value), true};
                 }
                 continue;  // Retry
             }
@@ -810,7 +810,7 @@ std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, c
                             retire_node(spec.target);
                         }
                         size_.fetch_add(1);
-                        return {iterator(this, kb, value), true};
+                        return {iterator(this, std::string(kb), value), true};
                     }
                     // Commit returned false - need fallback for complex ops
                     // For now, use full COW under lock for these cases
@@ -837,7 +837,7 @@ std::pair<iterator, bool> insert_locked(const Key& key, const std::string& kb, c
                             for (auto* old : res.old_nodes) retire_node(old);
                             size_.fetch_add(1);
                             
-                            return {iterator(this, kb, value), true};
+                            return {iterator(this, std::string(kb), value), true};
                         }
                         // else retry
                     }

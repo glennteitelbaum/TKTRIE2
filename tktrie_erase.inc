@@ -395,7 +395,7 @@ bool do_inplace_interior_full_erase(ptr_t n, unsigned char c) {
 // =========================================================================
 // ERASE LOCKED (main entry point)
 // =========================================================================
-bool erase_locked(const std::string& kb) {
+bool erase_locked(std::string_view kb) {
     if constexpr (!THREADED) {
         // Non-threaded: use simple recursive implementation
         std::lock_guard<mutex_t> lock(mutex_);
