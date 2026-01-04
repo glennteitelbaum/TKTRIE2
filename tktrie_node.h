@@ -9,13 +9,17 @@
 namespace gteitelbaum {
 
 // Forward declarations
-template <typename T, bool THREADED, typename Allocator> struct node;
-template <typename T, bool THREADED, typename Allocator> struct node_ptr;
+template <typename T, bool THREADED, typename Allocator> struct node_base;
+template <typename T, bool THREADED, typename Allocator> struct eos_node;
+template <typename T, bool THREADED, typename Allocator> struct skip_node;
+template <typename T, bool THREADED, typename Allocator> struct list_node;
+template <typename T, bool THREADED, typename Allocator> struct full_node;
 
 // Atomic wrapper for node pointers
 template <typename T, bool THREADED, typename Allocator>
 struct atomic_node_ptr {
-    using ptr_t = node<T, THREADED, Allocator>*;
+    using base_t = node_base<T, THREADED, Allocator>;
+    using ptr_t = base_t*;
     std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> ptr_{nullptr};
     
     ptr_t load() const noexcept {
@@ -28,108 +32,14 @@ struct atomic_node_ptr {
     }
 };
 
-// Unified node structure - can be leaf or interior
-// LIST nodes use inline small arrays, FULL nodes allocate 256-element arrays
+// Base node - just header, used as common pointer type
 template <typename T, bool THREADED, typename Allocator>
-struct node {
-    using self_t = node<T, THREADED, Allocator>;
+struct node_base {
+    using self_t = node_base<T, THREADED, Allocator>;
     using ptr_t = self_t*;
     using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator>;
-    using value_ptr = std::conditional_t<THREADED, std::atomic<T*>, T*>;
-    
-    static constexpr int INLINE_SLOTS = 8;  // Enough for LIST (7 max) + 1
     
     std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> header_;
-    std::string skip;           // For SKIP/LIST/FULL
-    small_list chars;           // For LIST
-    bitmap256 valid;            // For FULL
-    
-    // Storage for LIST/EOS/SKIP: small inline arrays
-    // For LEAF: values stored here or in heap_values
-    // For Interior: children stored here or in heap_children
-    union {
-        std::array<T, INLINE_SLOTS> inline_values;
-        std::array<atomic_ptr, INLINE_SLOTS> inline_children;
-    };
-    
-    // Heap storage for FULL nodes (256 elements)
-    union {
-        T* heap_values;
-        atomic_ptr* heap_children;
-    };
-    
-    value_ptr eos_ptr{nullptr};       // Interior EOS/SKIP value pointer
-    
-    node() : heap_values(nullptr) {
-        // Zero-initialize inline storage
-        if constexpr (THREADED) {
-            for (int i = 0; i < INLINE_SLOTS; ++i) {
-                inline_children[i].ptr_.store(nullptr, std::memory_order_relaxed);
-            }
-        } else {
-            for (int i = 0; i < INLINE_SLOTS; ++i) {
-                inline_children[i].ptr_ = nullptr;
-            }
-        }
-    }
-    
-    ~node() {
-        // Free heap arrays if FULL
-        if (is_full()) {
-            if (is_leaf()) {
-                delete[] heap_values;
-            } else {
-                delete[] heap_children;
-            }
-        }
-        // Free eos_ptr
-        T* p;
-        if constexpr (THREADED) p = eos_ptr.load(std::memory_order_acquire);
-        else p = eos_ptr;
-        delete p;
-    }
-    
-    // Allocate heap arrays for FULL nodes
-    void alloc_full_arrays() {
-        if (is_leaf()) {
-            heap_values = new T[256]();
-        } else {
-            heap_children = new atomic_ptr[256]();
-        }
-    }
-    
-    // Access values - handles inline vs heap
-    T& value_at(int idx) {
-        if (is_full()) return heap_values[idx];
-        return inline_values[idx];
-    }
-    const T& value_at(int idx) const {
-        if (is_full()) return heap_values[idx];
-        return inline_values[idx];
-    }
-    
-    // Access children - handles inline vs heap  
-    atomic_ptr& child_at(int idx) {
-        if (is_full()) return heap_children[idx];
-        return inline_children[idx];
-    }
-    const atomic_ptr& child_at(int idx) const {
-        if (is_full()) return heap_children[idx];
-        return inline_children[idx];
-    }
-    
-    // Transfer eos_ptr from another node (nulls the source)
-    void take_eos_from(node& other) noexcept {
-        T* p;
-        if constexpr (THREADED) {
-            p = other.eos_ptr.exchange(nullptr, std::memory_order_acq_rel);
-            eos_ptr.store(p, std::memory_order_release);
-        } else {
-            p = other.eos_ptr;
-            other.eos_ptr = nullptr;
-            eos_ptr = p;
-        }
-    }
     
     uint64_t header() const noexcept {
         if constexpr (THREADED) return header_.load(std::memory_order_acquire);
@@ -147,194 +57,325 @@ struct node {
     bool is_list() const noexcept { return type() == TYPE_LIST; }
     bool is_full() const noexcept { return type() == TYPE_FULL; }
     
-    // Get child count for interior nodes
+    // Downcasts
+    eos_node<T, THREADED, Allocator>* as_eos() noexcept {
+        return static_cast<eos_node<T, THREADED, Allocator>*>(this);
+    }
+    skip_node<T, THREADED, Allocator>* as_skip() noexcept {
+        return static_cast<skip_node<T, THREADED, Allocator>*>(this);
+    }
+    list_node<T, THREADED, Allocator>* as_list() noexcept {
+        return static_cast<list_node<T, THREADED, Allocator>*>(this);
+    }
+    full_node<T, THREADED, Allocator>* as_full() noexcept {
+        return static_cast<full_node<T, THREADED, Allocator>*>(this);
+    }
+    
+    const eos_node<T, THREADED, Allocator>* as_eos() const noexcept {
+        return static_cast<const eos_node<T, THREADED, Allocator>*>(this);
+    }
+    const skip_node<T, THREADED, Allocator>* as_skip() const noexcept {
+        return static_cast<const skip_node<T, THREADED, Allocator>*>(this);
+    }
+    const list_node<T, THREADED, Allocator>* as_list() const noexcept {
+        return static_cast<const list_node<T, THREADED, Allocator>*>(this);
+    }
+    const full_node<T, THREADED, Allocator>* as_full() const noexcept {
+        return static_cast<const full_node<T, THREADED, Allocator>*>(this);
+    }
+    
+    // Common accessors that dispatch based on type
+    std::string_view skip_str() const noexcept {
+        switch (type()) {
+            case TYPE_SKIP: return as_skip()->skip;
+            case TYPE_LIST: return as_list()->skip;
+            case TYPE_FULL: return as_full()->skip;
+            default: return {};
+        }
+    }
+    
     int child_count() const noexcept {
-        if (is_list()) return chars.count();
-        if (is_full()) return valid.count();
+        if (is_list()) return as_list()->chars.count();
+        if (is_full()) return as_full()->valid.count();
         return 0;
-    }
-    
-    // Find child slot
-    atomic_ptr* find_child_slot(unsigned char c) noexcept {
-        if (is_list()) {
-            int idx = chars.find(c);
-            return idx >= 0 ? &child_at(idx) : nullptr;
-        }
-        if (is_full() && valid.test(c)) {
-            return &child_at(c);
-        }
-        return nullptr;
-    }
-    
-    // Get value for leaf nodes
-    T* find_value_slot(unsigned char c) noexcept {
-        KTRIE_DEBUG_ASSERT(is_leaf());
-        if (is_list()) {
-            int idx = chars.find(c);
-            return idx >= 0 ? &value_at(idx) : nullptr;
-        }
-        if (is_full() && valid.test(c)) {
-            return &value_at(c);
-        }
-        return nullptr;
     }
 };
 
-// Node builder
+// EOS node - minimal, just a value (leaf) or eos_ptr (interior)
+// Size: ~16 bytes for leaf, ~16 bytes for interior
+template <typename T, bool THREADED, typename Allocator>
+struct eos_node : node_base<T, THREADED, Allocator> {
+    union {
+        T leaf_value;
+        T* eos_ptr;
+    };
+    
+    eos_node() : eos_ptr(nullptr) {}
+};
+
+// SKIP node - skip string + value
+// Size: ~48 bytes (with SSO)
+template <typename T, bool THREADED, typename Allocator>
+struct skip_node : node_base<T, THREADED, Allocator> {
+    std::string skip;
+    union {
+        T leaf_value;
+        T* eos_ptr;
+    };
+    
+    skip_node() : eos_ptr(nullptr) {}
+};
+
+// LIST node - skip + up to 7 children
+// Size: ~88 bytes for leaf, ~96 bytes for interior
+template <typename T, bool THREADED, typename Allocator>
+struct list_node : node_base<T, THREADED, Allocator> {
+    using base_t = node_base<T, THREADED, Allocator>;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    
+    static constexpr int MAX_CHILDREN = 8;
+    
+    std::string skip;
+    small_list chars;
+    union {
+        std::array<T, MAX_CHILDREN> leaf_values;
+        std::array<atomic_ptr, MAX_CHILDREN> children;
+    };
+    T* eos_ptr;  // interior only
+    
+    list_node() : eos_ptr(nullptr) {
+        // Zero-initialize children
+        for (int i = 0; i < MAX_CHILDREN; ++i) {
+            children[i].store(nullptr);
+        }
+    }
+};
+
+// FULL node - skip + 256 children
+// Size: ~2KB for leaf, ~2KB for interior
+template <typename T, bool THREADED, typename Allocator>
+struct full_node : node_base<T, THREADED, Allocator> {
+    using base_t = node_base<T, THREADED, Allocator>;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    
+    std::string skip;
+    bitmap256 valid;
+    union {
+        std::array<T, 256> leaf_values;
+        std::array<atomic_ptr, 256> children;
+    };
+    T* eos_ptr;  // interior only
+    
+    full_node() : eos_ptr(nullptr) {
+        // Zero-initialize children
+        for (int i = 0; i < 256; ++i) {
+            children[i].store(nullptr);
+        }
+    }
+};
+
+// Node builder - handles allocation and type-safe construction
 template <typename T, bool THREADED, typename Allocator>
 class node_builder {
 public:
-    using node_t = node<T, THREADED, Allocator>;
-    using ptr_t = node_t*;
+    using base_t = node_base<T, THREADED, Allocator>;
+    using ptr_t = base_t*;
+    using eos_t = eos_node<T, THREADED, Allocator>;
+    using skip_t = skip_node<T, THREADED, Allocator>;
+    using list_t = list_node<T, THREADED, Allocator>;
+    using full_t = full_node<T, THREADED, Allocator>;
     
-private:
-    Allocator alloc_;
+    // === LEAF builders ===
     
-    ptr_t alloc_node() {
-        ptr_t n = new node_t();
-        return n;
-    }
-    
-public:
-    explicit node_builder(const Allocator& alloc = Allocator()) : alloc_(alloc) {}
-    
-    void dealloc_node(ptr_t n) {
-        if (!n) return;
-        // Recursively free children for interior nodes
-        if (!n->is_leaf()) {
-            if (n->is_list()) {
-                for (int i = 0; i < n->chars.count(); ++i) {
-                    dealloc_node(n->child_at(i).load());
-                }
-            } else if (n->is_full()) {
-                for (int c = 0; c < 256; ++c) {
-                    if (n->valid.test(static_cast<unsigned char>(c))) {
-                        dealloc_node(n->child_at(c).load());
-                    }
-                }
-            }
-        }
-        delete n;
-    }
-    
-    // Create leaf EOS (value with no remaining key)
     ptr_t make_leaf_eos(const T& value) {
-        ptr_t n = alloc_node();
+        auto* n = new eos_t();
         n->set_header(make_header(true, TYPE_EOS));
-        n->value_at(0) = value;
+        n->leaf_value = value;
         return n;
     }
     
-    // Create leaf SKIP (value after skip prefix)
     ptr_t make_leaf_skip(std::string_view sk, const T& value) {
-        ptr_t n = alloc_node();
+        auto* n = new skip_t();
         n->set_header(make_header(true, TYPE_SKIP));
         n->skip = std::string(sk);
-        n->value_at(0) = value;
+        n->leaf_value = value;
         return n;
     }
     
-    // Create leaf LIST (values indexed by single char after skip)
     ptr_t make_leaf_list(std::string_view sk) {
-        ptr_t n = alloc_node();
+        auto* n = new list_t();
         n->set_header(make_header(true, TYPE_LIST));
         n->skip = std::string(sk);
         return n;
     }
     
-    // Create leaf FULL (values indexed by single char after skip)
     ptr_t make_leaf_full(std::string_view sk) {
-        ptr_t n = alloc_node();
+        auto* n = new full_t();
         n->set_header(make_header(true, TYPE_FULL));
         n->skip = std::string(sk);
-        n->alloc_full_arrays();
         return n;
     }
     
-    // Create interior EOS (eos_ptr for value)
+    // === INTERIOR builders ===
+    
     ptr_t make_interior_eos() {
-        ptr_t n = alloc_node();
+        auto* n = new eos_t();
         n->set_header(make_header(false, TYPE_EOS));
+        n->eos_ptr = nullptr;
         return n;
     }
     
-    // Create interior SKIP
     ptr_t make_interior_skip(std::string_view sk) {
-        ptr_t n = alloc_node();
+        auto* n = new skip_t();
         n->set_header(make_header(false, TYPE_SKIP));
         n->skip = std::string(sk);
+        n->eos_ptr = nullptr;
         return n;
     }
     
-    // Create interior LIST
     ptr_t make_interior_list(std::string_view sk) {
-        ptr_t n = alloc_node();
+        auto* n = new list_t();
         n->set_header(make_header(false, TYPE_LIST));
         n->skip = std::string(sk);
         return n;
     }
     
-    // Create interior FULL
     ptr_t make_interior_full(std::string_view sk) {
-        ptr_t n = alloc_node();
+        auto* n = new full_t();
         n->set_header(make_header(false, TYPE_FULL));
         n->skip = std::string(sk);
-        n->alloc_full_arrays();
         return n;
     }
     
-    // Deep copy
+    // === Deallocation ===
+    
+    void dealloc_node(ptr_t n) {
+        if (!n) return;
+        
+        // Recursively free children for interior nodes
+        if (!n->is_leaf()) {
+            if (n->is_list()) {
+                auto* ln = n->as_list();
+                for (int i = 0; i < ln->chars.count(); ++i) {
+                    dealloc_node(ln->children[i].load());
+                }
+                delete ln->eos_ptr;
+                delete ln;
+            } else if (n->is_full()) {
+                auto* fn = n->as_full();
+                for (int c = 0; c < 256; ++c) {
+                    if (fn->valid.test(static_cast<unsigned char>(c))) {
+                        dealloc_node(fn->children[c].load());
+                    }
+                }
+                delete fn->eos_ptr;
+                delete fn;
+            } else if (n->is_skip()) {
+                auto* sn = n->as_skip();
+                delete sn->eos_ptr;
+                delete sn;
+            } else {
+                auto* en = n->as_eos();
+                delete en->eos_ptr;
+                delete en;
+            }
+        } else {
+            // Leaf nodes - just delete the right type
+            switch (n->type()) {
+                case TYPE_EOS: delete n->as_eos(); break;
+                case TYPE_SKIP: delete n->as_skip(); break;
+                case TYPE_LIST: delete n->as_list(); break;
+                case TYPE_FULL: delete n->as_full(); break;
+            }
+        }
+    }
+    
+    // === Deep copy ===
+    
     ptr_t deep_copy(ptr_t src) {
         if (!src) return nullptr;
-        ptr_t dst = alloc_node();
-        dst->set_header(src->header());
-        dst->skip = src->skip;
-        dst->chars = src->chars;
-        dst->valid = src->valid;
-        
-        // Allocate heap arrays for FULL nodes
-        if (src->is_full()) {
-            dst->alloc_full_arrays();
-        }
         
         if (src->is_leaf()) {
-            if (src->is_eos() || src->is_skip()) {
-                dst->value_at(0) = src->value_at(0);
-            } else if (src->is_list()) {
-                for (int i = 0; i < src->chars.count(); ++i) {
-                    dst->value_at(i) = src->value_at(i);
+            switch (src->type()) {
+                case TYPE_EOS: {
+                    auto* s = src->as_eos();
+                    return make_leaf_eos(s->leaf_value);
                 }
-            } else {
-                for (int c = 0; c < 256; ++c) {
-                    if (src->valid.test(static_cast<unsigned char>(c))) {
-                        dst->value_at(c) = src->value_at(c);
+                case TYPE_SKIP: {
+                    auto* s = src->as_skip();
+                    return make_leaf_skip(s->skip, s->leaf_value);
+                }
+                case TYPE_LIST: {
+                    auto* s = src->as_list();
+                    auto* d = new list_t();
+                    d->set_header(s->header());
+                    d->skip = s->skip;
+                    d->chars = s->chars;
+                    for (int i = 0; i < s->chars.count(); ++i) {
+                        d->leaf_values[i] = s->leaf_values[i];
                     }
+                    return d;
+                }
+                case TYPE_FULL: {
+                    auto* s = src->as_full();
+                    auto* d = new full_t();
+                    d->set_header(s->header());
+                    d->skip = s->skip;
+                    d->valid = s->valid;
+                    for (int c = 0; c < 256; ++c) {
+                        if (s->valid.test(static_cast<unsigned char>(c))) {
+                            d->leaf_values[c] = s->leaf_values[c];
+                        }
+                    }
+                    return d;
                 }
             }
         } else {
-            if (src->eos_ptr) {
-                T* p;
-                if constexpr (THREADED) p = src->eos_ptr.load(std::memory_order_acquire);
-                else p = src->eos_ptr;
-                if (p) {
-                    T* np = new T(*p);
-                    if constexpr (THREADED) dst->eos_ptr.store(np, std::memory_order_release);
-                    else dst->eos_ptr = np;
+            switch (src->type()) {
+                case TYPE_EOS: {
+                    auto* s = src->as_eos();
+                    auto* d = new eos_t();
+                    d->set_header(s->header());
+                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
+                    return d;
                 }
-            }
-            if (src->is_list()) {
-                for (int i = 0; i < src->chars.count(); ++i) {
-                    dst->child_at(i).store(deep_copy(src->child_at(i).load()));
+                case TYPE_SKIP: {
+                    auto* s = src->as_skip();
+                    auto* d = new skip_t();
+                    d->set_header(s->header());
+                    d->skip = s->skip;
+                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
+                    return d;
                 }
-            } else if (src->is_full()) {
-                for (int c = 0; c < 256; ++c) {
-                    if (src->valid.test(static_cast<unsigned char>(c))) {
-                        dst->child_at(c).store(deep_copy(src->child_at(c).load()));
+                case TYPE_LIST: {
+                    auto* s = src->as_list();
+                    auto* d = new list_t();
+                    d->set_header(s->header());
+                    d->skip = s->skip;
+                    d->chars = s->chars;
+                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
+                    for (int i = 0; i < s->chars.count(); ++i) {
+                        d->children[i].store(deep_copy(s->children[i].load()));
                     }
+                    return d;
+                }
+                case TYPE_FULL: {
+                    auto* s = src->as_full();
+                    auto* d = new full_t();
+                    d->set_header(s->header());
+                    d->skip = s->skip;
+                    d->valid = s->valid;
+                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
+                    for (int c = 0; c < 256; ++c) {
+                        if (s->valid.test(static_cast<unsigned char>(c))) {
+                            d->children[c].store(deep_copy(s->children[c].load()));
+                        }
+                    }
+                    return d;
                 }
             }
         }
-        return dst;
+        return nullptr;
     }
 };
 
