@@ -917,9 +917,30 @@ private:
     
     erase_result try_collapse_interior(ptr_t n) {
         erase_result res;
-        // If interior has no eos and single child, could collapse
-        // For simplicity, just return unchanged for now
-        return res;
+        
+        T* eos;
+        if constexpr (THREADED) eos = n->eos_ptr.load(std::memory_order_acquire);
+        else eos = n->eos_ptr;
+        if (eos) return res;  // Has EOS value, can't collapse
+        
+        // Check for single child (LIST[1] or FULL[1])
+        bool can_collapse = false;
+        unsigned char c = 0;
+        ptr_t child = nullptr;
+        
+        if (n->is_list() && n->chars.count() == 1) {
+            c = n->chars.char_at(0);
+            child = n->children[0].load();
+            can_collapse = (child != nullptr);
+        } else if (n->is_full() && n->valid.count() == 1) {
+            c = n->valid.first();
+            child = n->children[c].load();
+            can_collapse = (child != nullptr);
+        }
+        
+        if (!can_collapse) return res;
+        
+        return collapse_single_child(n, c, child, res);
     }
     
     erase_result try_collapse_after_child_removal(ptr_t n, unsigned char removed_c, std::vector<ptr_t>& child_old) {
@@ -933,7 +954,6 @@ private:
         
         int remaining = n->child_count();
         if (n->is_list()) {
-            // Need to rebuild without removed_c
             int idx = n->chars.find(removed_c);
             if (idx >= 0) remaining--;
         } else if (n->is_full()) {
@@ -946,11 +966,10 @@ private:
             return res;
         }
         
-        // Rebuild without removed_c
+        // First, do the in-place removal
         if (n->is_list()) {
             int idx = n->chars.find(removed_c);
             if (idx >= 0) {
-                // In-place remove: shift children down, then remove char
                 int count = n->chars.count();
                 for (int i = idx; i < count - 1; ++i) {
                     n->children[i].store(n->children[i + 1].load());
@@ -958,13 +977,94 @@ private:
                 n->children[count - 1].store(nullptr);
                 n->chars.remove_at(idx);
             }
-            // Stay as LIST
         } else if (n->is_full()) {
             n->valid.template atomic_clear<THREADED>(removed_c);
             n->children[removed_c].store(nullptr);
-            // Stay as FULL
         }
         
+        // Now check if LIST[1] or FULL[1] can collapse to SKIP
+        bool can_collapse = false;
+        unsigned char c = 0;
+        ptr_t child = nullptr;
+        
+        if (n->is_list() && n->chars.count() == 1 && !eos) {
+            c = n->chars.char_at(0);
+            child = n->children[0].load();
+            can_collapse = (child != nullptr);
+        } else if (n->is_full() && !eos) {
+            int cnt = n->valid.count();
+            if (cnt == 1) {
+                c = n->valid.first();
+                child = n->children[c].load();
+                can_collapse = (child != nullptr);
+            }
+        }
+        
+        if (can_collapse) {
+            return collapse_single_child(n, c, child, res);
+        }
+        
+        return res;
+    }
+    
+    // Helper to collapse a node with single child into merged SKIP node
+    erase_result collapse_single_child(ptr_t n, unsigned char c, ptr_t child, erase_result& res) {
+        // Build new skip = parent_skip + c + child_skip
+        std::string new_skip = n->skip;
+        new_skip.push_back(static_cast<char>(c));
+        new_skip.append(child->skip);
+        
+        // Clone child with extended skip
+        ptr_t merged;
+        if (child->is_leaf()) {
+            if (child->is_eos()) {
+                merged = builder_.make_leaf_skip(new_skip, child->values[0]);
+            } else if (child->is_skip()) {
+                merged = builder_.make_leaf_skip(new_skip, child->values[0]);
+            } else if (child->is_list()) {
+                merged = builder_.make_leaf_list(new_skip);
+                merged->chars = child->chars;
+                for (int i = 0; i < child->chars.count(); ++i) {
+                    merged->values[i] = child->values[i];
+                }
+            } else { // FULL
+                merged = builder_.make_leaf_full(new_skip);
+                merged->valid = child->valid;
+                for (int i = 0; i < 256; ++i) {
+                    if (child->valid.test(static_cast<unsigned char>(i))) {
+                        merged->values[i] = child->values[i];
+                    }
+                }
+            }
+        } else {
+            // Interior child
+            if (child->is_eos() || child->is_skip()) {
+                merged = builder_.make_interior_skip(new_skip);
+                merged->take_eos_from(*child);
+            } else if (child->is_list()) {
+                merged = builder_.make_interior_list(new_skip);
+                merged->take_eos_from(*child);
+                merged->chars = child->chars;
+                for (int i = 0; i < child->chars.count(); ++i) {
+                    merged->children[i].store(child->children[i].load());
+                    child->children[i].store(nullptr);
+                }
+            } else { // FULL
+                merged = builder_.make_interior_full(new_skip);
+                merged->take_eos_from(*child);
+                merged->valid = child->valid;
+                for (int i = 0; i < 256; ++i) {
+                    if (child->valid.test(static_cast<unsigned char>(i))) {
+                        merged->children[i].store(child->children[i].load());
+                        child->children[i].store(nullptr);
+                    }
+                }
+            }
+        }
+        
+        res.new_node = merged;
+        res.old_nodes.push_back(n);
+        res.old_nodes.push_back(child);
         return res;
     }
     
