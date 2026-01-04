@@ -43,6 +43,7 @@ struct speculative_info {
     unsigned char c = 0;
     bool is_eos = false;
     size_t match_pos = 0;
+    bool target_is_list = false;  // For clone pre-allocation
     
     std::string target_skip;
     std::string remaining_key;
@@ -55,11 +56,21 @@ struct pre_alloc {
     int count = 0;
     ptr_t root_replacement = nullptr;
     
+    // For in-place interior path
+    ptr_t in_place_child = nullptr;
+    T* in_place_eos = nullptr;
+    
+    // For clone cases (SPLIT_LEAF_LIST, PREFIX_LEAF_LIST)
+    ptr_t clone_shell = nullptr;
+    
     void add(ptr_t n) { if (n && count < MAX_NODES) nodes[count++] = n; }
     void clear() {
         for (int i = 0; i < count; ++i) nodes[i] = nullptr;
         count = 0;
         root_replacement = nullptr;
+        in_place_child = nullptr;
+        in_place_eos = nullptr;
+        clone_shell = nullptr;
     }
 };
 
@@ -121,6 +132,7 @@ speculative_info probe_speculative(ptr_t n, std::string_view key) const noexcept
             info.target = n;
             info.target_header = n->header();
             info.target_skip = std::string(skip);
+            info.target_is_list = n->is_list();
             
             if (m < skip.size() && m < key.size()) {
                 info.op = spec_op::SPLIT_LEAF_LIST;
@@ -320,12 +332,22 @@ pre_alloc allocate_speculative(const speculative_info& info, const T& value) {
         ptr_t interior = builder_.make_interior_list(common);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         
+        // Pre-allocate clone shell for old leaf
+        std::string_view clone_skip = skip.substr(m + 1);
+        if (info.target_is_list) {
+            alloc.clone_shell = builder_.make_leaf_list(clone_skip);
+        } else {
+            alloc.clone_shell = builder_.make_leaf_full(clone_skip);
+        }
+        
         interior->as_list()->chars.add(old_c);
         interior->as_list()->chars.add(new_c);
+        interior->as_list()->children[0].store(alloc.clone_shell);
         interior->as_list()->children[1].store(new_child);
         
         alloc.root_replacement = interior;
         alloc.add(interior);
+        alloc.add(alloc.clone_shell);
         alloc.add(new_child);
         break;
     }
@@ -334,10 +356,21 @@ pre_alloc allocate_speculative(const speculative_info& info, const T& value) {
         interior->as_list()->eos_ptr = new T(value);
         
         unsigned char c = static_cast<unsigned char>(skip[m]);
+        
+        // Pre-allocate clone shell for old leaf
+        std::string_view clone_skip = skip.substr(m + 1);
+        if (info.target_is_list) {
+            alloc.clone_shell = builder_.make_leaf_list(clone_skip);
+        } else {
+            alloc.clone_shell = builder_.make_leaf_full(clone_skip);
+        }
+        
         interior->as_list()->chars.add(c);
+        interior->as_list()->children[0].store(alloc.clone_shell);
         
         alloc.root_replacement = interior;
         alloc.add(interior);
+        alloc.add(alloc.clone_shell);
         break;
     }
     case spec_op::LIST_TO_FULL_LEAF: {
@@ -354,6 +387,17 @@ pre_alloc allocate_speculative(const speculative_info& info, const T& value) {
     case spec_op::ADD_CHILD_CONVERT:
     case spec_op::SPLIT_INTERIOR:
     case spec_op::PREFIX_INTERIOR:
+        break;
+    case spec_op::IN_PLACE_LEAF:
+        // No pre-allocation needed - just updating existing leaf values
+        break;
+    case spec_op::IN_PLACE_INTERIOR:
+        // Pre-allocate eos or child outside lock
+        if (info.is_eos) {
+            alloc.in_place_eos = new T(value);
+        } else {
+            alloc.in_place_child = create_leaf_for_key(info.remaining_key, value);
+        }
         break;
     default:
         break;
@@ -440,12 +484,21 @@ bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& /*val
     }
     case spec_op::SPLIT_LEAF_LIST: {
         ptr_t interior = alloc.root_replacement;
-        std::string_view skip = info.target_skip;
-        size_t m = info.match_pos;
         
-        ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(m + 1));
-        interior->as_list()->children[0].store(old_child);
-        alloc.add(old_child);
+        // Fill pre-allocated clone shell with content from target
+        ptr_t clone = alloc.clone_shell;
+        if (info.target_is_list) {
+            clone->as_list()->chars = info.target->as_list()->chars;
+            int cnt = info.target->as_list()->chars.count();
+            for (int i = 0; i < cnt; ++i) {
+                clone->as_list()->leaf_values[i] = info.target->as_list()->leaf_values[i];
+            }
+        } else {
+            clone->as_full()->valid = info.target->as_full()->valid;
+            info.target->as_full()->valid.for_each_set([&](unsigned char c) {
+                clone->as_full()->leaf_values[c] = info.target->as_full()->leaf_values[c];
+            });
+        }
         
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
         slot->store(interior);
@@ -456,12 +509,21 @@ bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& /*val
     }
     case spec_op::PREFIX_LEAF_LIST: {
         ptr_t interior = alloc.root_replacement;
-        std::string_view skip = info.target_skip;
-        size_t m = info.match_pos;
         
-        ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(m + 1));
-        interior->as_list()->children[0].store(old_child);
-        alloc.add(old_child);
+        // Fill pre-allocated clone shell with content from target
+        ptr_t clone = alloc.clone_shell;
+        if (info.target_is_list) {
+            clone->as_list()->chars = info.target->as_list()->chars;
+            int cnt = info.target->as_list()->chars.count();
+            for (int i = 0; i < cnt; ++i) {
+                clone->as_list()->leaf_values[i] = info.target->as_list()->leaf_values[i];
+            }
+        } else {
+            clone->as_full()->valid = info.target->as_full()->valid;
+            info.target->as_full()->valid.for_each_set([&](unsigned char c) {
+                clone->as_full()->leaf_values[c] = info.target->as_full()->leaf_values[c];
+            });
+        }
         
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
         slot->store(interior);
@@ -500,6 +562,7 @@ bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& /*val
 }
 
 void dealloc_speculation(pre_alloc& alloc) {
+    // Clean up nodes array
     for (int i = 0; i < alloc.count; ++i) {
         ptr_t n = alloc.nodes[i];
         if (!n) continue;
@@ -516,182 +579,16 @@ void dealloc_speculation(pre_alloc& alloc) {
             case TYPE_FULL: delete n->as_full(); break;
         }
     }
+    
+    // Clean up in-place pre-allocations (not in nodes array)
+    if (alloc.in_place_eos) {
+        delete alloc.in_place_eos;
+    }
+    if (alloc.in_place_child) {
+        builder_.dealloc_node(alloc.in_place_child);
+    }
+    
     alloc.clear();
-}
-
-// Legacy probe_info for compatibility with in-place path
-enum class probe_result { NOT_FOUND, EXISTS, IN_PLACE_LEAF, IN_PLACE_INTERIOR, NEEDS_COW };
-
-struct probe_info {
-    probe_result result = probe_result::NOT_FOUND;
-    ptr_t target = nullptr;
-    unsigned char c = 0;
-    bool is_eos = false;
-};
-
-probe_info probe_insert(ptr_t n, std::string_view key) const noexcept {
-    probe_info info;
-    
-    while (n) {
-        if (n->is_leaf()) {
-            std::string_view skip = get_skip(n);
-            size_t m = match_skip_impl(skip, key);
-            if (m < skip.size()) {
-                info.result = probe_result::NEEDS_COW;
-                return info;
-            }
-            key.remove_prefix(m);
-            
-            if (n->is_eos() || n->is_skip()) {
-                info.result = key.empty() ? probe_result::EXISTS : probe_result::NEEDS_COW;
-                return info;
-            }
-            
-            if (key.empty()) {
-                info.result = probe_result::NEEDS_COW;
-                return info;
-            }
-            if (key.size() != 1) {
-                info.result = probe_result::NEEDS_COW;
-                return info;
-            }
-            
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            if (n->is_list()) {
-                if (n->as_list()->chars.find(c) >= 0) {
-                    info.result = probe_result::EXISTS;
-                    return info;
-                }
-                if (n->as_list()->chars.count() < LIST_MAX) {
-                    info.result = probe_result::IN_PLACE_LEAF;
-                    info.target = n;
-                    info.c = c;
-                    return info;
-                }
-                info.result = probe_result::NEEDS_COW;
-                return info;
-            }
-            if (n->as_full()->valid.test(c)) {
-                info.result = probe_result::EXISTS;
-                return info;
-            }
-            info.result = probe_result::IN_PLACE_LEAF;
-            info.target = n;
-            info.c = c;
-            return info;
-        }
-        
-        std::string_view skip = get_skip(n);
-        size_t m = match_skip_impl(skip, key);
-        if (m < skip.size()) {
-            info.result = probe_result::NEEDS_COW;
-            return info;
-        }
-        key.remove_prefix(m);
-        
-        if (key.empty()) {
-            T* p = get_eos_ptr(n);
-            if (p) {
-                info.result = probe_result::EXISTS;
-                return info;
-            }
-            info.result = probe_result::IN_PLACE_INTERIOR;
-            info.target = n;
-            info.is_eos = true;
-            return info;
-        }
-        
-        unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = find_child(n, c);
-        
-        if (!child) {
-            if (n->is_list() && n->as_list()->chars.count() < LIST_MAX) {
-                info.result = probe_result::IN_PLACE_INTERIOR;
-                info.target = n;
-                info.c = c;
-                return info;
-            }
-            if (n->is_full()) {
-                info.result = probe_result::IN_PLACE_INTERIOR;
-                info.target = n;
-                info.c = c;
-                return info;
-            }
-            info.result = probe_result::NEEDS_COW;
-            return info;
-        }
-        
-        key.remove_prefix(1);
-        n = child;
-    }
-    
-    info.result = probe_result::NEEDS_COW;
-    return info;
-}
-
-bool try_in_place_insert(const probe_info& info, std::string_view key, const T& value) {
-    if (info.result == probe_result::IN_PLACE_LEAF) {
-        ptr_t n = info.target;
-        unsigned char c = info.c;
-        
-        if (n->is_list()) {
-            if (n->as_list()->chars.find(c) >= 0) return false;
-            if (n->as_list()->chars.count() >= LIST_MAX) return false;
-            
-            int idx = n->as_list()->chars.add(c);
-            n->as_list()->leaf_values[idx] = value;
-            n->bump_version();
-            return true;
-        }
-        if (n->as_full()->valid.test(c)) return false;
-        n->as_full()->valid.template atomic_set<THREADED>(c);
-        n->as_full()->leaf_values[c] = value;
-        n->bump_version();
-        return true;
-    }
-    
-    if (info.result == probe_result::IN_PLACE_INTERIOR) {
-        ptr_t n = info.target;
-        
-        if (info.is_eos) {
-            if (get_eos_ptr(n)) return false;
-            set_eos_ptr(n, new T(value));
-            n->bump_version();
-            return true;
-        }
-        
-        unsigned char c = info.c;
-        std::string_view remaining = key;
-        std::string_view skip = get_skip(n);
-        remaining.remove_prefix(skip.size() + 1);
-        
-        ptr_t child = create_leaf_for_key(remaining, value);
-        
-        if (n->is_list()) {
-            if (n->as_list()->chars.find(c) >= 0) {
-                builder_.dealloc_node(child);
-                return false;
-            }
-            if (n->as_list()->chars.count() >= LIST_MAX) {
-                builder_.dealloc_node(child);
-                return false;
-            }
-            int idx = n->as_list()->chars.add(c);
-            n->as_list()->children[idx].store(child);
-            n->bump_version();
-            return true;
-        }
-        if (find_child(n, c)) {
-            builder_.dealloc_node(child);
-            return false;
-        }
-        n->as_full()->valid.template atomic_set<THREADED>(c);
-        n->as_full()->children[c].store(child);
-        n->bump_version();
-        return true;
-    }
-    
-    return false;
 }
 
 std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value) {
@@ -724,29 +621,103 @@ std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, con
                 return {find(key), false};
             }
             
-            if (spec.op == spec_op::IN_PLACE_LEAF || spec.op == spec_op::IN_PLACE_INTERIOR) {
-                probe_info info;
-                info.target = spec.target;
-                info.c = spec.c;
-                info.is_eos = spec.is_eos;
-                info.result = (spec.op == spec_op::IN_PLACE_LEAF) 
-                    ? probe_result::IN_PLACE_LEAF 
-                    : probe_result::IN_PLACE_INTERIOR;
-                
+            // All paths now go through allocate_speculative for pre-allocation
+            pre_alloc alloc = allocate_speculative(spec, value);
+            
+            if (spec.op == spec_op::IN_PLACE_LEAF) {
+                // IN_PLACE_LEAF: no allocation needed, just update value in existing leaf
                 std::lock_guard<mutex_t> lock(mutex_);
                 
-                if (spec.target && spec.target->header() != spec.target_header) {
+                if (spec.target->header() != spec.target_header) {
+                    dealloc_speculation(alloc);
                     continue;
                 }
                 
-                if (try_in_place_insert(info, kb, value)) {
+                ptr_t n = spec.target;
+                unsigned char c = spec.c;
+                
+                if (n->is_list()) {
+                    if (n->as_list()->chars.find(c) >= 0) {
+                        dealloc_speculation(alloc);
+                        continue;
+                    }
+                    if (n->as_list()->chars.count() >= LIST_MAX) {
+                        dealloc_speculation(alloc);
+                        continue;
+                    }
+                    int idx = n->as_list()->chars.add(c);
+                    n->as_list()->leaf_values[idx] = value;
+                    n->bump_version();
                     size_.fetch_add(1);
                     return {iterator(this, std::string(kb), value), true};
                 }
-                continue;
+                // FULL leaf
+                if (n->as_full()->valid.test(c)) {
+                    dealloc_speculation(alloc);
+                    continue;
+                }
+                n->as_full()->valid.template atomic_set<THREADED>(c);
+                n->as_full()->leaf_values[c] = value;
+                n->bump_version();
+                size_.fetch_add(1);
+                return {iterator(this, std::string(kb), value), true};
             }
             
-            pre_alloc alloc = allocate_speculative(spec, value);
+            if (spec.op == spec_op::IN_PLACE_INTERIOR) {
+                // IN_PLACE_INTERIOR: use pre-allocated eos or child
+                std::lock_guard<mutex_t> lock(mutex_);
+                
+                if (spec.target->header() != spec.target_header) {
+                    dealloc_speculation(alloc);
+                    continue;
+                }
+                
+                ptr_t n = spec.target;
+                
+                if (spec.is_eos) {
+                    if (get_eos_ptr(n)) {
+                        dealloc_speculation(alloc);
+                        continue;
+                    }
+                    // Use pre-allocated eos
+                    set_eos_ptr(n, alloc.in_place_eos);
+                    alloc.in_place_eos = nullptr;  // Transferred ownership
+                    n->bump_version();
+                    size_.fetch_add(1);
+                    return {iterator(this, std::string(kb), value), true};
+                }
+                
+                // Adding child
+                unsigned char c = spec.c;
+                
+                if (n->is_list()) {
+                    if (n->as_list()->chars.find(c) >= 0) {
+                        dealloc_speculation(alloc);
+                        continue;
+                    }
+                    if (n->as_list()->chars.count() >= LIST_MAX) {
+                        dealloc_speculation(alloc);
+                        continue;
+                    }
+                    int idx = n->as_list()->chars.add(c);
+                    n->as_list()->children[idx].store(alloc.in_place_child);
+                    alloc.in_place_child = nullptr;  // Transferred ownership
+                    n->bump_version();
+                    size_.fetch_add(1);
+                    return {iterator(this, std::string(kb), value), true};
+                }
+                // FULL interior
+                if (find_child(n, c)) {
+                    dealloc_speculation(alloc);
+                    continue;
+                }
+                n->as_full()->valid.template atomic_set<THREADED>(c);
+                n->as_full()->children[c].store(alloc.in_place_child);
+                alloc.in_place_child = nullptr;  // Transferred ownership
+                n->bump_version();
+                size_.fetch_add(1);
+                return {iterator(this, std::string(kb), value), true};
+            }
             
             {
                 std::lock_guard<mutex_t> lock(mutex_);
