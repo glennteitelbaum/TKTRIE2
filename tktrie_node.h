@@ -113,6 +113,7 @@ struct node_base {
 };
 
 // EOS node - minimal, just a value (leaf) or eos_ptr (interior)
+// Layout: header → value/eos_ptr
 template <typename T, bool THREADED, typename Allocator>
 struct eos_node : node_base<T, THREADED, Allocator> {
     union {
@@ -124,19 +125,20 @@ struct eos_node : node_base<T, THREADED, Allocator> {
 };
 
 // SKIP node - skip string + value
+// Layout: header → value/eos_ptr → skip
 template <typename T, bool THREADED, typename Allocator>
 struct skip_node : node_base<T, THREADED, Allocator> {
-    std::string skip;
     union {
         T leaf_value;
         T* eos_ptr;
     };
+    std::string skip;
     
     skip_node() : eos_ptr(nullptr) {}
 };
 
-// LIST node - skip + up to 7 children
-// Layout: header, skip, chars, eos_ptr, children[0] all in first cache line
+// LIST node - up to 7 children
+// Layout: header → eos_ptr → skip → chars → children
 template <typename T, bool THREADED, typename Allocator>
 struct list_node : node_base<T, THREADED, Allocator> {
     using base_t = node_base<T, THREADED, Allocator>;
@@ -144,9 +146,9 @@ struct list_node : node_base<T, THREADED, Allocator> {
     
     static constexpr int MAX_CHILDREN = 7;  // Matches LIST_MAX
     
+    T* eos_ptr;
     std::string skip;
     small_list chars;
-    T* eos_ptr;  // Before children for cache locality
     union {
         std::array<T, MAX_CHILDREN> leaf_values;
         std::array<atomic_ptr, MAX_CHILDREN> children;
@@ -159,19 +161,20 @@ struct list_node : node_base<T, THREADED, Allocator> {
     }
 };
 
-// FULL node - skip + 256 children
+// FULL node - 256 children
+// Layout: header → eos_ptr → skip → valid → children
 template <typename T, bool THREADED, typename Allocator>
 struct full_node : node_base<T, THREADED, Allocator> {
     using base_t = node_base<T, THREADED, Allocator>;
     using atomic_ptr = typename base_t::atomic_ptr;
     
+    T* eos_ptr;
     std::string skip;
     bitmap256 valid;
     union {
         std::array<T, 256> leaf_values;
         std::array<atomic_ptr, 256> children;
     };
-    T* eos_ptr;  // interior only
     
     full_node() : eos_ptr(nullptr) {
         for (int i = 0; i < 256; ++i) {
