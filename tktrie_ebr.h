@@ -2,153 +2,107 @@
 
 #include <atomic>
 #include <functional>
-#include <memory>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 namespace gteitelbaum {
 
-// Per-thread EBR slot
+// Epoch-based reclamation for THREADED mode
 class ebr_slot {
-    std::atomic<uint64_t> epoch_{0};
+    std::atomic<uint64_t> local_epoch_{0};
     std::atomic<bool> active_{false};
-    
+
 public:
     class guard {
-        ebr_slot* slot_;
+        ebr_slot& slot_;
     public:
-        explicit guard(ebr_slot* s) : slot_(s) { slot_->enter(); }
-        ~guard() { slot_->exit(); }
+        explicit guard(ebr_slot& slot) : slot_(slot) { slot_.enter(); }
+        ~guard() { slot_.leave(); }
         guard(const guard&) = delete;
         guard& operator=(const guard&) = delete;
     };
-    
+
     void enter() noexcept {
-        active_.store(true, std::memory_order_release);
+        active_.store(true, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
-    
-    void exit() noexcept {
+
+    void leave() noexcept {
         active_.store(false, std::memory_order_release);
     }
-    
+
     bool is_active() const noexcept {
         return active_.load(std::memory_order_acquire);
     }
-    
+
     uint64_t epoch() const noexcept {
-        return epoch_.load(std::memory_order_acquire);
+        return local_epoch_.load(std::memory_order_acquire);
     }
-    
+
     void set_epoch(uint64_t e) noexcept {
-        epoch_.store(e, std::memory_order_release);
+        local_epoch_.store(e, std::memory_order_release);
     }
-    
-    guard get_guard() { return guard(this); }
+
+    guard get_guard() { return guard(*this); }
 };
 
-// Global EBR manager
 class ebr_global {
-public:
-    using deleter_fn = void(*)(void*);
-    
-private:
-    struct retired_node {
-        void* ptr;
-        deleter_fn deleter;
-        uint64_t retire_epoch;
-    };
-    
     std::atomic<uint64_t> global_epoch_{0};
-    std::mutex slots_mutex_;
-    std::vector<ebr_slot*> slots_;
-    std::mutex retired_mutex_;
-    std::vector<retired_node> retired_;
-    
-    ebr_global() = default;
-    
+    std::mutex retire_mutex_;
+
+    struct retired_item {
+        void* ptr;
+        uint64_t epoch;
+        void (*deleter)(void*);
+    };
+
+    std::vector<retired_item> retired_;
+
+    ebr_global() { retired_.reserve(1024); }
+
 public:
     static ebr_global& instance() {
-        static ebr_global g;
-        return g;
+        static ebr_global inst;
+        return inst;
     }
-    
-    ebr_slot* register_thread() {
-        auto* slot = new ebr_slot();
-        slot->set_epoch(global_epoch_.load(std::memory_order_relaxed));
-        std::lock_guard<std::mutex> lock(slots_mutex_);
-        slots_.push_back(slot);
-        return slot;
-    }
-    
-    void unregister_thread(ebr_slot* slot) {
-        if (!slot) return;
-        {
-            std::lock_guard<std::mutex> lock(slots_mutex_);
-            slots_.erase(std::remove(slots_.begin(), slots_.end(), slot), slots_.end());
-        }
-        delete slot;
-    }
-    
+
     uint64_t current_epoch() const noexcept {
         return global_epoch_.load(std::memory_order_acquire);
     }
-    
+
     void advance_epoch() noexcept {
         global_epoch_.fetch_add(1, std::memory_order_acq_rel);
     }
-    
-    void retire(void* ptr, deleter_fn deleter) {
-        if (!ptr) return;
-        uint64_t epoch = global_epoch_.load(std::memory_order_acquire);
-        std::lock_guard<std::mutex> lock(retired_mutex_);
-        retired_.push_back({ptr, deleter, epoch});
+
+    void retire(void* ptr, void (*deleter)(void*)) {
+        std::lock_guard<std::mutex> lock(retire_mutex_);
+        retired_.push_back({ptr, current_epoch(), deleter});
     }
-    
+
     void try_reclaim() {
-        uint64_t safe_epoch = compute_safe_epoch();
-        
-        std::vector<retired_node> to_delete;
-        {
-            std::lock_guard<std::mutex> lock(retired_mutex_);
-            auto it = std::remove_if(retired_.begin(), retired_.end(),
-                [safe_epoch, &to_delete](const retired_node& n) {
-                    if (n.retire_epoch < safe_epoch) {
-                        to_delete.push_back(n);
-                        return true;
-                    }
-                    return false;
-                });
-            retired_.erase(it, retired_.end());
-        }
-        
-        for (auto& n : to_delete) {
-            n.deleter(n.ptr);
-        }
-    }
-    
-private:
-    uint64_t compute_safe_epoch() {
-        uint64_t global = global_epoch_.load(std::memory_order_acquire);
-        uint64_t safe = global;
-        
-        std::lock_guard<std::mutex> lock(slots_mutex_);
-        for (auto* slot : slots_) {
-            if (slot->is_active()) {
-                uint64_t e = slot->epoch();
-                if (e < safe) safe = e;
+        std::lock_guard<std::mutex> lock(retire_mutex_);
+        if (retired_.empty()) return;
+
+        uint64_t safe_epoch = current_epoch();
+        if (safe_epoch >= 2) safe_epoch -= 2;
+        else safe_epoch = 0;
+
+        auto it = retired_.begin();
+        while (it != retired_.end()) {
+            if (it->epoch <= safe_epoch) {
+                it->deleter(it->ptr);
+                it = retired_.erase(it);
+            } else {
+                ++it;
             }
         }
-        return safe;
     }
 };
 
-// Thread-local EBR slot accessor
+inline thread_local ebr_slot tl_ebr_slot;
+
 inline ebr_slot& get_ebr_slot() {
-    thread_local ebr_slot* slot = ebr_global::instance().register_thread();
-    slot->set_epoch(ebr_global::instance().current_epoch());
-    return *slot;
+    return tl_ebr_slot;
 }
 
 }  // namespace gteitelbaum

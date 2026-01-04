@@ -68,28 +68,21 @@ struct tktrie_traits<T> {
     }
 };
 
-// Convenience trait aliases
-using string_traits = tktrie_traits<std::string>;
-using int32_traits = tktrie_traits<int32_t>;
-using uint32_traits = tktrie_traits<uint32_t>;
-using int64_traits = tktrie_traits<int64_t>;
-using uint64_traits = tktrie_traits<uint64_t>;
-
 // =============================================================================
 // Iterator
 // =============================================================================
 
-template <typename Key, typename T, bool THREADED, typename Allocator>
+template <typename Key, typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 class tktrie_iterator {
 public:
-    using trie_type = tktrie<Key, T, THREADED, Allocator>;
+    using trie_type = tktrie<Key, T, THREADED, Allocator, FIXED_LEN>;
     using traits = tktrie_traits<Key>;
     using value_type = std::pair<Key, T>;
     using difference_type = std::ptrdiff_t;
     using iterator_category = std::forward_iterator_tag;
 
 private:
-    friend class tktrie<Key, T, THREADED, Allocator>;
+    friend class tktrie<Key, T, THREADED, Allocator, FIXED_LEN>;
     const trie_type* parent_;
     std::string key_bytes_;
     T value_;
@@ -172,34 +165,37 @@ public:
 // Convenience type aliases
 // =============================================================================
 
+// Variable-length string keys
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using string_trie = tktrie<std::string, T, false, Allocator>;
+using string_trie = tktrie<std::string, T, false, Allocator, 0>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using concurrent_string_trie = tktrie<std::string, T, true, Allocator>;
+using concurrent_string_trie = tktrie<std::string, T, true, Allocator, 0>;
+
+// Fixed-length 32-bit integer keys
+template <typename T, typename Allocator = std::allocator<uint64_t>>
+using int32_trie = tktrie<int32_t, T, false, Allocator, 4>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using int32_trie = tktrie<int32_t, T, false, Allocator>;
+using concurrent_int32_trie = tktrie<int32_t, T, true, Allocator, 4>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using concurrent_int32_trie = tktrie<int32_t, T, true, Allocator>;
+using uint32_trie = tktrie<uint32_t, T, false, Allocator, 4>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using int64_trie = tktrie<int64_t, T, false, Allocator>;
+using concurrent_uint32_trie = tktrie<uint32_t, T, true, Allocator, 4>;
+
+// Fixed-length 64-bit integer keys
+template <typename T, typename Allocator = std::allocator<uint64_t>>
+using int64_trie = tktrie<int64_t, T, false, Allocator, 8>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator>;
+using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator, 8>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using uint32_trie = tktrie<uint32_t, T, false, Allocator>;
+using uint64_trie = tktrie<uint64_t, T, false, Allocator, 8>;
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
-using concurrent_uint32_trie = tktrie<uint32_t, T, true, Allocator>;
-
-template <typename T, typename Allocator = std::allocator<uint64_t>>
-using uint64_trie = tktrie<uint64_t, T, false, Allocator>;
-
-template <typename T, typename Allocator = std::allocator<uint64_t>>
-using concurrent_uint64_trie = tktrie<uint64_t, T, true, Allocator>;
+using concurrent_uint64_trie = tktrie<uint64_t, T, true, Allocator, 8>;
 
 }  // namespace gteitelbaum

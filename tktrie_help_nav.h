@@ -8,11 +8,16 @@
 
 namespace gteitelbaum {
 
-template <typename T, bool THREADED, typename Allocator>
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct nav_helpers {
-    using ptr_t = node_ptr<T, THREADED, Allocator>;
+    static constexpr bool VAR_LEN = (FIXED_LEN == 0);
 
-    // Match skip prefix with key, returns number of matching characters
+    using interior_ptr = node_ptr<T, THREADED, Allocator, false, VAR_LEN>;
+    using leaf_ptr = node_ptr<T, THREADED, Allocator, !VAR_LEN, false>;
+    using var_acc = var_len_accessors<T, THREADED, Allocator>;
+    using int_acc = interior_accessors<T, THREADED, Allocator>;
+    using leaf_acc = leaf_accessors<T, THREADED, Allocator>;
+
     static size_t match_skip(const std::string& skip, std::string_view key) noexcept {
         size_t i = 0;
         size_t n = std::min(skip.size(), key.size());
@@ -20,214 +25,224 @@ struct nav_helpers {
         return i;
     }
 
-    // Check if key exists in trie
-    static bool contains(ptr_t root, std::string_view key) noexcept {
+    static bool contains(interior_ptr root, std::string_view key) noexcept {
         T val;
         return read(root, key, val);
     }
 
-    // Read value for key, returns true if found
-    static bool read(ptr_t cur, std::string_view key, T& out) noexcept {
+    static bool read(interior_ptr cur, std::string_view key, T& out) noexcept {
+        if constexpr (VAR_LEN) {
+            return read_var_len(cur, key, out);
+        } else {
+            return read_fixed_len(cur, key, out);
+        }
+    }
+
+private:
+    // VAR_LEN: check eos/skip_eos at every node
+    static bool read_var_len(interior_ptr cur, std::string_view key, T& out) noexcept {
         while (cur) {
-            // 1. Check EOS (all nodes have it)
+            // Check EOS
             if (key.empty()) {
-                T* eos = cur.get_eos();
+                T* eos = var_acc::get_eos(cur);
                 if (eos) { out = *eos; return true; }
                 return false;
             }
 
-            // 2. If EOS-only node, no skip or children
-            if (cur.is_eos()) {
-                return false;
-            }
+            if (cur.is_eos()) return false;
 
-            // 3. Check/consume SKIP (SKIP, LIST, FULL all have it)
-            const std::string& skip = cur.get_skip();
+            // Consume skip
+            const std::string& skip = var_acc::get_skip(cur);
             if (!skip.empty()) {
                 size_t match = match_skip(skip, key);
-                if (match < skip.size()) return false;  // Key diverges
+                if (match < skip.size()) return false;
                 key.remove_prefix(match);
 
                 if (key.empty()) {
-                    T* skip_eos = cur.get_skip_eos();
+                    T* skip_eos = var_acc::get_skip_eos(cur);
                     if (skip_eos) { out = *skip_eos; return true; }
                     return false;
                 }
             }
 
-            // 4. If no children (SKIP-only), done
-            if (!cur.is_list() && !cur.is_full()) {
+            // Follow child
+            if (!cur.is_list() && !cur.is_full()) return false;
+
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            key.remove_prefix(1);
+            cur = var_acc::find_child(cur, c);
+        }
+        return false;
+    }
+
+    // FIXED_LEN: no eos checks in interior loop
+    static bool read_fixed_len(interior_ptr cur, std::string_view key, T& out) noexcept {
+        size_t depth = 0;
+
+        while (cur) {
+            // Consume skip (interior has no values)
+            if (!cur.is_eos()) {  // EOS type doesn't exist in FIXED_LEN interior
+                const std::string& skip = int_acc::get_skip(cur);
+                if (!skip.empty()) {
+                    size_t match = match_skip(skip, key);
+                    if (match < skip.size()) return false;
+                    key.remove_prefix(match);
+                    depth += match;
+                }
+            }
+
+            // Check if at leaf level
+            if (depth == FIXED_LEN - 1 && key.size() == 1) {
+                unsigned char c = static_cast<unsigned char>(key[0]);
+                return read_from_leaf_parent(cur, c, out);
+            }
+
+            if (depth >= FIXED_LEN) {
+                // Should have hit leaf already
                 return false;
             }
 
-            // 5. Follow child
+            // Follow child
+            if (!cur.is_list() && !cur.is_full()) return false;
+
             unsigned char c = static_cast<unsigned char>(key[0]);
             key.remove_prefix(1);
+            ++depth;
 
-            if (cur.is_list()) {
-                int idx = cur.list->chars.find(c);
-                if (idx < 0) return false;
-                cur = cur.list->children[idx].load();
-            } else {
-                // FULL
-                if (!cur.full->valid.test(c)) return false;
-                cur = cur.full->children[c].load();
-            }
+            cur = int_acc::find_child(cur, c);
+        }
+        return false;
+    }
+
+    // Read from leaf node via interior parent's child pointer
+    static bool read_from_leaf_parent(interior_ptr parent, unsigned char c, T& out) noexcept {
+        static_assert(!VAR_LEN);
+
+        if (parent.is_list()) {
+            int idx = parent.list->chars.find(c);
+            if (idx < 0) return false;
+
+            // Child is a leaf node
+            leaf_ptr leaf;
+            leaf.raw = parent.list->children[idx].load().raw;
+            if (!leaf) return false;
+
+            return read_leaf_value(leaf, out);
+        }
+
+        if (parent.is_full()) {
+            if (!parent.full->valid.test(c)) return false;
+
+            leaf_ptr leaf;
+            leaf.raw = parent.full->children[c].load().raw;
+            if (!leaf) return false;
+
+            return read_leaf_value(leaf, out);
         }
 
         return false;
     }
 
-    // Find first leaf (for begin iterator)
-    // Returns: node containing the value, key_out is populated with full key
-    // value_is_skip_eos: true if value is at skip_eos, false if at eos
-    static ptr_t find_first_leaf(ptr_t node, std::string& key_out, bool& value_is_skip_eos) noexcept {
-        value_is_skip_eos = false;
+    static bool read_leaf_value(leaf_ptr leaf, T& out) noexcept {
+        static_assert(!VAR_LEN);
+
+        if (leaf.is_eos()) {
+            out = leaf.eos->value;
+            return true;
+        }
+        if (leaf.is_skip()) {
+            out = leaf.skip->value;
+            return true;
+        }
+        // LIST/FULL at leaf shouldn't happen for single-value read
+        return false;
+    }
+
+public:
+    // Find first value (for begin iterator)
+    static interior_ptr find_first_leaf(interior_ptr node, std::string& key_out, T& value_out) noexcept {
+        if constexpr (VAR_LEN) {
+            return find_first_var_len(node, key_out, value_out);
+        } else {
+            return find_first_fixed_len(node, key_out, value_out, 0);
+        }
+    }
+
+private:
+    static interior_ptr find_first_var_len(interior_ptr node, std::string& key_out, T& value_out) noexcept {
         if (!node) return nullptr;
 
         while (true) {
-            // 1. Check EOS first (before consuming skip)
-            if (node.get_eos()) {
-                value_is_skip_eos = false;
+            // Check EOS
+            T* eos = var_acc::get_eos(node);
+            if (eos) {
+                value_out = *eos;
                 return node;
             }
 
-            // 2. If EOS-only node, no value found
-            if (node.is_eos()) {
-                return nullptr;
-            }
+            if (node.is_eos()) return nullptr;
 
-            // 3. Consume SKIP and check skip_eos
-            const std::string& skip = node.get_skip();
+            // Consume skip, check skip_eos
+            const std::string& skip = var_acc::get_skip(node);
             key_out.append(skip);
 
-            if (node.get_skip_eos()) {
-                value_is_skip_eos = true;
+            T* skip_eos = var_acc::get_skip_eos(node);
+            if (skip_eos) {
+                value_out = *skip_eos;
                 return node;
             }
 
-            // 4. If no children (SKIP-only), no value found
-            if (!node.is_list() && !node.is_full()) {
-                return nullptr;
-            }
+            // Find first child
+            if (!node.is_list() && !node.is_full()) return nullptr;
 
-            // 5. Find first child
-            unsigned char c;
-            if (node.is_list()) {
-                c = node.list->chars.smallest();
-                if (c == 255) return nullptr;
-                int idx = node.list->chars.find(c);
-                key_out.push_back(static_cast<char>(c));
-                node = node.list->children[idx].load();
-            } else {
-                // FULL
-                c = node.full->valid.first_set();
-                if (c == 255) return nullptr;
-                key_out.push_back(static_cast<char>(c));
-                node = node.full->children[c].load();
-            }
+            unsigned char c = var_acc::first_child_char(node);
+            if (c == 255) return nullptr;
 
+            key_out.push_back(static_cast<char>(c));
+            node = var_acc::find_child(node, c);
             if (!node) return nullptr;
         }
     }
 
-    // Find next leaf after given key (for iterator increment)
-    static ptr_t find_next_leaf(ptr_t root, const std::string& current_key,
-                                 std::string& next_key_out, bool& value_is_skip_eos) noexcept {
-        value_is_skip_eos = false;
-        if (!root) return nullptr;
+    static interior_ptr find_first_fixed_len(interior_ptr node, std::string& key_out, T& value_out, size_t depth) noexcept {
+        if (!node) return nullptr;
 
-        struct frame {
-            ptr_t node;
-            std::string prefix;
-            int state;  // 0=check eos, 1=check skip_eos, 2=iterating children
-            unsigned char last_child;
-        };
-
-        std::vector<frame> stack;
-        stack.push_back({root, "", 0, 0});
-
-        bool found_current = false;
-
-        while (!stack.empty()) {
-            frame& f = stack.back();
-            ptr_t node = f.node;
-
-            if (!node) {
-                stack.pop_back();
-                continue;
+        while (true) {
+            // Consume skip
+            if (!node.is_eos()) {
+                const std::string& skip = int_acc::get_skip(node);
+                key_out.append(skip);
+                depth += skip.size();
             }
 
-            if (f.state == 0) {
-                f.state = 1;
-                if (node.is_eos()) {
-                    if (f.prefix == current_key) {
-                        found_current = true;
-                    } else if (found_current && node.get_eos()) {
-                        next_key_out = f.prefix;
-                        value_is_skip_eos = false;
-                        return node;
-                    }
-                    stack.pop_back();
-                    continue;
-                }
+            // Find first child
+            if (!node.is_list() && !node.is_full()) return nullptr;
 
-                if (node.get_eos()) {
-                    if (f.prefix == current_key) {
-                        found_current = true;
-                    } else if (found_current) {
-                        next_key_out = f.prefix;
-                        value_is_skip_eos = false;
-                        return node;
-                    }
-                }
-            }
+            unsigned char c = int_acc::first_child_char(node);
+            if (c == 255) return nullptr;
 
-            if (f.state == 1) {
-                f.state = 2;
-                const std::string& skip = node.get_skip();
-                std::string skip_prefix = f.prefix + skip;
+            key_out.push_back(static_cast<char>(c));
+            ++depth;
 
-                if (node.get_skip_eos()) {
-                    if (skip_prefix == current_key) {
-                        found_current = true;
-                    } else if (found_current) {
-                        next_key_out = skip_prefix;
-                        value_is_skip_eos = true;
-                        return node;
-                    }
-                }
-                f.prefix = skip_prefix;
-                f.last_child = 0;
-            }
-
-            if (f.state == 2) {
-                if (!node.is_list() && !node.is_full()) {
-                    stack.pop_back();
-                    continue;
-                }
-
-                unsigned char c;
-                if (f.last_child == 0) {
-                    c = node.first_child_char();
+            // Check if child is at leaf level
+            if (depth == FIXED_LEN) {
+                leaf_ptr leaf;
+                if (node.is_list()) {
+                    int idx = node.list->chars.find(c);
+                    leaf.raw = node.list->children[idx].load().raw;
                 } else {
-                    c = node.next_child_char(f.last_child);
+                    leaf.raw = node.full->children[c].load().raw;
                 }
 
-                if (c == 255) {
-                    stack.pop_back();
-                    continue;
+                if (leaf && read_leaf_value(leaf, value_out)) {
+                    return node;
                 }
-
-                f.last_child = c;
-                ptr_t child = node.find_child(c);
-                if (child) {
-                    stack.push_back({child, f.prefix + static_cast<char>(c), 0, 0});
-                }
+                return nullptr;
             }
-        }
 
-        return nullptr;
+            node = int_acc::find_child(node, c);
+            if (!node) return nullptr;
+        }
     }
 };
 
