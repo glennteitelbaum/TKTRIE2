@@ -127,12 +127,12 @@ private:
     bool read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept {
         if (leaf->is_eos()) {
             if (!key.empty()) return false;
-            out = leaf->values[0];
+            out = leaf->value_at(0);
             return true;
         }
         if (leaf->is_skip()) {
             if (key != leaf->skip) return false;
-            out = leaf->values[0];
+            out = leaf->value_at(0);
             return true;
         }
         // LIST or FULL: skip + 1 char
@@ -306,14 +306,14 @@ private:
             ptr_t leaf = builder_.make_leaf_list("");
             unsigned char c = static_cast<unsigned char>(key[0]);
             leaf->chars.add(c);
-            leaf->values[0] = value;
+            leaf->value_at(0) = value;
             return leaf;
         }
         // Skip + 1 char
         ptr_t leaf = builder_.make_leaf_list(key.substr(0, key.size() - 1));
         unsigned char c = static_cast<unsigned char>(key.back());
         leaf->chars.add(c);
-        leaf->values[0] = value;
+        leaf->value_at(0) = value;
         return leaf;
     }
     
@@ -323,12 +323,12 @@ private:
         // Old leaf value becomes eos_ptr on new interior
         // New key gets a child leaf
         ptr_t interior = builder_.make_interior_list("");
-        interior->eos_ptr = new T(leaf->values[0]);
+        interior->eos_ptr = new T(leaf->value_at(0));
         
         unsigned char c = static_cast<unsigned char>(key[0]);
         ptr_t child = create_leaf_for_key(key.substr(1), value);
         interior->chars.add(c);
-        interior->children[0].store(child);
+        interior->child_at(0).store(child);
         
         res.new_node = interior;
         res.old_nodes.push_back(leaf);
@@ -350,15 +350,15 @@ private:
         ptr_t interior = builder_.make_interior_list(common);
         
         // Old leaf with shorter skip
-        ptr_t old_child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->values[0]);
+        ptr_t old_child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->value_at(0));
         
         // New leaf
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         
         interior->chars.add(old_c);
         interior->chars.add(new_c);
-        interior->children[0].store(old_child);
-        interior->children[1].store(new_child);
+        interior->child_at(0).store(old_child);
+        interior->child_at(1).store(new_child);
         
         res.new_node = interior;
         res.old_nodes.push_back(leaf);
@@ -376,9 +376,9 @@ private:
         interior->eos_ptr = new T(value);
         
         unsigned char c = static_cast<unsigned char>(old_skip[m]);
-        ptr_t child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->values[0]);
+        ptr_t child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->value_at(0));
         interior->chars.add(c);
-        interior->children[0].store(child);
+        interior->child_at(0).store(child);
         
         res.new_node = interior;
         res.old_nodes.push_back(leaf);
@@ -393,12 +393,12 @@ private:
         
         // Create interior with eos for old value, child for new
         ptr_t interior = builder_.make_interior_list(old_skip);
-        interior->eos_ptr = new T(leaf->values[0]);
+        interior->eos_ptr = new T(leaf->value_at(0));
         
         unsigned char c = static_cast<unsigned char>(key[m]);
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
         interior->chars.add(c);
-        interior->children[0].store(child);
+        interior->child_at(0).store(child);
         
         res.new_node = interior;
         res.old_nodes.push_back(leaf);
@@ -423,14 +423,14 @@ private:
             old_child = builder_.make_leaf_list(old_skip.substr(m + 1));
             old_child->chars = leaf->chars;
             for (int i = 0; i < leaf->chars.count(); ++i) {
-                old_child->values[i] = leaf->values[i];
+                old_child->value_at(i) = leaf->value_at(i);
             }
         } else {
             old_child = builder_.make_leaf_full(old_skip.substr(m + 1));
             old_child->valid = leaf->valid;
             for (int c = 0; c < 256; ++c) {
                 if (leaf->valid.test(static_cast<unsigned char>(c))) {
-                    old_child->values[c] = leaf->values[c];
+                    old_child->value_at(c) = leaf->value_at(c);
                 }
             }
         }
@@ -439,8 +439,8 @@ private:
         
         interior->chars.add(old_c);
         interior->chars.add(new_c);
-        interior->children[0].store(old_child);
-        interior->children[1].store(new_child);
+        interior->child_at(0).store(old_child);
+        interior->child_at(1).store(new_child);
         
         res.new_node = interior;
         res.old_nodes.push_back(leaf);
@@ -464,20 +464,20 @@ private:
             old_child = builder_.make_leaf_list(old_skip.substr(m + 1));
             old_child->chars = leaf->chars;
             for (int i = 0; i < leaf->chars.count(); ++i) {
-                old_child->values[i] = leaf->values[i];
+                old_child->value_at(i) = leaf->value_at(i);
             }
         } else {
             old_child = builder_.make_leaf_full(old_skip.substr(m + 1));
             old_child->valid = leaf->valid;
             for (int c2 = 0; c2 < 256; ++c2) {
                 if (leaf->valid.test(static_cast<unsigned char>(c2))) {
-                    old_child->values[c2] = leaf->values[c2];
+                    old_child->value_at(c2) = leaf->value_at(c2);
                 }
             }
         }
         
         interior->chars.add(c);
-        interior->children[0].store(old_child);
+        interior->child_at(0).store(old_child);
         
         res.new_node = interior;
         res.old_nodes.push_back(leaf);
@@ -496,17 +496,17 @@ private:
         if (leaf->is_list()) {
             for (int i = 0; i < leaf->chars.count(); ++i) {
                 unsigned char c = leaf->chars.char_at(i);
-                ptr_t child = builder_.make_leaf_eos(leaf->values[i]);
+                ptr_t child = builder_.make_leaf_eos(leaf->value_at(i));
                 interior->chars.add(c);
-                interior->children[i].store(child);
+                interior->child_at(i).store(child);
             }
         } else {
             // Convert to LIST for simplicity (could keep FULL)
             for (int c = 0; c < 256; ++c) {
                 if (leaf->valid.test(static_cast<unsigned char>(c))) {
-                    ptr_t child = builder_.make_leaf_eos(leaf->values[c]);
+                    ptr_t child = builder_.make_leaf_eos(leaf->value_at(c));
                     int idx = interior->chars.add(static_cast<unsigned char>(c));
-                    interior->children[idx].store(child);
+                    interior->child_at(idx).store(child);
                 }
             }
         }
@@ -529,7 +529,7 @@ private:
             if (leaf->chars.count() < LIST_MAX) {
                 // In-place add
                 int idx = leaf->chars.add(c);
-                leaf->values[idx] = value;
+                leaf->value_at(idx) = value;
                 res.in_place = true;
                 res.inserted = true;
                 return res;
@@ -539,10 +539,10 @@ private:
             for (int i = 0; i < leaf->chars.count(); ++i) {
                 unsigned char ch = leaf->chars.char_at(i);
                 full->valid.set(ch);
-                full->values[ch] = leaf->values[i];
+                full->value_at(ch) = leaf->value_at(i);
             }
             full->valid.set(c);
-            full->values[c] = value;
+            full->value_at(c) = value;
             
             res.new_node = full;
             res.old_nodes.push_back(leaf);
@@ -555,7 +555,7 @@ private:
             return res;  // Already exists
         }
         leaf->valid.template atomic_set<THREADED>(c);
-        leaf->values[c] = value;
+        leaf->value_at(c) = value;
         res.in_place = true;
         res.inserted = true;
         return res;
@@ -574,16 +574,16 @@ private:
         if (leaf->is_list()) {
             for (int i = 0; i < leaf->chars.count(); ++i) {
                 unsigned char c = leaf->chars.char_at(i);
-                ptr_t child = builder_.make_leaf_eos(leaf->values[i]);
+                ptr_t child = builder_.make_leaf_eos(leaf->value_at(i));
                 interior->chars.add(c);
-                interior->children[i].store(child);
+                interior->child_at(i).store(child);
             }
         } else {
             for (int c = 0; c < 256; ++c) {
                 if (leaf->valid.test(static_cast<unsigned char>(c))) {
-                    ptr_t child = builder_.make_leaf_eos(leaf->values[c]);
+                    ptr_t child = builder_.make_leaf_eos(leaf->value_at(c));
                     int idx = interior->chars.add(static_cast<unsigned char>(c));
-                    interior->children[idx].store(child);
+                    interior->child_at(idx).store(child);
                 }
             }
         }
@@ -592,10 +592,10 @@ private:
         int existing_idx = interior->chars.find(first_c);
         if (existing_idx >= 0) {
             // Need to extend existing child
-            ptr_t child = interior->children[existing_idx].load();
-            auto child_res = insert_impl(&interior->children[existing_idx], child, key.substr(1), value);
+            ptr_t child = interior->child_at(existing_idx).load();
+            auto child_res = insert_impl(&interior->child_at(existing_idx), child, key.substr(1), value);
             if (child_res.new_node) {
-                interior->children[existing_idx].store(child_res.new_node);
+                interior->child_at(existing_idx).store(child_res.new_node);
             }
             for (auto* old : child_res.old_nodes) {
                 res.old_nodes.push_back(old);
@@ -604,7 +604,7 @@ private:
             // Add new child
             ptr_t child = create_leaf_for_key(key.substr(1), value);
             int idx = interior->chars.add(first_c);
-            interior->children[idx].store(child);
+            interior->child_at(idx).store(child);
         }
         
         res.new_node = interior;
@@ -631,8 +631,8 @@ private:
             old_child->chars = n->chars;
             old_child->take_eos_from(*n);
             for (int i = 0; i < n->chars.count(); ++i) {
-                old_child->children[i].store(n->children[i].load());
-                n->children[i].store(nullptr);
+                old_child->child_at(i).store(n->child_at(i).load());
+                n->child_at(i).store(nullptr);
             }
         } else if (n->is_full()) {
             old_child = builder_.make_interior_full(old_skip.substr(m + 1));
@@ -640,8 +640,8 @@ private:
             old_child->take_eos_from(*n);
             for (int c = 0; c < 256; ++c) {
                 if (n->valid.test(static_cast<unsigned char>(c))) {
-                    old_child->children[c].store(n->children[c].load());
-                    n->children[c].store(nullptr);
+                    old_child->child_at(c).store(n->child_at(c).load());
+                    n->child_at(c).store(nullptr);
                 }
             }
         } else {
@@ -653,8 +653,8 @@ private:
         
         new_int->chars.add(old_c);
         new_int->chars.add(new_c);
-        new_int->children[0].store(old_child);
-        new_int->children[1].store(new_child);
+        new_int->child_at(0).store(old_child);
+        new_int->child_at(1).store(new_child);
         
         res.new_node = new_int;
         res.old_nodes.push_back(n);
@@ -679,8 +679,8 @@ private:
             old_child->chars = n->chars;
             old_child->take_eos_from(*n);
             for (int i = 0; i < n->chars.count(); ++i) {
-                old_child->children[i].store(n->children[i].load());
-                n->children[i].store(nullptr);
+                old_child->child_at(i).store(n->child_at(i).load());
+                n->child_at(i).store(nullptr);
             }
         } else if (n->is_full()) {
             old_child = builder_.make_interior_full(old_skip.substr(m + 1));
@@ -688,8 +688,8 @@ private:
             old_child->take_eos_from(*n);
             for (int c2 = 0; c2 < 256; ++c2) {
                 if (n->valid.test(static_cast<unsigned char>(c2))) {
-                    old_child->children[c2].store(n->children[c2].load());
-                    n->children[c2].store(nullptr);
+                    old_child->child_at(c2).store(n->child_at(c2).load());
+                    n->child_at(c2).store(nullptr);
                 }
             }
         } else {
@@ -698,7 +698,7 @@ private:
         }
         
         new_int->chars.add(c);
-        new_int->children[0].store(old_child);
+        new_int->child_at(0).store(old_child);
         
         res.new_node = new_int;
         res.old_nodes.push_back(n);
@@ -731,7 +731,7 @@ private:
         if (n->is_list()) {
             if (n->chars.count() < LIST_MAX) {
                 int idx = n->chars.add(c);
-                n->children[idx].store(child);
+                n->child_at(idx).store(child);
                 res.in_place = true;
                 res.inserted = true;
                 return res;
@@ -742,11 +742,11 @@ private:
             for (int i = 0; i < n->chars.count(); ++i) {
                 unsigned char ch = n->chars.char_at(i);
                 full->valid.set(ch);
-                full->children[ch].store(n->children[i].load());
-                n->children[i].store(nullptr);
+                full->child_at(ch).store(n->child_at(i).load());
+                n->child_at(i).store(nullptr);
             }
             full->valid.set(c);
-            full->children[c].store(child);
+            full->child_at(c).store(child);
             
             res.new_node = full;
             res.old_nodes.push_back(n);
@@ -756,7 +756,7 @@ private:
         
         if (n->is_full()) {
             n->valid.template atomic_set<THREADED>(c);
-            n->children[c].store(child);
+            n->child_at(c).store(child);
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -766,7 +766,7 @@ private:
         ptr_t list = builder_.make_interior_list(n->skip);
         list->take_eos_from(*n);
         list->chars.add(c);
-        list->children[0].store(child);
+        list->child_at(0).store(child);
         
         res.new_node = list;
         res.old_nodes.push_back(n);
@@ -835,7 +835,7 @@ private:
             // In-place remove: shift values down, then remove char
             int count = leaf->chars.count();
             for (int i = idx; i < count - 1; ++i) {
-                leaf->values[i] = leaf->values[i + 1];
+                leaf->value_at(i) = leaf->value_at(i + 1);
             }
             leaf->chars.remove_at(idx);
             res.erased = true;
@@ -930,11 +930,11 @@ private:
         
         if (n->is_list() && n->chars.count() == 1) {
             c = n->chars.char_at(0);
-            child = n->children[0].load();
+            child = n->child_at(0).load();
             can_collapse = (child != nullptr);
         } else if (n->is_full() && n->valid.count() == 1) {
             c = n->valid.first();
-            child = n->children[c].load();
+            child = n->child_at(c).load();
             can_collapse = (child != nullptr);
         }
         
@@ -972,14 +972,14 @@ private:
             if (idx >= 0) {
                 int count = n->chars.count();
                 for (int i = idx; i < count - 1; ++i) {
-                    n->children[i].store(n->children[i + 1].load());
+                    n->child_at(i).store(n->child_at(i + 1).load());
                 }
-                n->children[count - 1].store(nullptr);
+                n->child_at(count - 1).store(nullptr);
                 n->chars.remove_at(idx);
             }
         } else if (n->is_full()) {
             n->valid.template atomic_clear<THREADED>(removed_c);
-            n->children[removed_c].store(nullptr);
+            n->child_at(removed_c).store(nullptr);
         }
         
         // Now check if LIST[1] or FULL[1] can collapse to SKIP
@@ -989,13 +989,13 @@ private:
         
         if (n->is_list() && n->chars.count() == 1 && !eos) {
             c = n->chars.char_at(0);
-            child = n->children[0].load();
+            child = n->child_at(0).load();
             can_collapse = (child != nullptr);
         } else if (n->is_full() && !eos) {
             int cnt = n->valid.count();
             if (cnt == 1) {
                 c = n->valid.first();
-                child = n->children[c].load();
+                child = n->child_at(c).load();
                 can_collapse = (child != nullptr);
             }
         }
@@ -1018,21 +1018,21 @@ private:
         ptr_t merged;
         if (child->is_leaf()) {
             if (child->is_eos()) {
-                merged = builder_.make_leaf_skip(new_skip, child->values[0]);
+                merged = builder_.make_leaf_skip(new_skip, child->value_at(0));
             } else if (child->is_skip()) {
-                merged = builder_.make_leaf_skip(new_skip, child->values[0]);
+                merged = builder_.make_leaf_skip(new_skip, child->value_at(0));
             } else if (child->is_list()) {
                 merged = builder_.make_leaf_list(new_skip);
                 merged->chars = child->chars;
                 for (int i = 0; i < child->chars.count(); ++i) {
-                    merged->values[i] = child->values[i];
+                    merged->value_at(i) = child->value_at(i);
                 }
             } else { // FULL
                 merged = builder_.make_leaf_full(new_skip);
                 merged->valid = child->valid;
                 for (int i = 0; i < 256; ++i) {
                     if (child->valid.test(static_cast<unsigned char>(i))) {
-                        merged->values[i] = child->values[i];
+                        merged->value_at(i) = child->value_at(i);
                     }
                 }
             }
@@ -1046,8 +1046,8 @@ private:
                 merged->take_eos_from(*child);
                 merged->chars = child->chars;
                 for (int i = 0; i < child->chars.count(); ++i) {
-                    merged->children[i].store(child->children[i].load());
-                    child->children[i].store(nullptr);
+                    merged->child_at(i).store(child->child_at(i).load());
+                    child->child_at(i).store(nullptr);
                 }
             } else { // FULL
                 merged = builder_.make_interior_full(new_skip);
@@ -1055,8 +1055,8 @@ private:
                 merged->valid = child->valid;
                 for (int i = 0; i < 256; ++i) {
                     if (child->valid.test(static_cast<unsigned char>(i))) {
-                        merged->children[i].store(child->children[i].load());
-                        child->children[i].store(nullptr);
+                        merged->child_at(i).store(child->child_at(i).load());
+                        child->child_at(i).store(nullptr);
                     }
                 }
             }
