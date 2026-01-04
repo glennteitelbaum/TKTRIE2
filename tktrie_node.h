@@ -136,20 +136,21 @@ struct skip_node : node_base<T, THREADED, Allocator> {
 };
 
 // LIST node - skip + up to 7 children
+// Layout: header, skip, chars, eos_ptr, children[0] all in first cache line
 template <typename T, bool THREADED, typename Allocator>
 struct list_node : node_base<T, THREADED, Allocator> {
     using base_t = node_base<T, THREADED, Allocator>;
     using atomic_ptr = typename base_t::atomic_ptr;
     
-    static constexpr int MAX_CHILDREN = 8;
+    static constexpr int MAX_CHILDREN = 7;  // Matches LIST_MAX
     
     std::string skip;
     small_list chars;
+    T* eos_ptr;  // Before children for cache locality
     union {
         std::array<T, MAX_CHILDREN> leaf_values;
         std::array<atomic_ptr, MAX_CHILDREN> children;
     };
-    T* eos_ptr;  // interior only
     
     list_node() : eos_ptr(nullptr) {
         for (int i = 0; i < MAX_CHILDREN; ++i) {
