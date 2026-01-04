@@ -18,7 +18,7 @@
 
 namespace gteitelbaum {
 
-// Header: [LEAF:1][TYPE:2][unused:61]
+// Header: [LEAF:1][TYPE:2][VERSION:61]
 // TYPE: 00=EOS, 01=SKIP, 10=LIST, 11=FULL
 static constexpr uint64_t FLAG_LEAF = 1ULL << 63;
 static constexpr uint64_t TYPE_EOS  = 0ULL << 61;
@@ -26,14 +26,19 @@ static constexpr uint64_t TYPE_SKIP = 1ULL << 61;
 static constexpr uint64_t TYPE_LIST = 2ULL << 61;
 static constexpr uint64_t TYPE_FULL = 3ULL << 61;
 static constexpr uint64_t TYPE_MASK = 3ULL << 61;
+static constexpr uint64_t VERSION_MASK = (1ULL << 61) - 1;
 
 static constexpr int LIST_MAX = 7;
 
-inline constexpr uint64_t make_header(bool is_leaf, uint64_t type) noexcept {
-    return (is_leaf ? FLAG_LEAF : 0) | type;
+inline constexpr uint64_t make_header(bool is_leaf, uint64_t type, uint64_t version = 0) noexcept {
+    return (is_leaf ? FLAG_LEAF : 0) | type | (version & VERSION_MASK);
 }
 inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0; }
 inline constexpr uint64_t get_type(uint64_t h) noexcept { return h & TYPE_MASK; }
+inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
+inline constexpr uint64_t bump_version(uint64_t h) noexcept {
+    return (h & ~VERSION_MASK) | (((h & VERSION_MASK) + 1) & VERSION_MASK);
+}
 
 template <typename T>
 constexpr T ktrie_byteswap(T value) noexcept {

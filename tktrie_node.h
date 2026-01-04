@@ -52,6 +52,18 @@ struct node_base {
     
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     uint64_t type() const noexcept { return get_type(header()); }
+    uint64_t version() const noexcept { return get_version(header()); }
+    
+    void bump_version() noexcept {
+        if constexpr (THREADED) {
+            uint64_t old_h = header_.load(std::memory_order_acquire);
+            uint64_t new_h = gteitelbaum::bump_version(old_h);
+            header_.store(new_h, std::memory_order_release);
+        } else {
+            header_ = gteitelbaum::bump_version(header_);
+        }
+    }
+    
     bool is_eos() const noexcept { return type() == TYPE_EOS; }
     bool is_skip() const noexcept { return type() == TYPE_SKIP; }
     bool is_list() const noexcept { return type() == TYPE_LIST; }
