@@ -84,32 +84,12 @@ public:
         return static_cast<unsigned char>((data_ >> (i * 8)) & 0xFF);
     }
     
-    // SWAR find - O(1) regardless of list size
     int find(unsigned char c) const noexcept {
         int n = count();
-        if (n == 0) return -1;
-        
-        // Broadcast c to all 7 data bytes
-        uint64_t broadcast = 0x0101010101010101ULL * c;
-        // Mask to only compare the bytes that contain data (first n bytes)
-        uint64_t mask = (1ULL << (n * 8)) - 1;
-        uint64_t data_masked = data_ & mask;
-        uint64_t broadcast_masked = broadcast & mask;
-        
-        // XOR - matching bytes become 0
-        uint64_t xored = data_masked ^ broadcast_masked;
-        
-        // SWAR zero-byte detection: ((v - 0x01...) & ~v & 0x80...)
-        // A byte is zero iff its high bit is set in the result
-        uint64_t zero_detect = (xored - 0x0101010101010101ULL) & ~xored & 0x8080808080808080ULL;
-        
-        if (zero_detect == 0) return -1;
-        
-        // Find position of first zero byte (first match)
-        int bit_pos = std::countr_zero(zero_detect);
-        int byte_pos = bit_pos >> 3;
-        
-        return byte_pos < n ? byte_pos : -1;
+        for (int i = 0; i < n; ++i) {
+            if (char_at(i) == c) return i;
+        }
+        return -1;
     }
     
     int add(unsigned char c) noexcept {
