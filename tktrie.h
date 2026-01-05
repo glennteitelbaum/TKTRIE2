@@ -224,6 +224,8 @@ private:
     pre_alloc allocate_speculative(const speculative_info& info, const T& value);
     bool validate_path(const speculative_info& info) const noexcept;
     atomic_ptr* find_slot_for_commit(const speculative_info& info) noexcept;
+    atomic_ptr* get_verified_slot(const speculative_info& info) noexcept;
+    void commit_to_slot(atomic_ptr* slot, ptr_t new_node, const speculative_info& info) noexcept;
     bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& value);
     void dealloc_speculation(pre_alloc& alloc);
     std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value);
@@ -234,6 +236,8 @@ private:
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     void capture_parent_collapse_info(erase_spec_info& info) const noexcept;
     bool check_collapse_needed(ptr_t parent, unsigned char removed_c, unsigned char& collapse_c, ptr_t& collapse_child) const noexcept;
+    ptr_t allocate_collapse_node_impl(std::string_view prefix_skip, unsigned char edge_char,
+                                       std::string_view child_skip, ptr_t child);
     ptr_t allocate_collapse_node(const erase_spec_info& info);
     ptr_t allocate_parent_collapse_node(const erase_spec_info& info);
     erase_pre_alloc allocate_erase_speculative(const erase_spec_info& info);

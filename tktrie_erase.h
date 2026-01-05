@@ -156,15 +156,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (m < skip.size()) return res;
     key.remove_prefix(m);
 
-    if (leaf->is_eos()) {
-        if (!key.empty()) return res;
-        res.erased = true;
-        res.deleted_subtree = true;
-        res.old_nodes.push_back(leaf);
-        return res;
-    }
-
-    if (leaf->is_skip()) {
+    if (leaf->is_eos() | leaf->is_skip()) {
         if (!key.empty()) return res;
         res.erased = true;
         res.deleted_subtree = true;
@@ -347,10 +339,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
 
     ptr_t merged;
     if (child->is_leaf()) {
-        if (child->is_eos()) {
-            merged = builder_.make_leaf_skip(new_skip, child->as_eos()->leaf_value);
-        } else if (child->is_skip()) {
-            merged = builder_.make_leaf_skip(new_skip, child->as_skip()->leaf_value);
+        if (child->is_eos() | child->is_skip()) {
+            T& val = child->is_eos() ? child->as_eos()->leaf_value : child->as_skip()->leaf_value;
+            merged = builder_.make_leaf_skip(new_skip, val);
         } else if (child->is_list()) {
             merged = builder_.make_leaf_list(new_skip);
             merged->as_list()->chars = child->as_list()->chars;
@@ -360,11 +351,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
         } else {
             merged = builder_.make_leaf_full(new_skip);
             merged->as_full()->valid = child->as_full()->valid;
-            for (int i = 0; i < 256; ++i) {
-                if (child->as_full()->valid.test(static_cast<unsigned char>(i))) {
-                    merged->as_full()->construct_leaf_value(static_cast<unsigned char>(i), child->as_full()->leaf_values[i]);
-                }
-            }
+            child->as_full()->valid.for_each_set([child, merged](unsigned char ch) {
+                merged->as_full()->construct_leaf_value(ch, child->as_full()->leaf_values[ch]);
+            });
         }
     } else {
         if (child->is_eos() | child->is_skip()) {
@@ -385,12 +374,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             set_eos_ptr(merged, get_eos_ptr(child));
             set_eos_ptr(child, nullptr);
             merged->as_full()->valid = child->as_full()->valid;
-            for (int i = 0; i < 256; ++i) {
-                if (child->as_full()->valid.test(static_cast<unsigned char>(i))) {
-                    merged->as_full()->children[i].store(child->as_full()->children[i].load());
-                    child->as_full()->children[i].store(nullptr);
-                }
-            }
+            child->as_full()->valid.for_each_set([child, merged](unsigned char ch) {
+                merged->as_full()->children[ch].store(child->as_full()->children[ch].load());
+                child->as_full()->children[ch].store(nullptr);
+            });
         }
     }
 

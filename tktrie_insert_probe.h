@@ -342,12 +342,24 @@ bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::find_slot_for_commit(
     const speculative_info& info) noexcept {
-    if (info.path_len <= 1) {
-        return &root_;
-    }
+    if (info.path_len <= 1) return &root_;
     ptr_t parent = info.path[info.path_len - 2].node;
     unsigned char edge = info.path[info.path_len - 1].edge;
     return get_child_slot(parent, edge);
+}
+
+TKTRIE_TEMPLATE
+typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_verified_slot(
+    const speculative_info& info) noexcept {
+    atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
+    return (slot->load() == info.target) ? slot : nullptr;
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::commit_to_slot(atomic_ptr* slot, ptr_t new_node, 
+                                   const speculative_info& info) noexcept {
+    if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
+    slot->store(new_node);
 }
 
 TKTRIE_TEMPLATE
@@ -360,81 +372,56 @@ bool TKTRIE_CLASS::commit_speculative(
         return true;
 
     case spec_op::DEMOTE_LEAF_EOS: {
-        ptr_t interior = alloc.root_replacement;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
-        *interior->as_list()->eos_ptr = info.target->as_eos()->leaf_value;
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(interior);
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        *alloc.root_replacement->as_list()->eos_ptr = info.target->as_eos()->leaf_value;
+        commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
     case spec_op::SPLIT_LEAF_SKIP: {
-        ptr_t interior = alloc.root_replacement;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
-        ptr_t old_child = interior->as_list()->children[0].load();
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        ptr_t old_child = alloc.root_replacement->as_list()->children[0].load();
         old_child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(interior);
+        commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
     case spec_op::PREFIX_LEAF_SKIP: {
-        ptr_t interior = alloc.root_replacement;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
-        ptr_t child = interior->as_list()->children[0].load();
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        ptr_t child = alloc.root_replacement->as_list()->children[0].load();
         child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(interior);
+        commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
     case spec_op::EXTEND_LEAF_SKIP: {
-        ptr_t interior = alloc.root_replacement;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
-        *interior->as_list()->eos_ptr = info.target->as_skip()->leaf_value;
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(interior);
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        *alloc.root_replacement->as_list()->eos_ptr = info.target->as_skip()->leaf_value;
+        commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
-    case spec_op::SPLIT_LEAF_LIST: {
-        ptr_t interior = alloc.root_replacement;
-        std::string_view skip = info.target_skip;
-        size_t m = info.match_pos;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
-        ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(m + 1));
-        interior->as_list()->children[0].store(old_child);
-        alloc.add(old_child);
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(interior);
-        return true;
-    }
+    case spec_op::SPLIT_LEAF_LIST:
     case spec_op::PREFIX_LEAF_LIST: {
-        ptr_t interior = alloc.root_replacement;
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
         std::string_view skip = info.target_skip;
-        size_t m = info.match_pos;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
-        ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(m + 1));
-        interior->as_list()->children[0].store(old_child);
+        ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(info.match_pos + 1));
+        alloc.root_replacement->as_list()->children[0].store(old_child);
         alloc.add(old_child);
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(interior);
+        commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
     case spec_op::LIST_TO_FULL_LEAF: {
-        ptr_t full = alloc.root_replacement;
-        atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) return false;
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
         auto* list = info.target->as_list();
         for (int i = 0; i < list->chars.count(); ++i) {
             unsigned char ch = list->chars.char_at(i);
-            full->as_full()->valid.set(ch);
-            full->as_full()->construct_leaf_value(ch, list->leaf_values[i]);
+            alloc.root_replacement->as_full()->valid.set(ch);
+            alloc.root_replacement->as_full()->construct_leaf_value(ch, list->leaf_values[i]);
         }
-        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-        slot->store(full);
+        commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
     case spec_op::IN_PLACE_LEAF: {
@@ -442,7 +429,7 @@ bool TKTRIE_CLASS::commit_speculative(
         unsigned char c = info.c;
         if (n->version() != info.target_version) return false;
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (!slot || slot->load() != n) return false;
+        if (!slot | (slot->load() != n)) return false;
 
         if (n->is_list()) {
             if (n->as_list()->chars.find(c) >= 0) return false;
@@ -470,7 +457,7 @@ bool TKTRIE_CLASS::commit_speculative(
             return false;
         }
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (!slot || slot->load() != n) {
+        if (!slot | (slot->load() != n)) {
             if (alloc.in_place_eos) { delete alloc.in_place_eos; alloc.in_place_eos = nullptr; }
             return false;
         }

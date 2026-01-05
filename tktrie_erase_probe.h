@@ -31,17 +31,9 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
             if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
             key.remove_prefix(m);
 
-            if (n->is_eos()) {
+            if (n->is_eos() | n->is_skip()) {
                 if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
-                info.op = erase_op::DELETE_LEAF_EOS;
-                info.target = n;
-                info.target_version = n->version();
-                return info;
-            }
-
-            if (n->is_skip()) {
-                if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
-                info.op = erase_op::DELETE_LEAF_SKIP;
+                info.op = n->is_eos() ? erase_op::DELETE_LEAF_EOS : erase_op::DELETE_LEAF_SKIP;
                 info.target = n;
                 info.target_version = n->version();
                 return info;
@@ -200,45 +192,38 @@ bool TKTRIE_CLASS::check_collapse_needed(
     return false;
 }
 
+// Helper to allocate a collapse node given skip prefix, edge char, child skip suffix, and child node
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_collapse_node(const erase_spec_info& info) {
-    std::string new_skip = info.target_skip;
-    new_skip.push_back(static_cast<char>(info.collapse_char));
-    new_skip.append(info.child_skip);
-
-    ptr_t child = info.collapse_child;
+typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_collapse_node_impl(
+    std::string_view prefix_skip, unsigned char edge_char, 
+    std::string_view child_skip, ptr_t child) {
     if (!child) return nullptr;
+
+    std::string new_skip(prefix_skip);
+    new_skip.push_back(static_cast<char>(edge_char));
+    new_skip.append(child_skip);
 
     if (child->is_leaf()) {
         if (child->is_eos() | child->is_skip()) return builder_.make_leaf_skip(new_skip, T{});
-        else if (child->is_list()) return builder_.make_leaf_list(new_skip);
-        else return builder_.make_leaf_full(new_skip);
+        if (child->is_list()) return builder_.make_leaf_list(new_skip);
+        return builder_.make_leaf_full(new_skip);
     } else {
         if (child->is_eos() | child->is_skip()) return builder_.make_interior_skip(new_skip);
-        else if (child->is_list()) return builder_.make_interior_list(new_skip);
-        else return builder_.make_interior_full(new_skip);
+        if (child->is_list()) return builder_.make_interior_list(new_skip);
+        return builder_.make_interior_full(new_skip);
     }
 }
 
 TKTRIE_TEMPLATE
+typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_collapse_node(const erase_spec_info& info) {
+    return allocate_collapse_node_impl(info.target_skip, info.collapse_char, 
+                                        info.child_skip, info.collapse_child);
+}
+
+TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_parent_collapse_node(const erase_spec_info& info) {
-    if (!info.parent_collapse_child) return nullptr;
-
-    std::string new_skip = info.parent_skip;
-    new_skip.push_back(static_cast<char>(info.parent_collapse_char));
-    new_skip.append(info.parent_child_skip);
-
-    ptr_t child = info.parent_collapse_child;
-
-    if (child->is_leaf()) {
-        if (child->is_eos() | child->is_skip()) return builder_.make_leaf_skip(new_skip, T{});
-        else if (child->is_list()) return builder_.make_leaf_list(new_skip);
-        else return builder_.make_leaf_full(new_skip);
-    } else {
-        if (child->is_eos() | child->is_skip()) return builder_.make_interior_skip(new_skip);
-        else if (child->is_list()) return builder_.make_interior_list(new_skip);
-        else return builder_.make_interior_full(new_skip);
-    }
+    return allocate_collapse_node_impl(info.parent_skip, info.parent_collapse_char,
+                                        info.parent_child_skip, info.parent_collapse_child);
 }
 
 TKTRIE_TEMPLATE
