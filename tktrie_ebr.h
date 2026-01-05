@@ -129,7 +129,7 @@ public:
         }
         
         for (auto& r : retired_) {
-            if (r.epoch < safe) r.deleter(r.ptr);
+            if (r.epoch + 2 <= safe) r.deleter(r.ptr);
             else still_retired.push_back(r);
         }
         retired_ = std::move(still_retired);
