@@ -301,8 +301,8 @@ public:
     explicit operator bool() const { return valid_; }
 
     bool operator==(const tktrie_iterator& o) const {
-        if (!valid_ && !o.valid_) return true;
-        return valid_ == o.valid_ && key_bytes_ == o.key_bytes_;
+        if (!valid_ & !o.valid_) return true;
+        return (valid_ == o.valid_) & (key_bytes_ == o.key_bytes_);
     }
     bool operator!=(const tktrie_iterator& o) const { return !(*this == o); }
 };
@@ -630,15 +630,15 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_leaf(
 
     if (leaf->is_skip()) {
         size_t m = match_skip_impl(leaf_skip, key);
-        if (m == leaf_skip.size() && m == key.size()) return res;
-        if (m < leaf_skip.size() && m < key.size()) return split_leaf_skip(leaf, key, value, m);
+        if ((m == leaf_skip.size()) & (m == key.size())) return res;
+        if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_skip(leaf, key, value, m);
         if (m == key.size()) return prefix_leaf_skip(leaf, key, value, m);
         return extend_leaf_skip(leaf, key, value, m);
     }
 
     // LIST or FULL
     size_t m = match_skip_impl(leaf_skip, key);
-    if (m < leaf_skip.size() && m < key.size()) return split_leaf_list(leaf, key, value, m);
+    if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_list(leaf, key, value, m);
     if (m < leaf_skip.size()) return prefix_leaf_list(leaf, key, value, m);
     key.remove_prefix(m);
 
@@ -657,7 +657,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
     std::string_view skip = get_skip(n);
 
     size_t m = match_skip_impl(skip, key);
-    if (m < skip.size() && m < key.size()) return split_interior(n, key, value, m);
+    if ((m < skip.size()) & (m < key.size())) return split_interior(n, key, value, m);
     if (m < skip.size()) return prefix_interior(n, key, value, m);
     key.remove_prefix(m);
 
@@ -1142,7 +1142,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             }
 
             if (n->is_skip()) {
-                if (m == skip.size() && m == key.size()) {
+                if ((m == skip.size()) & (m == key.size())) {
                     info.op = spec_op::EXISTS;
                     return info;
                 }
@@ -1151,7 +1151,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
                 info.target_skip = std::string(skip);
                 info.match_pos = m;
 
-                if (m < skip.size() && m < key.size()) {
+                if ((m < skip.size()) & (m < key.size())) {
                     info.op = spec_op::SPLIT_LEAF_SKIP;
                     info.remaining_key = std::string(key);
                     return info;
@@ -1171,7 +1171,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             info.target_version = n->version();
             info.target_skip = std::string(skip);
 
-            if (m < skip.size() && m < key.size()) {
+            if ((m < skip.size()) & (m < key.size())) {
                 info.op = spec_op::SPLIT_LEAF_LIST;
                 info.match_pos = m;
                 info.remaining_key = std::string(key);
@@ -1680,7 +1680,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {find(key), false};
             }
 
-            if (spec.op == spec_op::IN_PLACE_LEAF || spec.op == spec_op::IN_PLACE_INTERIOR) {
+            if ((spec.op == spec_op::IN_PLACE_LEAF) | (spec.op == spec_op::IN_PLACE_INTERIOR)) {
                 pre_alloc alloc = allocate_speculative(spec, value);
 
                 {
@@ -1718,11 +1718,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     return {iterator(this, std::string(kb), value), true};
                 }
 
-                if (spec.op == spec_op::ADD_EOS_LEAF_LIST ||
-                    spec.op == spec_op::DEMOTE_LEAF_LIST ||
-                    spec.op == spec_op::SPLIT_INTERIOR ||
-                    spec.op == spec_op::PREFIX_INTERIOR ||
-                    spec.op == spec_op::ADD_CHILD_CONVERT) {
+                if ((spec.op == spec_op::ADD_EOS_LEAF_LIST) |
+                    (spec.op == spec_op::DEMOTE_LEAF_LIST) |
+                    (spec.op == spec_op::SPLIT_INTERIOR) |
+                    (spec.op == spec_op::PREFIX_INTERIOR) |
+                    (spec.op == spec_op::ADD_CHILD_CONVERT)) {
 
                     dealloc_speculation(alloc);
 
@@ -1983,7 +1983,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_collapse_node(const erase_sp
     if (!child) return nullptr;
 
     if (child->is_leaf()) {
-        if (child->is_eos() || child->is_skip()) {
+        if (child->is_eos() | child->is_skip()) {
             return builder_.make_leaf_skip(new_skip, T{});
         } else if (child->is_list()) {
             return builder_.make_leaf_list(new_skip);
@@ -1991,7 +1991,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_collapse_node(const erase_sp
             return builder_.make_leaf_full(new_skip);
         }
     } else {
-        if (child->is_eos() || child->is_skip()) {
+        if (child->is_eos() | child->is_skip()) {
             return builder_.make_interior_skip(new_skip);
         } else if (child->is_list()) {
             return builder_.make_interior_list(new_skip);
@@ -2012,7 +2012,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_parent_collapse_node(const e
     ptr_t child = info.parent_collapse_child;
 
     if (child->is_leaf()) {
-        if (child->is_eos() || child->is_skip()) {
+        if (child->is_eos() | child->is_skip()) {
             return builder_.make_leaf_skip(new_skip, T{});
         } else if (child->is_list()) {
             return builder_.make_leaf_list(new_skip);
@@ -2020,7 +2020,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_parent_collapse_node(const e
             return builder_.make_leaf_full(new_skip);
         }
     } else {
-        if (child->is_eos() || child->is_skip()) {
+        if (child->is_eos() | child->is_skip()) {
             return builder_.make_interior_skip(new_skip);
         } else if (child->is_list()) {
             return builder_.make_interior_list(new_skip);
@@ -2089,7 +2089,7 @@ void TKTRIE_CLASS::fill_collapse_node(ptr_t merged, ptr_t child) {
             }
         }
     } else {
-        if (child->is_eos() || child->is_skip()) {
+        if (child->is_eos() | child->is_skip()) {
             merged->as_skip()->eos_ptr = get_eos_ptr(child);
             set_eos_ptr(child, nullptr);
         } else if (child->is_list()) {
@@ -2225,10 +2225,10 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return false;
             }
 
-            if (info.op == erase_op::IN_PLACE_LEAF_LIST ||
-                info.op == erase_op::IN_PLACE_LEAF_FULL ||
-                info.op == erase_op::IN_PLACE_INTERIOR_LIST ||
-                info.op == erase_op::IN_PLACE_INTERIOR_FULL) {
+            if ((info.op == erase_op::IN_PLACE_LEAF_LIST) |
+                (info.op == erase_op::IN_PLACE_LEAF_FULL) |
+                (info.op == erase_op::IN_PLACE_INTERIOR_LIST) |
+                (info.op == erase_op::IN_PLACE_INTERIOR_FULL)) {
 
                 std::lock_guard<mutex_t> lock(mutex_);
 
@@ -2259,9 +2259,9 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 continue;
             }
 
-            if (info.op == erase_op::DELETE_LEAF_EOS ||
-                info.op == erase_op::DELETE_LEAF_SKIP ||
-                info.op == erase_op::DELETE_LAST_LEAF_LIST) {
+            if ((info.op == erase_op::DELETE_LEAF_EOS) |
+                (info.op == erase_op::DELETE_LEAF_SKIP) |
+                (info.op == erase_op::DELETE_LAST_LEAF_LIST)) {
 
                 erase_pre_alloc alloc = allocate_erase_speculative(info);
 
@@ -2673,7 +2673,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             }
         }
     } else {
-        if (child->is_eos() || child->is_skip()) {
+        if (child->is_eos() | child->is_skip()) {
             merged = builder_.make_interior_skip(new_skip);
             merged->as_skip()->eos_ptr = get_eos_ptr(child);
             set_eos_ptr(child, nullptr);
