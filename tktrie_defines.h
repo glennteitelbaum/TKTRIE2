@@ -243,6 +243,16 @@ public:
     }
     
     template <bool THREADED>
+    bool atomic_test(unsigned char c) const noexcept {
+        if constexpr (THREADED) {
+            uint64_t val = reinterpret_cast<const std::atomic<uint64_t>*>(&bits_[c >> 6])->load(std::memory_order_acquire);
+            return (val & (1ULL << (c & 63))) != 0;
+        } else {
+            return test(c);
+        }
+    }
+    
+    template <bool THREADED>
     void atomic_set(unsigned char c) noexcept {
         if constexpr (THREADED)
             reinterpret_cast<std::atomic<uint64_t>*>(&bits_[c >> 6])->fetch_or(1ULL << (c & 63), std::memory_order_release);

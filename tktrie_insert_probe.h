@@ -73,7 +73,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
         return info;
     }
     // FULL
-    info.op = n->as_full()->valid.test(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
+    info.op = n->as_full()->valid.template atomic_test<THREADED>(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
     return info;
 }
 
@@ -394,7 +394,7 @@ bool TKTRIE_CLASS::commit_speculative(
             return true;
         }
         // FULL
-        if (n->as_full()->valid.test(c)) return false;
+        if (n->as_full()->valid.template atomic_test<THREADED>(c)) return false;
         n->bump_version();
         n->as_full()->valid.template atomic_set<THREADED>(c);
         n->as_full()->construct_leaf_value(c, value);
@@ -431,7 +431,7 @@ bool TKTRIE_CLASS::commit_speculative(
             return true;
         }
         if (n->is_full()) {
-            if (n->as_full()->valid.test(c)) return false;
+            if (n->as_full()->valid.template atomic_test<THREADED>(c)) return false;
             n->bump_version();
             n->as_full()->template add_child_atomic<THREADED>(c, child);
             return true;
@@ -487,7 +487,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, std::string(kb), value), true};
     } else {
-        ebr_global::instance().try_reclaim();
+        // Batch try_reclaim - only every 1024 operations per thread
+        thread_local uint32_t reclaim_counter = 0;
+        if ((++reclaim_counter & 0x3FF) == 0) {
+            ebr_global::instance().try_reclaim();
+        }
+        
         auto& slot = get_ebr_slot();
         
         while (true) {
@@ -495,55 +500,102 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             speculative_info spec = probe_speculative(root_.load(), kb);
 
             if (spec.op == spec_op::EXISTS) {
-                return {find(key), false};
+                return {iterator(this, std::string(kb), value), false};
             }
 
-            if ((spec.op == spec_op::IN_PLACE_LEAF) | (spec.op == spec_op::IN_PLACE_INTERIOR)) {
-                pre_alloc alloc = allocate_speculative(spec, value);
-                {
-                    std::lock_guard<mutex_t> lock(mutex_);
-                    if (!validate_path(spec)) { dealloc_speculation(alloc); continue; }
-                    if (commit_speculative(spec, alloc, value)) {
-                        size_.fetch_add(1);
-                        return {iterator(this, std::string(kb), value), true};
-                    }
-                }
-                dealloc_speculation(alloc);
-                continue;
-            }
-
-            pre_alloc alloc = allocate_speculative(spec, value);
-            {
+            // Fast path for IN_PLACE operations - no allocation needed
+            if (spec.op == spec_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
-                if (!validate_path(spec)) { dealloc_speculation(alloc); continue; }
-                if (alloc.root_replacement && commit_speculative(spec, alloc, value)) {
-                    if (spec.target) retire_node(spec.target);
+                if (!validate_path(spec)) continue;
+                
+                ptr_t n = spec.target;
+                unsigned char c = spec.c;
+                
+                if (n->is_list()) {
+                    if (n->as_list()->chars.find(c) >= 0) continue;  // Now exists
+                    if (n->as_list()->chars.count() >= LIST_MAX) {
+                        // Need to convert to FULL - fall through to slow path
+                        goto slow_path;
+                    }
+                    n->bump_version();
+                    int idx = n->as_list()->chars.add(c);
+                    n->as_list()->construct_leaf_value(idx, value);
+                } else {
+                    if (n->as_full()->valid.template atomic_test<THREADED>(c)) continue;  // Now exists
+                    n->bump_version();
+                    n->as_full()->valid.template atomic_set<THREADED>(c);
+                    n->as_full()->construct_leaf_value(c, value);
+                }
+                size_.fetch_add(1);
+                return {iterator(this, std::string(kb), value), true};
+            }
+
+            if (spec.op == spec_op::IN_PLACE_INTERIOR) {
+                if (spec.is_eos) {
+                    // Adding EOS to interior node
+                    T* new_eos = new T(value);
+                    std::lock_guard<mutex_t> lock(mutex_);
+                    if (!validate_path(spec)) { delete new_eos; continue; }
+                    
+                    ptr_t n = spec.target;
+                    if (get_eos_ptr(n)) { delete new_eos; continue; }  // Now exists
+                    
+                    n->bump_version();
+                    set_eos_ptr(n, new_eos);
+                    size_.fetch_add(1);
+                    return {iterator(this, std::string(kb), value), true};
+                } else {
+                    // Adding child to interior node
+                    ptr_t child = create_leaf_for_key(spec.remaining_key, value);
+                    std::lock_guard<mutex_t> lock(mutex_);
+                    if (!validate_path(spec)) { builder_.dealloc_node(child); continue; }
+                    
+                    ptr_t n = spec.target;
+                    unsigned char c = spec.c;
+                    
+                    if (n->is_list()) {
+                        if (n->as_list()->chars.find(c) >= 0) { builder_.dealloc_node(child); continue; }
+                        if (n->as_list()->chars.count() >= LIST_MAX) {
+                            builder_.dealloc_node(child);
+                            goto slow_path;
+                        }
+                        n->bump_version();
+                        int idx = n->as_list()->chars.add(c);
+                        n->as_list()->children[idx].store(child);
+                    } else if (n->is_full()) {
+                        if (n->as_full()->valid.template atomic_test<THREADED>(c)) { builder_.dealloc_node(child); continue; }
+                        n->bump_version();
+                        n->as_full()->valid.template atomic_set<THREADED>(c);
+                        n->as_full()->children[c].store(child);
+                    } else {
+                        builder_.dealloc_node(child);
+                        goto slow_path;
+                    }
                     size_.fetch_add(1);
                     return {iterator(this, std::string(kb), value), true};
                 }
-
-                if ((spec.op == spec_op::ADD_EOS_LEAF_LIST) |
-                    (spec.op == spec_op::DEMOTE_LEAF_LIST) |
-                    (spec.op == spec_op::SPLIT_INTERIOR) |
-                    (spec.op == spec_op::PREFIX_INTERIOR) |
-                    (spec.op == spec_op::ADD_CHILD_CONVERT)) {
-
-                    dealloc_speculation(alloc);
-                    if (validate_path(spec)) {
-                        ptr_t root = root_.load();
-                        auto res = insert_impl(&root_, root, kb, value);
-                        if (!res.inserted) {
-                            for (auto* old : res.old_nodes) retire_node(old);
-                            return {find(key), false};
-                        }
-                        if (res.new_node) root_.store(res.new_node);
-                        for (auto* old : res.old_nodes) retire_node(old);
-                        size_.fetch_add(1);
-                        return {iterator(this, std::string(kb), value), true};
-                    }
-                }
             }
-            dealloc_speculation(alloc);
+
+            slow_path:
+            // Slow path: need structural changes
+            {
+                std::lock_guard<mutex_t> lock(mutex_);
+                // Re-validate under lock
+                if (!validate_path(spec)) continue;
+                
+                ptr_t root = root_.load();
+                auto res = insert_impl(&root_, root, kb, value);
+                
+                if (!res.inserted) {
+                    for (auto* old : res.old_nodes) retire_node(old);
+                    return {iterator(this, std::string(kb), value), false};
+                }
+                
+                if (res.new_node) root_.store(res.new_node);
+                for (auto* old : res.old_nodes) retire_node(old);
+                size_.fetch_add(1);
+                return {iterator(this, std::string(kb), value), true};
+            }
         }
     }
 }

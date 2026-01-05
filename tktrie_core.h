@@ -63,7 +63,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
         int idx = n->as_list()->chars.find(c);
         return idx >= 0 ? n->as_list()->children[idx].load() : nullptr;
     }
-    if (n->is_full() && n->as_full()->valid.test(c)) {
+    if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
         return n->as_full()->children[c].load();
     }
     return nullptr;
@@ -75,7 +75,7 @@ typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigne
         int idx = n->as_list()->chars.find(c);
         return idx >= 0 ? &n->as_list()->children[idx] : nullptr;
     }
-    if (n->is_full() && n->as_full()->valid.test(c)) {
+    if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
         return &n->as_full()->children[c];
     }
     return nullptr;
@@ -135,7 +135,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
         return true;
     }
     // FULL
-    if (!leaf->as_full()->valid.test(c)) return false;
+    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return false;
     out = leaf->as_full()->leaf_values[c];
     return true;
 }

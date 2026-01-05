@@ -25,17 +25,20 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
         size_.fetch_sub(1);
         return true;
     } else {
-        ebr_global::instance().try_reclaim();
+        // Batch try_reclaim - only every 1024 operations per thread
+        thread_local uint32_t reclaim_counter = 0;
+        if ((++reclaim_counter & 0x3FF) == 0) {
+            ebr_global::instance().try_reclaim();
+        }
+        
         auto& ebr_slot_ref = get_ebr_slot();
         
         while (true) {
             auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
-            if (info.op != erase_op::NOT_FOUND) {
-                capture_parent_collapse_info(info);
-            }
 
             if (info.op == erase_op::NOT_FOUND) {
+                // Re-check under lock to confirm
                 std::lock_guard<mutex_t> lock(mutex_);
                 ptr_t root = root_.load();
                 auto res = erase_impl(&root_, root, kb);
@@ -47,84 +50,46 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return true;
             }
 
-            // IN_PLACE operations
-            if ((info.op == erase_op::IN_PLACE_LEAF_LIST) |
-                (info.op == erase_op::IN_PLACE_LEAF_FULL) |
-                (info.op == erase_op::IN_PLACE_INTERIOR_LIST) |
-                (info.op == erase_op::IN_PLACE_INTERIOR_FULL)) {
-
+            // Fast path: IN_PLACE operations - direct modification
+            if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
                 std::lock_guard<mutex_t> lock(mutex_);
-                erase_spec_info locked_info = probe_erase(root_.load(), kb);
-                
-                if (locked_info.op == erase_op::NOT_FOUND) return false;
-                
-                if ((locked_info.op == erase_op::IN_PLACE_LEAF_LIST) |
-                    (locked_info.op == erase_op::IN_PLACE_LEAF_FULL) |
-                    (locked_info.op == erase_op::IN_PLACE_INTERIOR_LIST) |
-                    (locked_info.op == erase_op::IN_PLACE_INTERIOR_FULL)) {
-                    
-                    bool success = false;
-                    switch (locked_info.op) {
-                        case erase_op::IN_PLACE_LEAF_LIST:
-                            success = do_inplace_leaf_list_erase(locked_info.target, locked_info.c, locked_info.target_version);
-                            break;
-                        case erase_op::IN_PLACE_LEAF_FULL:
-                            success = do_inplace_leaf_full_erase(locked_info.target, locked_info.c, locked_info.target_version);
-                            break;
-                        case erase_op::IN_PLACE_INTERIOR_LIST:
-                            success = do_inplace_interior_list_erase(locked_info.target, locked_info.c, locked_info.target_version);
-                            break;
-                        case erase_op::IN_PLACE_INTERIOR_FULL:
-                            success = do_inplace_interior_full_erase(locked_info.target, locked_info.c, locked_info.target_version);
-                            break;
-                        default: break;
-                    }
-
-                    if (success) { size_.fetch_sub(1); return true; }
-                    continue;
+                if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
+                    size_.fetch_sub(1);
+                    return true;
                 }
-                
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) root_.store(nullptr);
-                else if (res.new_node) root_.store(res.new_node);
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_sub(1);
-                return true;
+                continue;
             }
-
-            // DELETE_LEAF_* operations
-            if ((info.op == erase_op::DELETE_LEAF_EOS) |
-                (info.op == erase_op::DELETE_LEAF_SKIP) |
-                (info.op == erase_op::DELETE_LAST_LEAF_LIST)) {
-
-                erase_pre_alloc alloc = allocate_erase_speculative(info);
+            
+            if (info.op == erase_op::IN_PLACE_LEAF_FULL) {
                 std::lock_guard<mutex_t> lock(mutex_);
-                erase_spec_info locked_info = probe_erase(root_.load(), kb);
-                
-                if (locked_info.op == erase_op::NOT_FOUND) {
-                    dealloc_erase_speculation(alloc);
-                    return false;
+                if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
+                    size_.fetch_sub(1);
+                    return true;
                 }
-                
-                dealloc_erase_speculation(alloc);
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) root_.store(nullptr);
-                else if (res.new_node) root_.store(res.new_node);
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_sub(1);
-                return true;
+                continue;
+            }
+            
+            if (info.op == erase_op::IN_PLACE_INTERIOR_LIST) {
+                std::lock_guard<mutex_t> lock(mutex_);
+                if (do_inplace_interior_list_erase(info.target, info.c, info.target_version)) {
+                    size_.fetch_sub(1);
+                    return true;
+                }
+                continue;
+            }
+            
+            if (info.op == erase_op::IN_PLACE_INTERIOR_FULL) {
+                std::lock_guard<mutex_t> lock(mutex_);
+                if (do_inplace_interior_full_erase(info.target, info.c, info.target_version)) {
+                    size_.fetch_sub(1);
+                    return true;
+                }
+                continue;
             }
 
-            // DELETE_EOS_INTERIOR or COLLAPSE_AFTER_REMOVE
+            // Slow path: structural changes needed
             {
                 std::lock_guard<mutex_t> lock(mutex_);
-                erase_spec_info locked_info = probe_erase(root_.load(), kb);
-                if (locked_info.op == erase_op::NOT_FOUND) return false;
-                
                 ptr_t root = root_.load();
                 auto res = erase_impl(&root_, root, kb);
                 if (!res.erased) return false;
@@ -186,7 +151,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     }
 
     // FULL
-    if (!leaf->as_full()->valid.test(c)) return res;
+    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return res;
     leaf->bump_version();
     leaf->as_full()->template remove_leaf_entry<THREADED>(c);
     res.erased = true;
@@ -276,7 +241,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         int idx = n->as_list()->chars.find(removed_c);
         if (idx >= 0) remaining--;
     } else if (n->is_full()) {
-        if (n->as_full()->valid.test(removed_c)) remaining--;
+        if (n->as_full()->valid.template atomic_test<THREADED>(removed_c)) remaining--;
     }
 
     if ((!eos) & (remaining == 0)) {

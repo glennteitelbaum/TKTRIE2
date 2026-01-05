@@ -298,7 +298,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
     }
 
     // FULL
-    if (leaf->as_full()->valid.test(c)) return res;
+    if (leaf->as_full()->valid.template atomic_test<THREADED>(c)) return res;
     leaf->as_full()->template add_leaf_entry_atomic<THREADED>(c, value);
     res.in_place = true;
     res.inserted = true;
@@ -355,7 +355,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             interior->as_full()->add_child(c, child);
         });
 
-        if (interior->as_full()->valid.test(first_c)) {
+        if (interior->as_full()->valid.template atomic_test<THREADED>(first_c)) {
             ptr_t child = interior->as_full()->children[first_c].load();
             auto child_res = insert_impl(&interior->as_full()->children[first_c], child, key.substr(1), value);
             if (child_res.new_node) {

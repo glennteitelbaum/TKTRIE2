@@ -43,7 +43,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
         return info;
     }
 
-    if (!n->as_full()->valid.test(c)) { info.op = erase_op::NOT_FOUND; return info; }
+    if (!n->as_full()->valid.template atomic_test<THREADED>(c)) { info.op = erase_op::NOT_FOUND; return info; }
     info.op = erase_op::IN_PLACE_LEAF_FULL;
     return info;
 }
@@ -143,7 +143,7 @@ void TKTRIE_CLASS::capture_parent_collapse_info(erase_spec_info& info) const noe
     } else if (parent->is_full()) {
         for (int i = 0; i < 256; ++i) {
             unsigned char ch = static_cast<unsigned char>(i);
-            if ((parent->as_full()->valid.test(ch)) & (ch != edge)) {
+            if ((parent->as_full()->valid.template atomic_test<THREADED>(ch)) & (ch != edge)) {
                 info.parent_collapse_char = ch;
                 info.parent_collapse_child = parent->as_full()->children[ch].load();
                 break;
@@ -180,12 +180,12 @@ bool TKTRIE_CLASS::check_collapse_needed(
             }
         }
     } else if (parent->is_full()) {
-        if (parent->as_full()->valid.test(removed_c)) remaining--;
+        if (parent->as_full()->valid.template atomic_test<THREADED>(removed_c)) remaining--;
         if (remaining != 1) return false;
 
         for (int i = 0; i < 256; ++i) {
             unsigned char ch = static_cast<unsigned char>(i);
-            if ((parent->as_full()->valid.test(ch)) & (ch != removed_c)) {
+            if ((parent->as_full()->valid.template atomic_test<THREADED>(ch)) & (ch != removed_c)) {
                 collapse_c = ch;
                 collapse_child = parent->as_full()->children[ch].load();
                 return collapse_child != nullptr;
@@ -301,7 +301,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint6
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
     if (leaf->version() != expected_version) return false;
-    if (!leaf->as_full()->valid.test(c)) return false;
+    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return false;
     leaf->bump_version();
     leaf->as_full()->template remove_leaf_entry<THREADED>(c);
     return true;
@@ -321,7 +321,7 @@ bool TKTRIE_CLASS::do_inplace_interior_list_erase(ptr_t n, unsigned char c, uint
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_interior_full_erase(ptr_t n, unsigned char c, uint64_t expected_version) {
     if (n->version() != expected_version) return false;
-    if (!n->as_full()->valid.test(c)) return false;
+    if (!n->as_full()->valid.template atomic_test<THREADED>(c)) return false;
     n->bump_version();
     n->as_full()->template remove_child<THREADED>(c);
     return true;
