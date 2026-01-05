@@ -177,6 +177,28 @@ struct list_node : node_base<T, THREADED, Allocator> {
     void destroy_leaf_value(int idx) {
         leaf_values[idx].~T();
     }
+    
+    // Helper to add a single child (for interior nodes)
+    void add_child(unsigned char c, typename base_t::ptr_t child) {
+        int idx = chars.add(c);
+        children[idx].store(child);
+    }
+    
+    // Helper to add two children at once (common in split operations)
+    void add_two_children(unsigned char c1, typename base_t::ptr_t child1,
+                          unsigned char c2, typename base_t::ptr_t child2) {
+        chars.add(c1);
+        chars.add(c2);
+        children[0].store(child1);
+        children[1].store(child2);
+    }
+    
+    // Helper to add a leaf value entry
+    int add_leaf_entry(unsigned char c, const T& value) {
+        int idx = chars.add(c);
+        construct_leaf_value(idx, value);
+        return idx;
+    }
 };
 
 // =============================================================================

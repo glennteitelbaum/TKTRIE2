@@ -207,10 +207,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::DEMOTE_LEAF_EOS: {
         ptr_t interior = builder_.make_interior_list("");
         interior->as_list()->eos_ptr = new T();
-        unsigned char c = static_cast<unsigned char>(key[0]);
         ptr_t child = create_leaf_for_key(key.substr(1), value);
-        interior->as_list()->chars.add(c);
-        interior->as_list()->children[0].store(child);
+        interior->as_list()->add_child(static_cast<unsigned char>(key[0]), child);
         alloc.root_replacement = interior;
         alloc.add(interior);
         alloc.add(child);
@@ -224,11 +222,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t interior = builder_.make_interior_list(common);
         ptr_t old_child = builder_.make_leaf_skip(skip.substr(m + 1), T{});
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-
-        interior->as_list()->chars.add(old_c);
-        interior->as_list()->chars.add(new_c);
-        interior->as_list()->children[0].store(old_child);
-        interior->as_list()->children[1].store(new_child);
+        interior->as_list()->add_two_children(old_c, old_child, new_c, new_child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -239,11 +233,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::PREFIX_LEAF_SKIP: {
         ptr_t interior = builder_.make_interior_list(std::string(key));
         interior->as_list()->eos_ptr = new T(value);
-
-        unsigned char c = static_cast<unsigned char>(skip[m]);
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), T{});
-        interior->as_list()->chars.add(c);
-        interior->as_list()->children[0].store(child);
+        interior->as_list()->add_child(static_cast<unsigned char>(skip[m]), child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -253,11 +244,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::EXTEND_LEAF_SKIP: {
         ptr_t interior = builder_.make_interior_list(std::string(skip));
         interior->as_list()->eos_ptr = new T();
-
-        unsigned char c = static_cast<unsigned char>(key[m]);
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->as_list()->chars.add(c);
-        interior->as_list()->children[0].store(child);
+        interior->as_list()->add_child(static_cast<unsigned char>(key[m]), child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -271,7 +259,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 
         ptr_t interior = builder_.make_interior_list(common);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-
+        // Note: children[0] will be set during commit with cloned old_child
         interior->as_list()->chars.add(old_c);
         interior->as_list()->chars.add(new_c);
         interior->as_list()->children[1].store(new_child);
@@ -284,9 +272,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::PREFIX_LEAF_LIST: {
         ptr_t interior = builder_.make_interior_list(std::string(key));
         interior->as_list()->eos_ptr = new T(value);
-
-        unsigned char c = static_cast<unsigned char>(skip[m]);
-        interior->as_list()->chars.add(c);
+        // Note: child[0] will be set during commit with cloned old_child
+        interior->as_list()->chars.add(static_cast<unsigned char>(skip[m]));
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -435,8 +422,7 @@ bool TKTRIE_CLASS::commit_speculative(
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
             n->bump_version();
-            int idx = n->as_list()->chars.add(c);
-            n->as_list()->construct_leaf_value(idx, value);
+            n->as_list()->add_leaf_entry(c, value);
             if (alloc.root_replacement) {
                 delete alloc.root_replacement->as_eos();
                 alloc.clear();
@@ -477,8 +463,7 @@ bool TKTRIE_CLASS::commit_speculative(
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
             n->bump_version();
-            int idx = n->as_list()->chars.add(c);
-            n->as_list()->children[idx].store(child);
+            n->as_list()->add_child(c, child);
             return true;
         }
         if (n->is_full()) {

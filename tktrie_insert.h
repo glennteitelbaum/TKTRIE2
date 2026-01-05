@@ -97,15 +97,11 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::create_leaf_for_key(std::string_view 
     if (key.empty()) return builder_.make_leaf_eos(value);
     if (key.size() == 1) {
         ptr_t leaf = builder_.make_leaf_list("");
-        unsigned char c = static_cast<unsigned char>(key[0]);
-        leaf->as_list()->chars.add(c);
-        leaf->as_list()->construct_leaf_value(0, value);
+        leaf->as_list()->add_leaf_entry(static_cast<unsigned char>(key[0]), value);
         return leaf;
     }
     ptr_t leaf = builder_.make_leaf_list(key.substr(0, key.size() - 1));
-    unsigned char c = static_cast<unsigned char>(key.back());
-    leaf->as_list()->chars.add(c);
-    leaf->as_list()->construct_leaf_value(0, value);
+    leaf->as_list()->add_leaf_entry(static_cast<unsigned char>(key.back()), value);
     return leaf;
 }
 
@@ -116,10 +112,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_eos(
     ptr_t interior = builder_.make_interior_list("");
     interior->as_list()->eos_ptr = new T(leaf->as_eos()->leaf_value);
 
-    unsigned char c = static_cast<unsigned char>(key[0]);
     ptr_t child = create_leaf_for_key(key.substr(1), value);
-    interior->as_list()->chars.add(c);
-    interior->as_list()->children[0].store(child);
+    interior->as_list()->add_child(static_cast<unsigned char>(key[0]), child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -140,11 +134,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
     ptr_t interior = builder_.make_interior_list(common);
     ptr_t old_child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->as_skip()->leaf_value);
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-
-    interior->as_list()->chars.add(old_c);
-    interior->as_list()->chars.add(new_c);
-    interior->as_list()->children[0].store(old_child);
-    interior->as_list()->children[1].store(new_child);
+    interior->as_list()->add_two_children(old_c, old_child, new_c, new_child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -161,10 +151,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
     ptr_t interior = builder_.make_interior_list(std::string(key));
     interior->as_list()->eos_ptr = new T(value);
 
-    unsigned char c = static_cast<unsigned char>(old_skip[m]);
     ptr_t child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->as_skip()->leaf_value);
-    interior->as_list()->chars.add(c);
-    interior->as_list()->children[0].store(child);
+    interior->as_list()->add_child(static_cast<unsigned char>(old_skip[m]), child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -181,10 +169,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     ptr_t interior = builder_.make_interior_list(std::string(old_skip));
     interior->as_list()->eos_ptr = new T(leaf->as_skip()->leaf_value);
 
-    unsigned char c = static_cast<unsigned char>(key[m]);
     ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->as_list()->chars.add(c);
-    interior->as_list()->children[0].store(child);
+    interior->as_list()->add_child(static_cast<unsigned char>(key[m]), child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -205,11 +191,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_list(
     ptr_t interior = builder_.make_interior_list(common);
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-
-    interior->as_list()->chars.add(old_c);
-    interior->as_list()->chars.add(new_c);
-    interior->as_list()->children[0].store(old_child);
-    interior->as_list()->children[1].store(new_child);
+    interior->as_list()->add_two_children(old_c, old_child, new_c, new_child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -226,10 +208,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_list(
     ptr_t interior = builder_.make_interior_list(std::string(key));
     interior->as_list()->eos_ptr = new T(value);
 
-    unsigned char c = static_cast<unsigned char>(old_skip[m]);
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
-    interior->as_list()->chars.add(c);
-    interior->as_list()->children[0].store(old_child);
+    interior->as_list()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -269,8 +249,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         for (int i = 0; i < cnt; ++i) {
             unsigned char c = leaf->as_list()->chars.char_at(i);
             ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
-            interior->as_list()->chars.add(c);
-            interior->as_list()->children[i].store(child);
+            interior->as_list()->add_child(c, child);
         }
         res.new_node = interior;
     } else {
@@ -295,12 +274,10 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
     insert_result res;
 
     if (leaf->is_list()) {
-        int idx = leaf->as_list()->chars.find(c);
-        if (idx >= 0) return res;
+        if (leaf->as_list()->chars.find(c) >= 0) return res;
 
         if (leaf->as_list()->chars.count() < LIST_MAX) {
-            idx = leaf->as_list()->chars.add(c);
-            leaf->as_list()->construct_leaf_value(idx, value);
+            leaf->as_list()->add_leaf_entry(c, value);
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -359,8 +336,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = leaf->as_list()->chars.char_at(i);
                 ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
-                interior->as_list()->chars.add(c);
-                interior->as_list()->children[i].store(child);
+                interior->as_list()->add_child(c, child);
             }
 
             if (existing_idx >= 0) {
@@ -372,8 +348,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
                 for (auto* old : child_res.old_nodes) res.old_nodes.push_back(old);
             } else {
                 ptr_t child = create_leaf_for_key(key.substr(1), value);
-                int idx = interior->as_list()->chars.add(first_c);
-                interior->as_list()->children[idx].store(child);
+                interior->as_list()->add_child(first_c, child);
             }
             res.new_node = interior;
         }
@@ -418,11 +393,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
     ptr_t new_int = builder_.make_interior_list(common);
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-
-    new_int->as_list()->chars.add(old_c);
-    new_int->as_list()->chars.add(new_c);
-    new_int->as_list()->children[0].store(old_child);
-    new_int->as_list()->children[1].store(new_child);
+    new_int->as_list()->add_two_children(old_c, old_child, new_c, new_child);
 
     res.new_node = new_int;
     res.old_nodes.push_back(n);
@@ -472,10 +443,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
     ptr_t new_int = builder_.make_interior_list(std::string(key));
     new_int->as_list()->eos_ptr = new T(value);
 
-    unsigned char c = static_cast<unsigned char>(old_skip[m]);
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
-    new_int->as_list()->chars.add(c);
-    new_int->as_list()->children[0].store(old_child);
+    new_int->as_list()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
 
     res.new_node = new_int;
     res.old_nodes.push_back(n);
@@ -503,8 +472,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 
     if (n->is_list()) {
         if (n->as_list()->chars.count() < LIST_MAX) {
-            int idx = n->as_list()->chars.add(c);
-            n->as_list()->children[idx].store(child);
+            n->as_list()->add_child(c, child);
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -540,8 +508,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     ptr_t list = builder_.make_interior_list(get_skip(n));
     list->as_list()->eos_ptr = get_eos_ptr(n);
     set_eos_ptr(n, nullptr);
-    list->as_list()->chars.add(c);
-    list->as_list()->children[0].store(child);
+    list->as_list()->add_child(c, child);
 
     res.new_node = list;
     res.old_nodes.push_back(n);
