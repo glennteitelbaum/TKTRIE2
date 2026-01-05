@@ -301,7 +301,7 @@ public:
     explicit operator bool() const { return valid_; }
 
     bool operator==(const tktrie_iterator& o) const {
-        if (!valid_ & !o.valid_) return true;
+        if ((!valid_) & (!o.valid_)) return true;
         return (valid_ == o.valid_) & (key_bytes_ == o.key_bytes_);
     }
     bool operator!=(const tktrie_iterator& o) const { return !(*this == o); }
@@ -1223,7 +1223,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
 
-        if (m < skip.size() && m < key.size()) {
+        if ((m < skip.size()) & (m < key.size())) {
             info.op = spec_op::SPLIT_INTERIOR;
             info.target = n;
             info.target_version = n->version();
@@ -1919,7 +1919,7 @@ void TKTRIE_CLASS::capture_parent_collapse_info(erase_spec_info& info) const noe
     } else if (parent->is_full()) {
         for (int i = 0; i < 256; ++i) {
             unsigned char ch = static_cast<unsigned char>(i);
-            if (parent->as_full()->valid.test(ch) && ch != edge) {
+            if ((parent->as_full()->valid.test(ch)) & (ch != edge)) {
                 info.parent_collapse_char = ch;
                 info.parent_collapse_child = parent->as_full()->children[ch].load();
                 break;
@@ -1963,7 +1963,7 @@ bool TKTRIE_CLASS::check_collapse_needed(
 
         for (int i = 0; i < 256; ++i) {
             unsigned char ch = static_cast<unsigned char>(i);
-            if (parent->as_full()->valid.test(ch) && ch != removed_c) {
+            if ((parent->as_full()->valid.test(ch)) & (ch != removed_c)) {
                 collapse_c = ch;
                 collapse_child = parent->as_full()->children[ch].load();
                 return collapse_child != nullptr;
@@ -2598,7 +2598,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (n->as_full()->valid.test(removed_c)) remaining--;
     }
 
-    if (!eos && remaining == 0) {
+    if ((!eos) & (remaining == 0)) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
         return res;
