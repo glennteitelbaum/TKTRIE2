@@ -69,6 +69,19 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
     return nullptr;
 }
 
+// Spin-wait version for sentinel-based synchronization
+TKTRIE_TEMPLATE
+typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child_spin(ptr_t n, unsigned char c) const noexcept {
+    if (n->is_list()) {
+        int idx = n->as_list()->chars.find(c);
+        return idx >= 0 ? n->as_list()->children[idx].load_spin() : nullptr;
+    }
+    if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
+        return n->as_full()->children[c].load_spin();
+    }
+    return nullptr;
+}
+
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigned char c) noexcept {
     if (n->is_list()) {
@@ -142,6 +155,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
 
 // -----------------------------------------------------------------------------
 // Optimistic read operations (lock-free fast path for THREADED mode)
+// Uses sentinel spin-wait + version validation for safe lock-free reads
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
@@ -167,7 +181,8 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = find_child(n, c);
+        // Use spin-wait load - will wait if writer has set sentinel
+        n = find_child_spin(n, c);
         if (!n) return false;
         
         // Record this node in path
@@ -279,20 +294,24 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     if constexpr (THREADED) {
-        // Optimistic read: try without EBR guard first
-        T dummy;
-        read_path path;
-        uint64_t epoch_before = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        ptr_t root = root_.load();
-        bool found = read_impl_optimistic(root, kb, dummy, path);
-        uint64_t epoch_after = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        
-        // If no epoch change and versions valid, result is trustworthy
-        if (epoch_before == epoch_after && validate_read_path(path)) {
-            return found;
+        // Lock-free read with sentinel spin-wait + version validation
+        // No EBR guards needed - sentinel protects active modifications,
+        // version validation catches races, EBR delays freeing
+        for (int attempts = 0; attempts < 10; ++attempts) {
+            T dummy;
+            read_path path;
+            ptr_t root = root_.load_spin();
+            if (!root) return false;
+            
+            bool found = read_impl_optimistic(root, kb, dummy, path);
+            
+            // Validate all versions unchanged
+            if (validate_read_path(path)) {
+                return found;
+            }
+            // Version mismatch - concurrent modification, retry
         }
-        
-        // Fall back to guarded read
+        // Too many retries - fall back to guarded read (shouldn't happen normally)
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
         return contains_impl(root_.load(), kb);
@@ -318,22 +337,24 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     auto kb = traits::to_bytes(key);
     T value;
     if constexpr (THREADED) {
-        // Optimistic read: try without EBR guard first
-        read_path path;
-        uint64_t epoch_before = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        ptr_t root = root_.load();
-        bool found = read_impl_optimistic(root, kb, value, path);
-        uint64_t epoch_after = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        
-        // If no epoch change and versions valid, result is trustworthy
-        if (epoch_before == epoch_after && validate_read_path(path)) {
-            if (found) {
-                return iterator(this, std::string(kb), value);
+        // Lock-free read with sentinel spin-wait + version validation
+        for (int attempts = 0; attempts < 10; ++attempts) {
+            read_path path;
+            ptr_t root = root_.load_spin();
+            if (!root) return end();
+            
+            bool found = read_impl_optimistic(root, kb, value, path);
+            
+            // Validate all versions unchanged
+            if (validate_read_path(path)) {
+                if (found) {
+                    return iterator(this, std::string(kb), value);
+                }
+                return end();
             }
-            return end();
+            // Version mismatch - concurrent modification, retry
         }
-        
-        // Fall back to guarded read
+        // Too many retries - fall back to guarded read
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
         if (read_impl(root_.load(), kb, value)) {

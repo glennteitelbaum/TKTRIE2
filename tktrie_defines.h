@@ -9,6 +9,7 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 
 #ifdef NDEBUG
@@ -88,6 +89,24 @@ public:
         if constexpr (THREADED) return value_.fetch_and(v, std::memory_order_acq_rel);
         else { T old = value_; value_ &= v; return old; }
     }
+    
+    // Spin-wait load that waits for sentinel to clear
+    // Only used in THREADED mode for pointer types
+    T load_spin() const noexcept {
+        if constexpr (THREADED) {
+            T v;
+            int spins = 0;
+            while (is_retry_sentinel(v = value_.load(std::memory_order_acquire))) {
+                if (++spins > 100) {
+                    std::this_thread::yield();
+                    spins = 0;
+                }
+            }
+            return v;
+        } else {
+            return value_;
+        }
+    }
 };
 
 // Convenience alias for size counters
@@ -110,6 +129,19 @@ static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | TYPE_MASK;
 static constexpr uint64_t VERSION_MASK = (1ULL << 61) - 1;
 
 static constexpr int LIST_MAX = 7;
+
+// Sentinel value indicating a slot is being modified - readers should spin
+static constexpr uintptr_t RETRY_SENTINEL_VALUE = 1;
+
+template <typename T>
+inline T* retry_sentinel() noexcept {
+    return reinterpret_cast<T*>(RETRY_SENTINEL_VALUE);
+}
+
+template <typename T>
+inline bool is_retry_sentinel(T* ptr) noexcept {
+    return reinterpret_cast<uintptr_t>(ptr) == RETRY_SENTINEL_VALUE;
+}
 
 inline constexpr uint64_t make_header(bool is_leaf, uint64_t type, uint64_t version = 0) noexcept {
     return (is_leaf ? FLAG_LEAF : 0) | type | (version & VERSION_MASK);

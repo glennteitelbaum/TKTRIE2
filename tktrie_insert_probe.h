@@ -310,6 +310,10 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::commit_to_slot(atomic_ptr* slot, ptr_t new_node, 
                                    const speculative_info& info) noexcept {
     if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
+    // Set sentinel to block readers, then store new value
+    if constexpr (THREADED) {
+        slot->store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+    }
     slot->store(new_node);
 }
 
@@ -591,7 +595,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     return {iterator(this, std::string(kb), value), false};
                 }
                 
-                if (res.new_node) root_.store(res.new_node);
+                if (res.new_node) {
+                    // Set sentinel to block readers, then store new root
+                    root_.store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+                    root_.store(res.new_node);
+                }
                 for (auto* old : res.old_nodes) retire_node(old);
                 size_.fetch_add(1);
                 return {iterator(this, std::string(kb), value), true};

@@ -81,6 +81,10 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
         atomic_ptr* child_slot = get_child_slot(n, c);
         auto child_res = insert_impl(child_slot, child, key, value);
         if (child_res.new_node && child_res.new_node != child) {
+            // Set sentinel to block readers, then store new value
+            if constexpr (THREADED) {
+                child_slot->store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+            }
             child_slot->store(child_res.new_node);
         }
         res.inserted = child_res.inserted;

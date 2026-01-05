@@ -204,6 +204,7 @@ private:
     // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
     ptr_t find_child(ptr_t n, unsigned char c) const noexcept;
+    ptr_t find_child_spin(ptr_t n, unsigned char c) const noexcept;
     atomic_ptr* get_child_slot(ptr_t n, unsigned char c) noexcept;
 
     // -------------------------------------------------------------------------

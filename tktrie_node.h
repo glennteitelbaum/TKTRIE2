@@ -32,6 +32,10 @@ struct atomic_node_ptr {
     
     ptr_t load() const noexcept { return ptr_.load(); }
     void store(ptr_t p) noexcept { ptr_.store(p); }
+    ptr_t exchange(ptr_t p) noexcept { return ptr_.exchange(p); }
+    
+    // Spin-wait load for sentinel-based synchronization
+    ptr_t load_spin() const noexcept { return ptr_.load_spin(); }
 };
 
 // =============================================================================
