@@ -96,6 +96,25 @@ public:
     };
 
     // -------------------------------------------------------------------------
+    // Optimistic read types (for lock-free reads)
+    // -------------------------------------------------------------------------
+    struct read_path {
+        static constexpr int MAX_DEPTH = 64;
+        ptr_t nodes[MAX_DEPTH];
+        uint64_t versions[MAX_DEPTH];
+        int len = 0;
+        
+        void clear() noexcept { len = 0; }
+        bool push(ptr_t n) noexcept {
+            if (len >= MAX_DEPTH) return false;
+            nodes[len] = n;
+            versions[len] = n->version();
+            ++len;
+            return true;
+        }
+    };
+
+    // -------------------------------------------------------------------------
     // Speculative insert types
     // -------------------------------------------------------------------------
     enum class spec_op {
@@ -193,6 +212,11 @@ private:
     bool read_impl(ptr_t n, std::string_view key, T& out) const noexcept;
     bool read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept;
     bool contains_impl(ptr_t n, std::string_view key) const noexcept;
+    
+    // Optimistic read operations (lock-free fast path)
+    bool read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept;
+    bool read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T& out, read_path& path) const noexcept;
+    bool validate_read_path(const read_path& path) const noexcept;
 
     // -------------------------------------------------------------------------
     // Insert operations

@@ -140,6 +140,81 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Optimistic read operations (lock-free fast path for THREADED mode)
+// -----------------------------------------------------------------------------
+
+TKTRIE_TEMPLATE
+bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept {
+    if (!n) return false;
+    
+    // Record root in path
+    if (!path.push(n)) return false;
+    
+    // Loop only on interior nodes
+    while (!n->is_leaf()) {
+        std::string_view skip = get_skip(n);
+        size_t m = match_skip_impl(skip, key);
+        if (m < skip.size()) return false;
+        key.remove_prefix(m);
+
+        if (key.empty()) {
+            T* p = get_eos_ptr(n);
+            if (p) { out = *p; return true; }
+            return false;
+        }
+
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        key.remove_prefix(1);
+
+        n = find_child(n, c);
+        if (!n) return false;
+        
+        // Record this node in path
+        if (!path.push(n)) return false;
+    }
+    
+    // n is now a leaf
+    return read_from_leaf_optimistic(n, key, out, path);
+}
+
+TKTRIE_TEMPLATE
+bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T& out, read_path& path) const noexcept {
+    std::string_view skip = get_skip(leaf);
+    size_t m = match_skip_impl(skip, key);
+    if (m < skip.size()) return false;
+    key.remove_prefix(m);
+
+    if (leaf->is_eos() | leaf->is_skip()) {
+        if (!key.empty()) return false;
+        out = leaf->is_eos() ? leaf->as_eos()->leaf_value : leaf->as_skip()->leaf_value;
+        return true;
+    }
+    if (key.size() != 1) return false;
+
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    if (leaf->is_list()) {
+        int idx = leaf->as_list()->chars.find(c);
+        if (idx < 0) return false;
+        out = leaf->as_list()->leaf_values[idx];
+        return true;
+    }
+    // FULL - use non-atomic test for optimistic read (we validate versions after)
+    if (!leaf->as_full()->valid.test(c)) return false;
+    out = leaf->as_full()->leaf_values[c];
+    return true;
+}
+
+TKTRIE_TEMPLATE
+bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
+    for (int i = 0; i < path.len; ++i) {
+        if (path.nodes[i]->version() != path.versions[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains_impl(ptr_t n, std::string_view key) const noexcept {
     T dummy;
@@ -204,6 +279,20 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     if constexpr (THREADED) {
+        // Optimistic read: try without EBR guard first
+        T dummy;
+        read_path path;
+        uint64_t epoch_before = ebr_slot::global_epoch().load(std::memory_order_acquire);
+        ptr_t root = root_.load();
+        bool found = read_impl_optimistic(root, kb, dummy, path);
+        uint64_t epoch_after = ebr_slot::global_epoch().load(std::memory_order_acquire);
+        
+        // If no epoch change and versions valid, result is trustworthy
+        if (epoch_before == epoch_after && validate_read_path(path)) {
+            return found;
+        }
+        
+        // Fall back to guarded read
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
         return contains_impl(root_.load(), kb);
@@ -229,6 +318,22 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     auto kb = traits::to_bytes(key);
     T value;
     if constexpr (THREADED) {
+        // Optimistic read: try without EBR guard first
+        read_path path;
+        uint64_t epoch_before = ebr_slot::global_epoch().load(std::memory_order_acquire);
+        ptr_t root = root_.load();
+        bool found = read_impl_optimistic(root, kb, value, path);
+        uint64_t epoch_after = ebr_slot::global_epoch().load(std::memory_order_acquire);
+        
+        // If no epoch change and versions valid, result is trustworthy
+        if (epoch_before == epoch_after && validate_read_path(path)) {
+            if (found) {
+                return iterator(this, std::string(kb), value);
+            }
+            return end();
+        }
+        
+        // Fall back to guarded read
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
         if (read_impl(root_.load(), kb, value)) {
