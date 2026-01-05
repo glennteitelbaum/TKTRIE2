@@ -69,17 +69,54 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
     return nullptr;
 }
 
-// Spin-wait version for sentinel-based synchronization
+// Hybrid spin-then-lock-wait version for sentinel-based synchronization
+// Returns (child_ptr, hit_sentinel) - if hit_sentinel, caller should reset path
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child_spin(ptr_t n, unsigned char c) const noexcept {
-    if (n->is_list()) {
-        int idx = n->as_list()->chars.find(c);
-        return idx >= 0 ? n->as_list()->children[idx].load_spin() : nullptr;
+std::pair<typename TKTRIE_CLASS::ptr_t, bool> TKTRIE_CLASS::find_child_wait(
+    ptr_t n, unsigned char c) const noexcept {
+    ptr_t child = nullptr;
+    bool hit_sentinel = false;
+    
+    auto reload_child = [&]() -> ptr_t {
+        if (n->is_list()) {
+            int idx = n->as_list()->chars.find(c);
+            return (idx >= 0) ? n->as_list()->children[idx].load() : nullptr;
+        } else if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
+            return n->as_full()->children[c].load();
+        }
+        return nullptr;
+    };
+    
+    child = reload_child();
+    if (!child) return {nullptr, false};
+    
+    // Check for sentinel - if hit, try spin then lock-wait
+    if constexpr (THREADED) {
+        if (is_retry_sentinel(child)) {
+            hit_sentinel = true;
+            
+            // Fast path: spin for a while (writer might be almost done)
+            for (int spin = 0; spin < 48; ++spin) {
+                child = reload_child();
+                if (!is_retry_sentinel(child)) {
+                    return {child, hit_sentinel};
+                }
+                // Pause instruction hint for spin-wait
+                #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                    __builtin_ia32_pause();
+                #elif defined(__aarch64__) || defined(_M_ARM64)
+                    asm volatile("yield" ::: "memory");
+                #endif
+            }
+            
+            // Slow path: still sentinel, block on writer's mutex
+            mutex_.lock();
+            mutex_.unlock();
+            child = reload_child();
+        }
     }
-    if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
-        return n->as_full()->children[c].load_spin();
-    }
-    return nullptr;
+    
+    return {child, hit_sentinel};
 }
 
 TKTRIE_TEMPLATE
@@ -155,7 +192,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
 
 // -----------------------------------------------------------------------------
 // Optimistic read operations (lock-free fast path for THREADED mode)
-// Uses sentinel spin-wait + version validation for safe lock-free reads
+// Uses sentinel wait + version validation for safe lock-free reads
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
@@ -181,11 +218,18 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        // Use spin-wait load - will wait if writer has set sentinel
-        n = find_child_spin(n, c);
-        if (!n) return false;
+        // Use wait-load - blocks on mutex if sentinel hit
+        auto [child, hit_sentinel] = find_child_wait(n, c);
+        if (!child) return false;
+        
+        if (hit_sentinel) {
+            // We synchronized with writer via mutex lock/unlock
+            // Clear old path - it's stale but we've synced
+            path.clear();
+        }
         
         // Record this node in path
+        n = child;
         if (!path.push(n)) return false;
     }
     
@@ -294,13 +338,30 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     if constexpr (THREADED) {
-        // Lock-free read with sentinel spin-wait + version validation
-        // No EBR guards needed - sentinel protects active modifications,
-        // version validation catches races, EBR delays freeing
+        // Lock-free read with hybrid sentinel handling + version validation
         for (int attempts = 0; attempts < 10; ++attempts) {
             T dummy;
             read_path path;
-            ptr_t root = root_.load_spin();
+            
+            // Load root, hybrid spin-then-lock on sentinel
+            ptr_t root = root_.load();
+            if (is_retry_sentinel(root)) {
+                // Fast path: spin for a while
+                for (int spin = 0; spin < 48; ++spin) {
+                    root = root_.load();
+                    if (!is_retry_sentinel(root)) goto root_ready;
+                    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                        __builtin_ia32_pause();
+                    #elif defined(__aarch64__) || defined(_M_ARM64)
+                        asm volatile("yield" ::: "memory");
+                    #endif
+                }
+                // Slow path: block on mutex
+                mutex_.lock();
+                mutex_.unlock();
+                root = root_.load();
+            }
+            root_ready:
             if (!root) return false;
             
             bool found = read_impl_optimistic(root, kb, dummy, path);
@@ -337,10 +398,29 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     auto kb = traits::to_bytes(key);
     T value;
     if constexpr (THREADED) {
-        // Lock-free read with sentinel spin-wait + version validation
+        // Lock-free read with hybrid sentinel handling + version validation
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
-            ptr_t root = root_.load_spin();
+            
+            // Load root, hybrid spin-then-lock on sentinel
+            ptr_t root = root_.load();
+            if (is_retry_sentinel(root)) {
+                // Fast path: spin for a while
+                for (int spin = 0; spin < 48; ++spin) {
+                    root = root_.load();
+                    if (!is_retry_sentinel(root)) goto root_ready;
+                    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                        __builtin_ia32_pause();
+                    #elif defined(__aarch64__) || defined(_M_ARM64)
+                        asm volatile("yield" ::: "memory");
+                    #endif
+                }
+                // Slow path: block on mutex
+                mutex_.lock();
+                mutex_.unlock();
+                root = root_.load();
+            }
+            root_ready:
             if (!root) return end();
             
             bool found = read_impl_optimistic(root, kb, value, path);

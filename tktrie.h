@@ -188,7 +188,7 @@ public:
 private:
     atomic_ptr root_;
     atomic_counter<THREADED> size_;
-    mutable mutex_t mutex_;
+    mutable mutex_t mutex_;  // mutable so const readers can lock for sentinel wait
     builder_t builder_;
 
     // -------------------------------------------------------------------------
@@ -204,7 +204,7 @@ private:
     // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
     ptr_t find_child(ptr_t n, unsigned char c) const noexcept;
-    ptr_t find_child_spin(ptr_t n, unsigned char c) const noexcept;
+    std::pair<ptr_t, bool> find_child_wait(ptr_t n, unsigned char c) const noexcept;
     atomic_ptr* get_child_slot(ptr_t n, unsigned char c) noexcept;
 
     // -------------------------------------------------------------------------

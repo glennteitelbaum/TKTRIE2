@@ -89,24 +89,6 @@ public:
         if constexpr (THREADED) return value_.fetch_and(v, std::memory_order_acq_rel);
         else { T old = value_; value_ &= v; return old; }
     }
-    
-    // Spin-wait load that waits for sentinel to clear
-    // Only used in THREADED mode for pointer types
-    T load_spin() const noexcept {
-        if constexpr (THREADED) {
-            T v;
-            int spins = 0;
-            while (is_retry_sentinel(v = value_.load(std::memory_order_acquire))) {
-                if (++spins > 100) {
-                    std::this_thread::yield();
-                    spins = 0;
-                }
-            }
-            return v;
-        } else {
-            return value_;
-        }
-    }
 };
 
 // Convenience alias for size counters
