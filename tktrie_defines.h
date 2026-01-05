@@ -101,37 +101,54 @@ template <typename T>
 constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
 class small_list {
-    uint64_t data_ = 0;
+    // Use atomic to prevent torn reads in concurrent access
+    // Relaxed ordering is sufficient - correctness is ensured by version checks
+    std::atomic<uint64_t> data_{0};
 public:
     small_list() noexcept = default;
-    int count() const noexcept { return static_cast<int>((data_ >> 56) & 0xFF); }
+    
+    // Copy constructor/assignment for non-atomic copying
+    small_list(const small_list& o) noexcept : data_(o.data_.load(std::memory_order_relaxed)) {}
+    small_list& operator=(const small_list& o) noexcept {
+        data_.store(o.data_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+    
+    int count() const noexcept { 
+        return static_cast<int>((data_.load(std::memory_order_acquire) >> 56) & 0xFF); 
+    }
     unsigned char char_at(int i) const noexcept {
-        return static_cast<unsigned char>((data_ >> (i * 8)) & 0xFF);
+        return static_cast<unsigned char>((data_.load(std::memory_order_acquire) >> (i * 8)) & 0xFF);
     }
     
     int find(unsigned char c) const noexcept {
-        int n = count();
+        uint64_t d = data_.load(std::memory_order_acquire);
+        int n = static_cast<int>((d >> 56) & 0xFF);
         for (int i = 0; i < n; ++i) {
-            if (char_at(i) == c) return i;
+            if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
         }
         return -1;
     }
     
     int add(unsigned char c) noexcept {
-        int n = count();
-        data_ = (data_ & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
-                (static_cast<uint64_t>(n + 1) << 56);
+        uint64_t d = data_.load(std::memory_order_relaxed);
+        int n = static_cast<int>((d >> 56) & 0xFF);
+        d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
+            (static_cast<uint64_t>(n + 1) << 56);
+        data_.store(d, std::memory_order_release);  // Release to synchronize with readers
         return n;
     }
     void remove_at(int idx) noexcept {
-        int n = count();
+        uint64_t d = data_.load(std::memory_order_relaxed);
+        int n = static_cast<int>((d >> 56) & 0xFF);
         for (int i = idx; i < n - 1; ++i) {
-            unsigned char next = char_at(i + 1);
-            data_ &= ~(0xFFULL << (i * 8));
-            data_ |= (static_cast<uint64_t>(next) << (i * 8));
+            unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
+            d &= ~(0xFFULL << (i * 8));
+            d |= (static_cast<uint64_t>(next) << (i * 8));
         }
-        data_ = (data_ & ~(0xFFULL << ((n-1) * 8))) & ~(0xFFULL << 56);
-        data_ |= (static_cast<uint64_t>(n - 1) << 56);
+        d = (d & ~(0xFFULL << ((n-1) * 8))) & ~(0xFFULL << 56);
+        d |= (static_cast<uint64_t>(n - 1) << 56);
+        data_.store(d, std::memory_order_release);  // Release to synchronize with readers
     }
 };
 

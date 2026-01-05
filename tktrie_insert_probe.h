@@ -373,10 +373,11 @@ bool TKTRIE_CLASS::commit_speculative(
         
         *interior->as_list()->eos_ptr = info.target->as_eos()->leaf_value;
 
-        slot->store(interior);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(interior);
         return true;
     }
     case spec_op::SPLIT_LEAF_SKIP: {
@@ -391,10 +392,11 @@ bool TKTRIE_CLASS::commit_speculative(
         ptr_t old_child = interior->as_list()->children[0].load();
         old_child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
 
-        slot->store(interior);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(interior);
         return true;
     }
     case spec_op::PREFIX_LEAF_SKIP: {
@@ -409,10 +411,11 @@ bool TKTRIE_CLASS::commit_speculative(
         ptr_t child = interior->as_list()->children[0].load();
         child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
 
-        slot->store(interior);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(interior);
         return true;
     }
     case spec_op::EXTEND_LEAF_SKIP: {
@@ -426,10 +429,11 @@ bool TKTRIE_CLASS::commit_speculative(
         
         *interior->as_list()->eos_ptr = info.target->as_skip()->leaf_value;
 
-        slot->store(interior);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(interior);
         return true;
     }
     case spec_op::SPLIT_LEAF_LIST: {
@@ -447,10 +451,11 @@ bool TKTRIE_CLASS::commit_speculative(
         interior->as_list()->children[0].store(old_child);
         alloc.add(old_child);
 
-        slot->store(interior);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(interior);
         return true;
     }
     case spec_op::PREFIX_LEAF_LIST: {
@@ -468,10 +473,11 @@ bool TKTRIE_CLASS::commit_speculative(
         interior->as_list()->children[0].store(old_child);
         alloc.add(old_child);
 
-        slot->store(interior);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(interior);
         return true;
     }
     case spec_op::LIST_TO_FULL_LEAF: {
@@ -490,10 +496,11 @@ bool TKTRIE_CLASS::commit_speculative(
             full->as_full()->construct_leaf_value(ch, list->leaf_values[i]);
         }
 
-        slot->store(full);
+        // CRITICAL: Bump parent version BEFORE storing new child
         if (info.path_len > 1) {
             info.path[info.path_len - 2].node->bump_version();
         }
+        slot->store(full);
         return true;
     }
     case spec_op::IN_PLACE_LEAF: {
@@ -515,9 +522,11 @@ bool TKTRIE_CLASS::commit_speculative(
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
 
+            // CRITICAL: Bump version BEFORE modifying data
+            n->bump_version();
+            
             int idx = n->as_list()->chars.add(c);
             n->as_list()->construct_leaf_value(idx, value);
-            n->bump_version();
 
             // Clean up any pre-allocated nodes
             if (alloc.root_replacement) {
@@ -528,9 +537,12 @@ bool TKTRIE_CLASS::commit_speculative(
         }
         // FULL
         if (n->as_full()->valid.test(c)) return false;
+        
+        // CRITICAL: Bump version BEFORE modifying data
+        n->bump_version();
+        
         n->as_full()->valid.template atomic_set<THREADED>(c);
         n->as_full()->construct_leaf_value(c, value);
-        n->bump_version();
         return true;
     }
     case spec_op::IN_PLACE_INTERIOR: {
@@ -560,9 +572,12 @@ bool TKTRIE_CLASS::commit_speculative(
                 delete alloc.in_place_eos;
                 return false;
             }
+            
+            // CRITICAL: Bump version BEFORE modifying data
+            n->bump_version();
+            
             set_eos_ptr(n, alloc.in_place_eos);
             alloc.in_place_eos = nullptr;
-            n->bump_version();
             return true;
         }
 
@@ -573,16 +588,21 @@ bool TKTRIE_CLASS::commit_speculative(
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
 
+            // CRITICAL: Bump version BEFORE modifying data
+            n->bump_version();
+            
             int idx = n->as_list()->chars.add(c);
             n->as_list()->children[idx].store(child);
-            n->bump_version();
             return true;
         }
         if (n->is_full()) {
             if (n->as_full()->valid.test(c)) return false;
+            
+            // CRITICAL: Bump version BEFORE modifying data
+            n->bump_version();
+            
             n->as_full()->valid.template atomic_set<THREADED>(c);
             n->as_full()->children[c].store(child);
-            n->bump_version();
             return true;
         }
         return false;

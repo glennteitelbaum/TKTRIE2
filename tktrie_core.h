@@ -36,12 +36,22 @@ std::string_view TKTRIE_CLASS::get_skip(ptr_t n) noexcept {
 TKTRIE_TEMPLATE
 T* TKTRIE_CLASS::get_eos_ptr(ptr_t n) noexcept {
     if (n->is_leaf()) return nullptr;
-    return *reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
+    T** ptr_loc = reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
+    if constexpr (THREADED) {
+        return reinterpret_cast<std::atomic<T*>*>(ptr_loc)->load(std::memory_order_acquire);
+    } else {
+        return *ptr_loc;
+    }
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
-    *reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET) = p;
+    T** ptr_loc = reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
+    if constexpr (THREADED) {
+        reinterpret_cast<std::atomic<T*>*>(ptr_loc)->store(p, std::memory_order_release);
+    } else {
+        *ptr_loc = p;
+    }
 }
 
 // -----------------------------------------------------------------------------

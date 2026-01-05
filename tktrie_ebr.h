@@ -3,11 +3,14 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
-#include <unordered_set>
 #include <vector>
 #include <thread>
+#include <algorithm>
 
 namespace gteitelbaum {
+
+// Forward declaration
+class ebr_global;
 
 // =============================================================================
 // EBR_SLOT - per-thread epoch tracking
@@ -16,6 +19,7 @@ namespace gteitelbaum {
 class ebr_slot {
     std::atomic<uint64_t> epoch_{0};
     std::atomic<bool> active_{false};
+    std::atomic<bool> valid_{true};  // Set to false when slot is destroyed
     
 public:
     // RAII guard for reader critical sections
@@ -30,9 +34,13 @@ public:
         guard& operator=(guard&&) = delete;
     };
     
+    ebr_slot();
+    ~ebr_slot();
+    
     void enter() noexcept;
     void exit() noexcept;
     bool is_active() const noexcept;
+    bool is_valid() const noexcept;
     uint64_t epoch() const noexcept;
     guard get_guard();
     
@@ -60,22 +68,17 @@ private:
     
     ebr_global() = default;
     
-    uint64_t safe_epoch();
-    
 public:
-    ~ebr_global() { 
-        // Don't call force_reclaim_all - the tree's dealloc_node already freed
-        // the live nodes. Calling force_reclaim_all would try to free retired
-        // nodes that might overlap with nodes still in the tree.
-        // Accept the memory leak for now.
-    }
+    ~ebr_global();
     
     static ebr_global& instance();
+    void register_slot(ebr_slot* slot);
+    void unregister_slot(ebr_slot* slot);
     ebr_slot& get_slot();
     void retire(void* ptr, deleter_t deleter);
     void advance_epoch();
     void try_reclaim();
-    void force_reclaim_all();  // Force delete all retired nodes
+    void force_reclaim_all();
 };
 
 // Free function for convenience
@@ -101,9 +104,20 @@ inline ebr_slot::guard::guard(guard&& o) noexcept : slot_(o.slot_) {
 // EBR_SLOT DEFINITIONS
 // =============================================================================
 
+inline ebr_slot::ebr_slot() {
+    ebr_global::instance().register_slot(this);
+}
+
+inline ebr_slot::~ebr_slot() {
+    valid_.store(false, std::memory_order_release);
+    ebr_global::instance().unregister_slot(this);
+}
+
 inline void ebr_slot::enter() noexcept {
-    active_.store(true, std::memory_order_relaxed);
+    // CRITICAL: Store epoch FIRST, then set active
+    // This ensures that when safe_epoch() sees active=true, it will also see the updated epoch
     epoch_.store(global_epoch().load(std::memory_order_acquire), std::memory_order_release);
+    active_.store(true, std::memory_order_release);
 }
 
 inline void ebr_slot::exit() noexcept {
@@ -112,6 +126,10 @@ inline void ebr_slot::exit() noexcept {
 
 inline bool ebr_slot::is_active() const noexcept {
     return active_.load(std::memory_order_acquire);
+}
+
+inline bool ebr_slot::is_valid() const noexcept {
+    return valid_.load(std::memory_order_acquire);
 }
 
 inline uint64_t ebr_slot::epoch() const noexcept {
@@ -136,14 +154,30 @@ inline ebr_global& ebr_global::instance() {
     return inst;
 }
 
+inline ebr_global::~ebr_global() {
+    // Clean up any remaining retired nodes
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& r : retired_) {
+        r.deleter(r.ptr);
+    }
+    retired_.clear();
+}
+
+inline void ebr_global::register_slot(ebr_slot* slot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    slots_.push_back(slot);
+}
+
+inline void ebr_global::unregister_slot(ebr_slot* slot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = std::find(slots_.begin(), slots_.end(), slot);
+    if (it != slots_.end()) {
+        slots_.erase(it);
+    }
+}
+
 inline ebr_slot& ebr_global::get_slot() {
     thread_local ebr_slot slot;
-    thread_local bool registered = false;
-    if (!registered) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        slots_.push_back(&slot);
-        registered = true;
-    }
     return slot;
 }
 
@@ -173,14 +207,14 @@ inline void ebr_global::try_reclaim() {
     uint64_t ge = ebr_slot::global_epoch().load(std::memory_order_acquire);
     uint64_t safe = ge;
     for (auto* slot : slots_) {
-        if (slot->is_active()) {
+        // Only check valid slots (not being destroyed)
+        if (slot->is_valid() && slot->is_active()) {
             uint64_t se = slot->epoch();
             if (se < safe) safe = se;
         }
     }
     
     // Reclaim nodes retired before the safe epoch
-    // If r.epoch < safe, all threads have moved past that epoch
     for (auto& r : retired_) {
         if (r.epoch < safe) {
             r.deleter(r.ptr);
@@ -197,20 +231,6 @@ inline void ebr_global::force_reclaim_all() {
         r.deleter(r.ptr);
     }
     retired_.clear();
-}
-
-inline uint64_t ebr_global::safe_epoch() {
-    uint64_t ge = ebr_slot::global_epoch().load(std::memory_order_acquire);
-    uint64_t safe = ge;
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto* slot : slots_) {
-        if (slot->is_active()) {
-            uint64_t se = slot->epoch();
-            if (se < safe) safe = se;
-        }
-    }
-    return safe;
 }
 
 // =============================================================================

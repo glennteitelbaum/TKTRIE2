@@ -331,9 +331,11 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::fill_collapse_node(ptr_t merged, ptr_t child) {
     if (child->is_leaf()) {
         if (child->is_eos()) {
-            new (&merged->as_skip()->leaf_value) T(child->as_eos()->leaf_value);
+            // merged was created with make_leaf_skip which already constructed leaf_value
+            // Use assignment, not placement new
+            merged->as_skip()->leaf_value = child->as_eos()->leaf_value;
         } else if (child->is_skip()) {
-            new (&merged->as_skip()->leaf_value) T(child->as_skip()->leaf_value);
+            merged->as_skip()->leaf_value = child->as_skip()->leaf_value;
         } else if (child->is_list()) {
             merged->as_list()->chars = child->as_list()->chars;
             for (int i = 0; i < child->as_list()->chars.count(); ++i) {
@@ -352,16 +354,18 @@ void TKTRIE_CLASS::fill_collapse_node(ptr_t merged, ptr_t child) {
             merged->as_skip()->eos_ptr = get_eos_ptr(child);
             set_eos_ptr(child, nullptr);
         } else if (child->is_list()) {
-            merged->as_list()->eos_ptr = child->as_list()->eos_ptr;
-            child->as_list()->eos_ptr = nullptr;
+            // Use set_eos_ptr for atomic access when THREADED
+            set_eos_ptr(merged, get_eos_ptr(child));
+            set_eos_ptr(child, nullptr);
             merged->as_list()->chars = child->as_list()->chars;
             for (int i = 0; i < child->as_list()->chars.count(); ++i) {
                 merged->as_list()->children[i].store(child->as_list()->children[i].load());
                 child->as_list()->children[i].store(nullptr);
             }
         } else {
-            merged->as_full()->eos_ptr = child->as_full()->eos_ptr;
-            child->as_full()->eos_ptr = nullptr;
+            // Use set_eos_ptr for atomic access when THREADED
+            set_eos_ptr(merged, get_eos_ptr(child));
+            set_eos_ptr(child, nullptr);
             merged->as_full()->valid = child->as_full()->valid;
             for (int i = 0; i < 256; ++i) {
                 if (child->as_full()->valid.test(static_cast<unsigned char>(i))) {
@@ -414,6 +418,9 @@ bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint6
     int count = leaf->as_list()->chars.count();
     if (count <= 1) return false;
 
+    // CRITICAL: Bump version BEFORE modifying data
+    leaf->bump_version();
+    
     // Shift values down
     for (int i = idx; i < count - 1; ++i) {
         leaf->as_list()->leaf_values[i] = leaf->as_list()->leaf_values[i + 1];
@@ -421,7 +428,6 @@ bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint6
     // Destroy the last element that's now extra
     leaf->as_list()->destroy_leaf_value(count - 1);
     leaf->as_list()->chars.remove_at(idx);
-    leaf->bump_version();
     return true;
 }
 
@@ -431,9 +437,12 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
     if (leaf->version() != expected_version) return false;
     
     if (!leaf->as_full()->valid.test(c)) return false;
+    
+    // CRITICAL: Bump version BEFORE modifying data
+    leaf->bump_version();
+    
     leaf->as_full()->destroy_leaf_value(c);
     leaf->as_full()->valid.template atomic_clear<THREADED>(c);
-    leaf->bump_version();
     return true;
 }
 
@@ -445,13 +454,16 @@ bool TKTRIE_CLASS::do_inplace_interior_list_erase(ptr_t n, unsigned char c, uint
     int idx = n->as_list()->chars.find(c);
     if (idx < 0) return false;
 
+    // CRITICAL: Bump version BEFORE modifying data to signal readers
+    // This ensures any concurrent reader will see version change and retry
+    n->bump_version();
+    
     int count = n->as_list()->chars.count();
     for (int i = idx; i < count - 1; ++i) {
         n->as_list()->children[i].store(n->as_list()->children[i + 1].load());
     }
     n->as_list()->children[count - 1].store(nullptr);
     n->as_list()->chars.remove_at(idx);
-    n->bump_version();
     return true;
 }
 
@@ -461,9 +473,12 @@ bool TKTRIE_CLASS::do_inplace_interior_full_erase(ptr_t n, unsigned char c, uint
     if (n->version() != expected_version) return false;
     
     if (!n->as_full()->valid.test(c)) return false;
+    
+    // CRITICAL: Bump version BEFORE modifying data
+    n->bump_version();
+    
     n->as_full()->valid.template atomic_clear<THREADED>(c);
     n->as_full()->children[c].store(nullptr);
-    n->bump_version();
     return true;
 }
 
