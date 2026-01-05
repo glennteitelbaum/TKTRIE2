@@ -59,6 +59,7 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
 
             // =================================================================
             // IN_PLACE operations - simple modify in place
+            // Re-probe inside lock to ensure we see current tree state
             // =================================================================
             if ((info.op == erase_op::IN_PLACE_LEAF_LIST) |
                 (info.op == erase_op::IN_PLACE_LEAF_FULL) |
@@ -67,232 +68,141 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
 
                 std::lock_guard<mutex_t> lock(mutex_);
 
-                if (!validate_erase_path(info)) continue;
-
-                bool success = false;
-                switch (info.op) {
-                    case erase_op::IN_PLACE_LEAF_LIST:
-                        success = do_inplace_leaf_list_erase(info.target, info.c, info.target_version);
-                        break;
-                    case erase_op::IN_PLACE_LEAF_FULL:
-                        success = do_inplace_leaf_full_erase(info.target, info.c, info.target_version);
-                        break;
-                    case erase_op::IN_PLACE_INTERIOR_LIST:
-                        success = do_inplace_interior_list_erase(info.target, info.c, info.target_version);
-                        break;
-                    case erase_op::IN_PLACE_INTERIOR_FULL:
-                        success = do_inplace_interior_full_erase(info.target, info.c, info.target_version);
-                        break;
-                    default:
-                        break;
+                // Re-probe inside lock to get current state
+                erase_spec_info locked_info = probe_erase(root_.load(), kb);
+                
+                // If operation type changed, handle appropriately
+                if (locked_info.op == erase_op::NOT_FOUND) {
+                    return false;  // Key no longer exists
                 }
+                
+                // If still in-place, do it with fresh info
+                if ((locked_info.op == erase_op::IN_PLACE_LEAF_LIST) |
+                    (locked_info.op == erase_op::IN_PLACE_LEAF_FULL) |
+                    (locked_info.op == erase_op::IN_PLACE_INTERIOR_LIST) |
+                    (locked_info.op == erase_op::IN_PLACE_INTERIOR_FULL)) {
+                    
+                    bool success = false;
+                    switch (locked_info.op) {
+                        case erase_op::IN_PLACE_LEAF_LIST:
+                            success = do_inplace_leaf_list_erase(locked_info.target, locked_info.c, locked_info.target_version);
+                            break;
+                        case erase_op::IN_PLACE_LEAF_FULL:
+                            success = do_inplace_leaf_full_erase(locked_info.target, locked_info.c, locked_info.target_version);
+                            break;
+                        case erase_op::IN_PLACE_INTERIOR_LIST:
+                            success = do_inplace_interior_list_erase(locked_info.target, locked_info.c, locked_info.target_version);
+                            break;
+                        case erase_op::IN_PLACE_INTERIOR_FULL:
+                            success = do_inplace_interior_full_erase(locked_info.target, locked_info.c, locked_info.target_version);
+                            break;
+                        default:
+                            break;
+                    }
 
-                if (success) {
-                    size_.fetch_sub(1);
-                    return true;
+                    if (success) {
+                        size_.fetch_sub(1);
+                        return true;
+                    }
+                    // Shouldn't fail since we just probed under lock, but retry if it does
+                    continue;
                 }
-                continue;  // Version changed, retry
+                
+                // Operation type changed (e.g., became DELETE_LAST_LEAF_LIST)
+                // Fall through to handle with erase_impl
+                ptr_t root = root_.load();
+                auto res = erase_impl(&root_, root, kb);
+                if (!res.erased) return false;
+                if (res.deleted_subtree) root_.store(nullptr);
+                else if (res.new_node) root_.store(res.new_node);
+                for (auto* old : res.old_nodes) retire_node(old);
+                size_.fetch_sub(1);
+                return true;
             }
 
             // =================================================================
             // DELETE_LEAF_* - remove leaf node from parent
+            // Re-probe inside lock to ensure we see current tree state
             // =================================================================
             if ((info.op == erase_op::DELETE_LEAF_EOS) |
                 (info.op == erase_op::DELETE_LEAF_SKIP) |
                 (info.op == erase_op::DELETE_LAST_LEAF_LIST)) {
 
-                // Pre-allocate merge node if parent collapse is possible
+                // Pre-allocate merge node if parent collapse might be needed
                 erase_pre_alloc alloc = allocate_erase_speculative(info);
 
                 std::lock_guard<mutex_t> lock(mutex_);
 
-                if (!validate_erase_path(info)) {
+                // Re-probe inside lock to get current state
+                erase_spec_info locked_info = probe_erase(root_.load(), kb);
+                
+                if (locked_info.op == erase_op::NOT_FOUND) {
                     dealloc_erase_speculation(alloc);
-                    continue;
+                    return false;  // Key no longer exists
                 }
-
-                // Root deletion
-                if (info.path_len <= 1) {
-                    root_.store(nullptr);
-                    retire_node(info.target);
-                    size_.fetch_sub(1);
-                    dealloc_erase_speculation(alloc);
-                    return true;
-                }
-
-                ptr_t parent = info.path[info.path_len - 2].node;
-                unsigned char edge = info.path[info.path_len - 1].edge;
-
-                // Verify slot still points to target
-                atomic_ptr* slot_ptr = get_child_slot(parent, edge);
-                if (!slot_ptr || slot_ptr->load() != info.target) {
-                    dealloc_erase_speculation(alloc);
-                    continue;  // Slot changed, retry
-                }
-
-                // Check if we can do parent collapse
-                if (alloc.parent_merged && info.parent_collapse_child) {
-                    // Verify parent collapse child hasn't changed
-                    if (info.parent_collapse_child->version() != info.parent_collapse_child_version) {
-                        dealloc_erase_speculation(alloc);
-                        continue;
-                    }
-                    
-                    fill_collapse_node(alloc.parent_merged, info.parent_collapse_child);
-
-                    if (info.path_len <= 2) {
-                        root_.store(alloc.parent_merged);
-                    } else {
-                        ptr_t grandparent = info.path[info.path_len - 3].node;
-                        unsigned char parent_edge = info.path[info.path_len - 2].edge;
-                        atomic_ptr* gp_slot = get_child_slot(grandparent, parent_edge);
-                        if (gp_slot) {
-                            // CRITICAL: Bump version BEFORE storing new child
-                            grandparent->bump_version();
-                            gp_slot->store(alloc.parent_merged);
-                        }
-                    }
-                    retire_node(info.target);
-                    retire_node(parent);
-                    retire_node(info.parent_collapse_child);
-                    alloc.parent_merged = nullptr;
-                    size_.fetch_sub(1);
-                    dealloc_erase_speculation(alloc);
-                    return true;
-                }
-
-                // Simple removal from parent
-                bool removed = false;
-                if (parent->is_list()) {
-                    removed = do_inplace_interior_list_erase(parent, edge, info.path[info.path_len - 2].version);
-                } else if (parent->is_full()) {
-                    removed = do_inplace_interior_full_erase(parent, edge, info.path[info.path_len - 2].version);
-                }
-
-                if (!removed) {
-                    dealloc_erase_speculation(alloc);
-                    continue;  // Parent version changed, retry
-                }
-
-                retire_node(info.target);
-                size_.fetch_sub(1);
+                
+                // For simplicity, use erase_impl for the actual operation
+                // The pre-allocation was just an optimization attempt
                 dealloc_erase_speculation(alloc);
+                
+                ptr_t root = root_.load();
+                auto res = erase_impl(&root_, root, kb);
+                if (!res.erased) return false;
+                if (res.deleted_subtree) root_.store(nullptr);
+                else if (res.new_node) root_.store(res.new_node);
+                for (auto* old : res.old_nodes) retire_node(old);
+                size_.fetch_sub(1);
                 return true;
             }
 
             // =================================================================
             // DELETE_EOS_INTERIOR - remove eos value from interior node
+            // Re-probe inside lock to ensure we see current tree state
             // =================================================================
             if (info.op == erase_op::DELETE_EOS_INTERIOR) {
                 std::lock_guard<mutex_t> lock(mutex_);
 
-                if (!validate_erase_path(info)) continue;
-
-                // Re-verify eos_ptr exists
-                T* p = get_eos_ptr(info.target);
-                if (!p) continue;  // Already deleted, retry
-
-                // CRITICAL: Bump version BEFORE modifying data
-                info.target->bump_version();
+                // Re-probe inside lock to get current state
+                erase_spec_info locked_info = probe_erase(root_.load(), kb);
                 
-                // Delete the eos value
-                delete p;
-                set_eos_ptr(info.target, nullptr);
-
-                // Check if node needs cleanup (no children and no eos)
-                int child_cnt = info.target->child_count();
-                if (child_cnt == 0) {
-                    // Node is now empty - remove from parent
-                    if (info.path_len <= 1) {
-                        root_.store(nullptr);
-                        retire_node(info.target);
-                    } else {
-                        ptr_t parent = info.path[info.path_len - 2].node;
-                        unsigned char edge = info.path[info.path_len - 1].edge;
-                        
-                        // Remove from parent
-                        if (parent->is_list()) {
-                            do_inplace_interior_list_erase(parent, edge, parent->version());
-                        } else if (parent->is_full()) {
-                            do_inplace_interior_full_erase(parent, edge, parent->version());
-                        }
-                        retire_node(info.target);
-                    }
+                if (locked_info.op == erase_op::NOT_FOUND) {
+                    return false;  // Key no longer exists
                 }
-                // If child_cnt > 0, node stays in tree (just without eos value)
-
+                
+                // Use erase_impl for the actual operation
+                ptr_t root = root_.load();
+                auto res = erase_impl(&root_, root, kb);
+                if (!res.erased) return false;
+                if (res.deleted_subtree) root_.store(nullptr);
+                else if (res.new_node) root_.store(res.new_node);
+                for (auto* old : res.old_nodes) retire_node(old);
                 size_.fetch_sub(1);
                 return true;
             }
 
             // =================================================================
             // COLLAPSE_AFTER_REMOVE - remove eos and collapse with single child
+            // Re-probe inside lock to ensure we see current tree state
             // =================================================================
             if (info.op == erase_op::COLLAPSE_AFTER_REMOVE) {
-                erase_pre_alloc alloc = allocate_erase_speculative(info);
-                
-                if (!alloc.merged) {
-                    dealloc_erase_speculation(alloc);
-                    // Fall back to erase_impl for complex cases
-                    std::lock_guard<mutex_t> lock(mutex_);
-                    ptr_t root = root_.load();
-                    auto res = erase_impl(&root_, root, kb);
-                    if (!res.erased) return false;
-                    if (res.deleted_subtree) root_.store(nullptr);
-                    else if (res.new_node) root_.store(res.new_node);
-                    for (auto* old : res.old_nodes) retire_node(old);
-                    size_.fetch_sub(1);
-                    return true;
-                }
-
+                // Don't bother with pre-allocation since we'll re-probe anyway
                 std::lock_guard<mutex_t> lock(mutex_);
 
-                if (!validate_erase_path(info)) {
-                    dealloc_erase_speculation(alloc);
-                    continue;
-                }
-
-                // Verify collapse child hasn't changed
-                if (info.collapse_child->version() != info.collapse_child_version) {
-                    dealloc_erase_speculation(alloc);
-                    continue;
-                }
-
-                // Re-verify eos exists BEFORE any modifications
-                T* p = get_eos_ptr(info.target);
-                if (!p) {
-                    // Another thread already deleted it - retry to get correct result
-                    dealloc_erase_speculation(alloc);
-                    continue;
+                // Re-probe inside lock to get current state
+                erase_spec_info locked_info = probe_erase(root_.load(), kb);
+                
+                if (locked_info.op == erase_op::NOT_FOUND) {
+                    return false;  // Key no longer exists
                 }
                 
-                // CRITICAL: Bump target version BEFORE deleting eos
-                info.target->bump_version();
-                
-                delete p;
-                set_eos_ptr(info.target, nullptr);
-
-                // Fill and install merged node
-                fill_collapse_node(alloc.merged, info.collapse_child);
-
-                if (info.path_len <= 1) {
-                    root_.store(alloc.merged);
-                } else {
-                    ptr_t parent = info.path[info.path_len - 2].node;
-                    unsigned char edge = info.path[info.path_len - 1].edge;
-                    atomic_ptr* slot_ptr = get_child_slot(parent, edge);
-                    if (slot_ptr) {
-                        // CRITICAL: Bump version BEFORE storing new child
-                        parent->bump_version();
-                        slot_ptr->store(alloc.merged);
-                    }
-                }
-
-                retire_node(info.target);
-                retire_node(info.collapse_child);
-                alloc.merged = nullptr;
+                // Use erase_impl for the actual operation
+                ptr_t root = root_.load();
+                auto res = erase_impl(&root_, root, kb);
+                if (!res.erased) return false;
+                if (res.deleted_subtree) root_.store(nullptr);
+                else if (res.new_node) root_.store(res.new_node);
+                for (auto* old : res.old_nodes) retire_node(old);
                 size_.fetch_sub(1);
-                dealloc_erase_speculation(alloc);
                 return true;
             }
 
