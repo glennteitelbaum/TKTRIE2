@@ -258,8 +258,8 @@ bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T
         out = leaf->as_list()->leaf_values[idx];
         return true;
     }
-    // FULL - use non-atomic test for optimistic read (we validate versions after)
-    if (!leaf->as_full()->valid.test(c)) return false;
+    // FULL - must use atomic test to avoid data race with concurrent writers
+    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return false;
     out = leaf->as_full()->leaf_values[c];
     return true;
 }
