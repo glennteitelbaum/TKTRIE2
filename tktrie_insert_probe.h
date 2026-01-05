@@ -469,8 +469,7 @@ bool TKTRIE_CLASS::commit_speculative(
         if (n->is_full()) {
             if (n->as_full()->valid.test(c)) return false;
             n->bump_version();
-            n->as_full()->valid.template atomic_set<THREADED>(c);
-            n->as_full()->children[c].store(child);
+            n->as_full()->template add_child_atomic<THREADED>(c, child);
             return true;
         }
         return false;

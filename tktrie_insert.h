@@ -257,8 +257,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         interior->as_full()->eos_ptr = new T(value);
         leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
             ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
-            interior->as_full()->valid.set(c);
-            interior->as_full()->children[c].store(child);
+            interior->as_full()->add_child(c, child);
         });
         res.new_node = interior;
     }
@@ -300,8 +299,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
     // FULL
     if (leaf->as_full()->valid.test(c)) return res;
-    leaf->as_full()->valid.template atomic_set<THREADED>(c);
-    leaf->as_full()->construct_leaf_value(c, value);
+    leaf->as_full()->template add_leaf_entry_atomic<THREADED>(c, value);
     res.in_place = true;
     res.inserted = true;
     return res;
@@ -324,12 +322,10 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = leaf->as_list()->chars.char_at(i);
                 ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
-                interior->as_full()->valid.set(c);
-                interior->as_full()->children[c].store(child);
+                interior->as_full()->add_child(c, child);
             }
             ptr_t child = create_leaf_for_key(key.substr(1), value);
-            interior->as_full()->valid.set(first_c);
-            interior->as_full()->children[first_c].store(child);
+            interior->as_full()->add_child(first_c, child);
             res.new_node = interior;
         } else {
             ptr_t interior = builder_.make_interior_list(leaf_skip);
@@ -356,8 +352,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
         ptr_t interior = builder_.make_interior_full(leaf_skip);
         leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
             ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
-            interior->as_full()->valid.set(c);
-            interior->as_full()->children[c].store(child);
+            interior->as_full()->add_child(c, child);
         });
 
         if (interior->as_full()->valid.test(first_c)) {
@@ -369,8 +364,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             for (auto* old : child_res.old_nodes) res.old_nodes.push_back(old);
         } else {
             ptr_t child = create_leaf_for_key(key.substr(1), value);
-            interior->as_full()->valid.set(first_c);
-            interior->as_full()->children[first_c].store(child);
+            interior->as_full()->add_child(first_c, child);
         }
         res.new_node = interior;
     }
@@ -405,26 +399,12 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std::string_view new_skip) {
     if (n->is_list()) {
         ptr_t clone = builder_.make_interior_list(new_skip);
-        clone->as_list()->chars = n->as_list()->chars;
-        clone->as_list()->eos_ptr = n->as_list()->eos_ptr;
-        n->as_list()->eos_ptr = nullptr;
-        for (int i = 0; i < n->as_list()->chars.count(); ++i) {
-            clone->as_list()->children[i].store(n->as_list()->children[i].load());
-            n->as_list()->children[i].store(nullptr);
-        }
+        n->as_list()->move_interior_to(clone->as_list());
         return clone;
     }
     if (n->is_full()) {
         ptr_t clone = builder_.make_interior_full(new_skip);
-        clone->as_full()->valid = n->as_full()->valid;
-        clone->as_full()->eos_ptr = n->as_full()->eos_ptr;
-        n->as_full()->eos_ptr = nullptr;
-        for (int c = 0; c < 256; ++c) {
-            if (n->as_full()->valid.test(static_cast<unsigned char>(c))) {
-                clone->as_full()->children[c].store(n->as_full()->children[c].load());
-                n->as_full()->children[c].store(nullptr);
-            }
-        }
+        n->as_full()->move_interior_to(clone->as_full());
         return clone;
     }
     // EOS or SKIP
@@ -479,16 +459,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         }
         // Convert to FULL
         ptr_t full = builder_.make_interior_full(n->as_list()->skip);
-        full->as_full()->eos_ptr = n->as_list()->eos_ptr;
-        n->as_list()->eos_ptr = nullptr;
-        for (int i = 0; i < n->as_list()->chars.count(); ++i) {
-            unsigned char ch = n->as_list()->chars.char_at(i);
-            full->as_full()->valid.set(ch);
-            full->as_full()->children[ch].store(n->as_list()->children[i].load());
-            n->as_list()->children[i].store(nullptr);
-        }
-        full->as_full()->valid.set(c);
-        full->as_full()->children[c].store(child);
+        n->as_list()->move_interior_to_full(full->as_full());
+        full->as_full()->add_child(c, child);
 
         res.new_node = full;
         res.old_nodes.push_back(n);
@@ -497,8 +469,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     }
 
     if (n->is_full()) {
-        n->as_full()->valid.template atomic_set<THREADED>(c);
-        n->as_full()->children[c].store(child);
+        n->as_full()->template add_child_atomic<THREADED>(c, child);
         res.in_place = true;
         res.inserted = true;
         return res;

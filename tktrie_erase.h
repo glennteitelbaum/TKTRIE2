@@ -180,11 +180,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         }
 
         leaf->bump_version();
-        for (int i = idx; i < count - 1; ++i) {
-            leaf->as_list()->leaf_values[i] = leaf->as_list()->leaf_values[i + 1];
-        }
-        leaf->as_list()->destroy_leaf_value(count - 1);
-        leaf->as_list()->chars.remove_at(idx);
+        leaf->as_list()->shift_leaf_values_down(idx);
         res.erased = true;
         return res;
     }
@@ -192,8 +188,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     // FULL
     if (!leaf->as_full()->valid.test(c)) return res;
     leaf->bump_version();
-    leaf->as_full()->destroy_leaf_value(c);
-    leaf->as_full()->valid.template atomic_clear<THREADED>(c);
+    leaf->as_full()->template remove_leaf_entry<THREADED>(c);
     res.erased = true;
     return res;
 }
@@ -294,17 +289,11 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         int idx = n->as_list()->chars.find(removed_c);
         if (idx >= 0) {
             n->bump_version();
-            int count = n->as_list()->chars.count();
-            for (int i = idx; i < count - 1; ++i) {
-                n->as_list()->children[i].store(n->as_list()->children[i + 1].load());
-            }
-            n->as_list()->children[count - 1].store(nullptr);
-            n->as_list()->chars.remove_at(idx);
+            n->as_list()->shift_children_down(idx);
         }
     } else if (n->is_full()) {
         n->bump_version();
-        n->as_full()->valid.template atomic_clear<THREADED>(removed_c);
-        n->as_full()->children[removed_c].store(nullptr);
+        n->as_full()->template remove_child<THREADED>(removed_c);
     }
 
     bool can_collapse = false;
@@ -344,16 +333,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             merged = builder_.make_leaf_skip(new_skip, val);
         } else if (child->is_list()) {
             merged = builder_.make_leaf_list(new_skip);
-            merged->as_list()->chars = child->as_list()->chars;
-            for (int i = 0; i < child->as_list()->chars.count(); ++i) {
-                merged->as_list()->construct_leaf_value(i, child->as_list()->leaf_values[i]);
-            }
+            child->as_list()->copy_leaf_values_to(merged->as_list());
         } else {
             merged = builder_.make_leaf_full(new_skip);
-            merged->as_full()->valid = child->as_full()->valid;
-            child->as_full()->valid.for_each_set([child, merged](unsigned char ch) {
-                merged->as_full()->construct_leaf_value(ch, child->as_full()->leaf_values[ch]);
-            });
+            child->as_full()->copy_leaf_values_to(merged->as_full());
         }
     } else {
         if (child->is_eos() | child->is_skip()) {
@@ -362,22 +345,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             set_eos_ptr(child, nullptr);
         } else if (child->is_list()) {
             merged = builder_.make_interior_list(new_skip);
-            set_eos_ptr(merged, get_eos_ptr(child));
-            set_eos_ptr(child, nullptr);
-            merged->as_list()->chars = child->as_list()->chars;
-            for (int i = 0; i < child->as_list()->chars.count(); ++i) {
-                merged->as_list()->children[i].store(child->as_list()->children[i].load());
-                child->as_list()->children[i].store(nullptr);
-            }
+            child->as_list()->move_interior_to(merged->as_list());
         } else {
             merged = builder_.make_interior_full(new_skip);
-            set_eos_ptr(merged, get_eos_ptr(child));
-            set_eos_ptr(child, nullptr);
-            merged->as_full()->valid = child->as_full()->valid;
-            child->as_full()->valid.for_each_set([child, merged](unsigned char ch) {
-                merged->as_full()->children[ch].store(child->as_full()->children[ch].load());
-                child->as_full()->children[ch].store(nullptr);
-            });
+            child->as_full()->move_interior_to(merged->as_full());
         }
     }
 

@@ -199,6 +199,79 @@ struct list_node : node_base<T, THREADED, Allocator> {
         construct_leaf_value(idx, value);
         return idx;
     }
+    
+    // Helper to move children from this node to another list_node (nulls out source)
+    void move_children_to(list_node* dest) {
+        dest->chars = chars;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    // Helper to copy children to another list_node
+    void copy_children_to(list_node* dest) {
+        dest->chars = chars;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
+    // Helper to shift children down after removal at idx
+    void shift_children_down(int idx) {
+        int count = chars.count();
+        for (int i = idx; i < count - 1; ++i) {
+            children[i].store(children[i + 1].load());
+        }
+        children[count - 1].store(nullptr);
+        chars.remove_at(idx);
+    }
+    
+    // Helper to shift leaf values down after removal at idx
+    void shift_leaf_values_down(int idx) {
+        int count = chars.count();
+        for (int i = idx; i < count - 1; ++i) {
+            leaf_values[i] = leaf_values[i + 1];
+        }
+        destroy_leaf_value(count - 1);
+        chars.remove_at(idx);
+    }
+    
+    // Helper to copy leaf values to another list_node
+    void copy_leaf_values_to(list_node* dest) {
+        dest->chars = chars;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->construct_leaf_value(i, leaf_values[i]);
+        }
+    }
+    
+    // Helper to move interior node contents to another list_node (nulls out source eos_ptr)
+    void move_interior_to(list_node* dest) {
+        dest->chars = chars;
+        dest->eos_ptr = eos_ptr;
+        eos_ptr = nullptr;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    // Helper to move list interior to full_node (for LIST->FULL conversion)
+    void move_interior_to_full(full_node<T, THREADED, Allocator>* dest) {
+        dest->eos_ptr = eos_ptr;
+        eos_ptr = nullptr;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            unsigned char ch = chars.char_at(i);
+            dest->valid.set(ch);
+            dest->children[ch].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
 };
 
 // =============================================================================
@@ -233,6 +306,87 @@ struct full_node : node_base<T, THREADED, Allocator> {
     
     void destroy_leaf_value(unsigned char c) {
         leaf_values[c].~T();
+    }
+    
+    // Helper to add a child (for interior nodes)
+    void add_child(unsigned char c, typename base_t::ptr_t child) {
+        valid.set(c);
+        children[c].store(child);
+    }
+    
+    // Helper to add a child atomically (for threaded interior nodes)
+    template <bool THR>
+    void add_child_atomic(unsigned char c, typename base_t::ptr_t child) {
+        valid.template atomic_set<THR>(c);
+        children[c].store(child);
+    }
+    
+    // Helper to remove a child
+    template <bool THR>
+    void remove_child(unsigned char c) {
+        valid.template atomic_clear<THR>(c);
+        children[c].store(nullptr);
+    }
+    
+    // Helper to add a leaf value entry
+    void add_leaf_entry(unsigned char c, const T& value) {
+        valid.set(c);
+        construct_leaf_value(c, value);
+    }
+    
+    // Helper to add a leaf value entry atomically
+    template <bool THR>
+    void add_leaf_entry_atomic(unsigned char c, const T& value) {
+        valid.template atomic_set<THR>(c);
+        construct_leaf_value(c, value);
+    }
+    
+    // Helper to remove a leaf entry
+    template <bool THR>
+    void remove_leaf_entry(unsigned char c) {
+        destroy_leaf_value(c);
+        valid.template atomic_clear<THR>(c);
+    }
+    
+    // Helper to copy leaf values to another full_node
+    void copy_leaf_values_to(full_node* dest) {
+        dest->valid = valid;
+        valid.for_each_set([this, dest](unsigned char c) {
+            dest->construct_leaf_value(c, leaf_values[c]);
+        });
+    }
+    
+    // Helper to move a child from this node to another (nulls out source)
+    void move_child_to(unsigned char c, full_node* dest) {
+        dest->valid.set(c);
+        dest->children[c].store(children[c].load());
+        children[c].store(nullptr);
+    }
+    
+    // Helper to copy a child to another node
+    void copy_child_to(unsigned char c, full_node* dest) {
+        dest->valid.set(c);
+        dest->children[c].store(children[c].load());
+    }
+    
+    // Helper to move all children to another full_node (nulls out source)
+    void move_all_children_to(full_node* dest) {
+        dest->valid = valid;
+        valid.for_each_set([this, dest](unsigned char c) {
+            dest->children[c].store(children[c].load());
+            children[c].store(nullptr);
+        });
+    }
+    
+    // Helper to move interior node contents to another full_node (nulls out source eos_ptr)
+    void move_interior_to(full_node* dest) {
+        dest->valid = valid;
+        dest->eos_ptr = eos_ptr;
+        eos_ptr = nullptr;
+        valid.for_each_set([this, dest](unsigned char c) {
+            dest->children[c].store(children[c].load());
+            children[c].store(nullptr);
+        });
     }
 };
 
