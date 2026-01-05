@@ -73,7 +73,7 @@ public:
     using mutex_t = std::conditional_t<THREADED, std::mutex, empty_mutex>;
 
     // -------------------------------------------------------------------------
-    // Insert types
+    // Result types
     // -------------------------------------------------------------------------
     struct insert_result {
         ptr_t new_node = nullptr;
@@ -82,12 +82,22 @@ public:
         bool in_place = false;
     };
 
+    struct erase_result {
+        ptr_t new_node = nullptr;
+        std::vector<ptr_t> old_nodes;
+        bool erased = false;
+        bool deleted_subtree = false;
+    };
+
     struct path_entry {
         ptr_t node;
         uint64_t version;
         unsigned char edge;
     };
 
+    // -------------------------------------------------------------------------
+    // Speculative insert types
+    // -------------------------------------------------------------------------
     enum class spec_op {
         EXISTS, IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
         DEMOTE_LEAF_EOS, SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
@@ -119,15 +129,8 @@ public:
     };
 
     // -------------------------------------------------------------------------
-    // Erase types
+    // Speculative erase types
     // -------------------------------------------------------------------------
-    struct erase_result {
-        ptr_t new_node = nullptr;
-        std::vector<ptr_t> old_nodes;
-        bool erased = false;
-        bool deleted_subtree = false;
-    };
-
     enum class erase_op {
         NOT_FOUND, DELETE_LEAF_EOS, DELETE_LEAF_SKIP, DELETE_LAST_LEAF_LIST,
         IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL, DELETE_EOS_INTERIOR,
@@ -147,7 +150,6 @@ public:
         unsigned char collapse_char = 0;
         std::string target_skip;
         std::string child_skip;
-        // Parent collapse info
         ptr_t parent = nullptr;
         uint64_t parent_version = 0;
         unsigned char parent_edge = 0;
@@ -166,7 +168,7 @@ public:
 
 private:
     atomic_ptr root_;
-    std::conditional_t<THREADED, std::atomic<size_t>, size_t> size_{0};
+    atomic_counter<THREADED> size_;
     mutable mutex_t mutex_;
     builder_t builder_;
 
@@ -265,15 +267,13 @@ public:
     // Public interface
     // -------------------------------------------------------------------------
     void clear();
-    size_t size() const noexcept;
-    bool empty() const noexcept;
+    size_t size() const noexcept { return size_.load(); }
+    bool empty() const noexcept { return size() == 0; }
     bool contains(const Key& key) const;
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& kv);
     bool erase(const Key& key);
     iterator find(const Key& key) const;
-    iterator end() const noexcept;
-    
-    // Call when trie is quiescent (no concurrent operations) to free retired nodes
+    iterator end() const noexcept { return iterator(); }
     void reclaim_retired() noexcept;
 };
 

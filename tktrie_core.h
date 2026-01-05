@@ -5,7 +5,6 @@
 
 namespace gteitelbaum {
 
-// Shorthand for template prefix
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
 
@@ -16,13 +15,7 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
     if (!ptr) return;
-    ptr_t n = static_cast<ptr_t>(ptr);
-    switch (n->type()) {
-        case TYPE_EOS: delete n->as_eos(); break;
-        case TYPE_SKIP: delete n->as_skip(); break;
-        case TYPE_LIST: delete n->as_list(); break;
-        case TYPE_FULL: delete n->as_full(); break;
-    }
+    builder_t::delete_node(static_cast<ptr_t>(ptr));
 }
 
 TKTRIE_TEMPLATE
@@ -36,22 +29,16 @@ std::string_view TKTRIE_CLASS::get_skip(ptr_t n) noexcept {
 TKTRIE_TEMPLATE
 T* TKTRIE_CLASS::get_eos_ptr(ptr_t n) noexcept {
     if (n->is_leaf()) return nullptr;
-    T** ptr_loc = reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
-    if constexpr (THREADED) {
-        return reinterpret_cast<std::atomic<T*>*>(ptr_loc)->load(std::memory_order_acquire);
-    } else {
-        return *ptr_loc;
-    }
+    auto* ptr_loc = reinterpret_cast<atomic_storage<T*, THREADED>*>(
+        reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
+    return ptr_loc->load();
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
-    T** ptr_loc = reinterpret_cast<T**>(reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
-    if constexpr (THREADED) {
-        reinterpret_cast<std::atomic<T*>*>(ptr_loc)->store(p, std::memory_order_release);
-    } else {
-        *ptr_loc = p;
-    }
+    auto* ptr_loc = reinterpret_cast<atomic_storage<T*, THREADED>*>(
+        reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
+    ptr_loc->store(p);
 }
 
 // -----------------------------------------------------------------------------
@@ -65,8 +52,6 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
         auto& ebr = ebr_global::instance();
         ebr.retire(n, node_deleter);
         ebr.advance_epoch();
-        // Don't call try_reclaim during operations - causes use-after-free
-        // Nodes will be reclaimed when trie is destroyed or reclaim_retired() is called
     } else {
         node_deleter(n);
     }
@@ -177,8 +162,7 @@ TKTRIE_TEMPLATE
 TKTRIE_CLASS::tktrie(const tktrie& other) {
     ptr_t other_root = other.root_.load();
     if (other_root) root_.store(builder_.deep_copy(other_root));
-    if constexpr (THREADED) size_.store(other.size_.load());
-    else size_ = other.size_;
+    size_.store(other.size_.load());
 }
 
 TKTRIE_TEMPLATE
@@ -187,8 +171,7 @@ TKTRIE_CLASS& TKTRIE_CLASS::operator=(const tktrie& other) {
         clear();
         ptr_t other_root = other.root_.load();
         if (other_root) root_.store(builder_.deep_copy(other_root));
-        if constexpr (THREADED) size_.store(other.size_.load());
-        else size_ = other.size_;
+        size_.store(other.size_.load());
     }
     return *this;
 }
@@ -197,12 +180,7 @@ TKTRIE_TEMPLATE
 TKTRIE_CLASS::tktrie(tktrie&& other) noexcept {
     root_.store(other.root_.load());
     other.root_.store(nullptr);
-    if constexpr (THREADED) {
-        size_.store(other.size_.exchange(0));
-    } else {
-        size_ = other.size_;
-        other.size_ = 0;
-    }
+    size_.store(other.size_.exchange(0));
 }
 
 TKTRIE_TEMPLATE
@@ -211,12 +189,7 @@ TKTRIE_CLASS& TKTRIE_CLASS::operator=(tktrie&& other) noexcept {
         clear();
         root_.store(other.root_.load());
         other.root_.store(nullptr);
-        if constexpr (THREADED) {
-            size_.store(other.size_.exchange(0));
-        } else {
-            size_ = other.size_;
-            other.size_ = 0;
-        }
+        size_.store(other.size_.exchange(0));
     }
     return *this;
 }
@@ -226,22 +199,11 @@ void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
     root_.store(nullptr);
     if (r) builder_.dealloc_node(r);
+    size_.store(0);
     if constexpr (THREADED) {
-        size_.store(0);
-        // Try to reclaim retired nodes - should succeed since tree is destroyed
         ebr_global::instance().try_reclaim();
     }
-    else size_ = 0;
 }
-
-TKTRIE_TEMPLATE
-size_t TKTRIE_CLASS::size() const noexcept {
-    if constexpr (THREADED) return size_.load();
-    else return size_;
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::empty() const noexcept { return size() == 0; }
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
@@ -286,20 +248,15 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
 }
 
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::iterator TKTRIE_CLASS::end() const noexcept { return iterator(); }
-
-TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
         ebr_global::instance().force_reclaim_all();
     }
 }
 
-
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
 }  // namespace gteitelbaum
 
-// Include insert implementation
 #include "tktrie_insert.h"

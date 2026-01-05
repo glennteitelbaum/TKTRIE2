@@ -22,34 +22,24 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
         else if (res.new_node) root_.store(res.new_node);
 
         for (auto* old : res.old_nodes) retire_node(old);
-        --size_;
-
+        size_.fetch_sub(1);
         return true;
     } else {
-        // Try to reclaim old nodes BEFORE taking a guard
         ebr_global::instance().try_reclaim();
-        
         auto& ebr_slot_ref = get_ebr_slot();
         
         while (true) {
-            // Keep guard active for entire operation to protect probe results
             auto guard = ebr_slot_ref.get_guard();
-            
             erase_spec_info info = probe_erase(root_.load(), kb);
             if (info.op != erase_op::NOT_FOUND) {
                 capture_parent_collapse_info(info);
             }
 
             if (info.op == erase_op::NOT_FOUND) {
-                // Re-probe under lock to be sure key doesn't exist
-                // The initial probe might have seen stale data
                 std::lock_guard<mutex_t> lock(mutex_);
                 ptr_t root = root_.load();
                 auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) {
-                    return false;  // Confirmed: key doesn't exist
-                }
-                // Key actually existed - apply the erase result
+                if (!res.erased) return false;
                 if (res.deleted_subtree) root_.store(nullptr);
                 else if (res.new_node) root_.store(res.new_node);
                 for (auto* old : res.old_nodes) retire_node(old);
@@ -57,26 +47,17 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return true;
             }
 
-            // =================================================================
-            // IN_PLACE operations - simple modify in place
-            // Re-probe inside lock to ensure we see current tree state
-            // =================================================================
+            // IN_PLACE operations
             if ((info.op == erase_op::IN_PLACE_LEAF_LIST) |
                 (info.op == erase_op::IN_PLACE_LEAF_FULL) |
                 (info.op == erase_op::IN_PLACE_INTERIOR_LIST) |
                 (info.op == erase_op::IN_PLACE_INTERIOR_FULL)) {
 
                 std::lock_guard<mutex_t> lock(mutex_);
-
-                // Re-probe inside lock to get current state
                 erase_spec_info locked_info = probe_erase(root_.load(), kb);
                 
-                // If operation type changed, handle appropriately
-                if (locked_info.op == erase_op::NOT_FOUND) {
-                    return false;  // Key no longer exists
-                }
+                if (locked_info.op == erase_op::NOT_FOUND) return false;
                 
-                // If still in-place, do it with fresh info
                 if ((locked_info.op == erase_op::IN_PLACE_LEAF_LIST) |
                     (locked_info.op == erase_op::IN_PLACE_LEAF_FULL) |
                     (locked_info.op == erase_op::IN_PLACE_INTERIOR_LIST) |
@@ -96,20 +77,13 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         case erase_op::IN_PLACE_INTERIOR_FULL:
                             success = do_inplace_interior_full_erase(locked_info.target, locked_info.c, locked_info.target_version);
                             break;
-                        default:
-                            break;
+                        default: break;
                     }
 
-                    if (success) {
-                        size_.fetch_sub(1);
-                        return true;
-                    }
-                    // Shouldn't fail since we just probed under lock, but retry if it does
+                    if (success) { size_.fetch_sub(1); return true; }
                     continue;
                 }
                 
-                // Operation type changed (e.g., became DELETE_LAST_LEAF_LIST)
-                // Fall through to handle with erase_impl
                 ptr_t root = root_.load();
                 auto res = erase_impl(&root_, root, kb);
                 if (!res.erased) return false;
@@ -120,31 +94,21 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return true;
             }
 
-            // =================================================================
-            // DELETE_LEAF_* - remove leaf node from parent
-            // Re-probe inside lock to ensure we see current tree state
-            // =================================================================
+            // DELETE_LEAF_* operations
             if ((info.op == erase_op::DELETE_LEAF_EOS) |
                 (info.op == erase_op::DELETE_LEAF_SKIP) |
                 (info.op == erase_op::DELETE_LAST_LEAF_LIST)) {
 
-                // Pre-allocate merge node if parent collapse might be needed
                 erase_pre_alloc alloc = allocate_erase_speculative(info);
-
                 std::lock_guard<mutex_t> lock(mutex_);
-
-                // Re-probe inside lock to get current state
                 erase_spec_info locked_info = probe_erase(root_.load(), kb);
                 
                 if (locked_info.op == erase_op::NOT_FOUND) {
                     dealloc_erase_speculation(alloc);
-                    return false;  // Key no longer exists
+                    return false;
                 }
                 
-                // For simplicity, use erase_impl for the actual operation
-                // The pre-allocation was just an optimization attempt
                 dealloc_erase_speculation(alloc);
-                
                 ptr_t root = root_.load();
                 auto res = erase_impl(&root_, root, kb);
                 if (!res.erased) return false;
@@ -155,62 +119,12 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return true;
             }
 
-            // =================================================================
-            // DELETE_EOS_INTERIOR - remove eos value from interior node
-            // Re-probe inside lock to ensure we see current tree state
-            // =================================================================
-            if (info.op == erase_op::DELETE_EOS_INTERIOR) {
-                std::lock_guard<mutex_t> lock(mutex_);
-
-                // Re-probe inside lock to get current state
-                erase_spec_info locked_info = probe_erase(root_.load(), kb);
-                
-                if (locked_info.op == erase_op::NOT_FOUND) {
-                    return false;  // Key no longer exists
-                }
-                
-                // Use erase_impl for the actual operation
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) root_.store(nullptr);
-                else if (res.new_node) root_.store(res.new_node);
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_sub(1);
-                return true;
-            }
-
-            // =================================================================
-            // COLLAPSE_AFTER_REMOVE - remove eos and collapse with single child
-            // Re-probe inside lock to ensure we see current tree state
-            // =================================================================
-            if (info.op == erase_op::COLLAPSE_AFTER_REMOVE) {
-                // Don't bother with pre-allocation since we'll re-probe anyway
-                std::lock_guard<mutex_t> lock(mutex_);
-
-                // Re-probe inside lock to get current state
-                erase_spec_info locked_info = probe_erase(root_.load(), kb);
-                
-                if (locked_info.op == erase_op::NOT_FOUND) {
-                    return false;  // Key no longer exists
-                }
-                
-                // Use erase_impl for the actual operation
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) root_.store(nullptr);
-                else if (res.new_node) root_.store(res.new_node);
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_sub(1);
-                return true;
-            }
-
-            // =================================================================
-            // Fallback - use erase_impl for any unhandled cases
-            // =================================================================
+            // DELETE_EOS_INTERIOR or COLLAPSE_AFTER_REMOVE
             {
                 std::lock_guard<mutex_t> lock(mutex_);
+                erase_spec_info locked_info = probe_erase(root_.load(), kb);
+                if (locked_info.op == erase_op::NOT_FOUND) return false;
+                
                 ptr_t root = root_.load();
                 auto res = erase_impl(&root_, root, kb);
                 if (!res.erased) return false;
@@ -273,13 +187,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
             return res;
         }
 
-        // CRITICAL: Bump version BEFORE modifying data
         leaf->bump_version();
-        
         for (int i = idx; i < count - 1; ++i) {
             leaf->as_list()->leaf_values[i] = leaf->as_list()->leaf_values[i + 1];
         }
-        // Destroy the last element that's now extra
         leaf->as_list()->destroy_leaf_value(count - 1);
         leaf->as_list()->chars.remove_at(idx);
         res.erased = true;
@@ -288,10 +199,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
 
     // FULL
     if (!leaf->as_full()->valid.test(c)) return res;
-    
-    // CRITICAL: Bump version BEFORE modifying data
     leaf->bump_version();
-    
     leaf->as_full()->destroy_leaf_value(c);
     leaf->as_full()->valid.template atomic_clear<THREADED>(c);
     res.erased = true;
@@ -310,10 +218,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     if (key.empty()) {
         T* p = get_eos_ptr(n);
         if (!p) return res;
-        
-        // CRITICAL: Bump version BEFORE modifying data
         n->bump_version();
-        
         delete p;
         set_eos_ptr(n, nullptr);
         res.erased = true;
@@ -332,7 +237,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     }
 
     if (child_res.new_node) {
-        // CRITICAL: Bump version BEFORE storing new node
         n->bump_version();
         get_child_slot(n, c)->store(child_res.new_node);
     }
@@ -397,9 +301,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     if (n->is_list()) {
         int idx = n->as_list()->chars.find(removed_c);
         if (idx >= 0) {
-            // CRITICAL: Bump version BEFORE modifying data
             n->bump_version();
-            
             int count = n->as_list()->chars.count();
             for (int i = idx; i < count - 1; ++i) {
                 n->as_list()->children[i].store(n->as_list()->children[i + 1].load());
@@ -408,9 +310,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
             n->as_list()->chars.remove_at(idx);
         }
     } else if (n->is_full()) {
-        // CRITICAL: Bump version BEFORE modifying data
         n->bump_version();
-        
         n->as_full()->valid.template atomic_clear<THREADED>(removed_c);
         n->as_full()->children[removed_c].store(nullptr);
     }

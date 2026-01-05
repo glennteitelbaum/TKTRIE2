@@ -43,6 +43,61 @@ constexpr void ktrie_destroy_at(T* p) {
 
 namespace gteitelbaum {
 
+// =============================================================================
+// ATOMIC STORAGE HELPERS - eliminates repeated if constexpr (THREADED) patterns
+// =============================================================================
+
+template <typename T, bool THREADED>
+class atomic_storage {
+    std::conditional_t<THREADED, std::atomic<T>, T> value_;
+public:
+    atomic_storage() noexcept : value_{} {}
+    explicit atomic_storage(T v) noexcept : value_(v) {}
+    
+    T load() const noexcept {
+        if constexpr (THREADED) return value_.load(std::memory_order_acquire);
+        else return value_;
+    }
+    
+    void store(T v) noexcept {
+        if constexpr (THREADED) value_.store(v, std::memory_order_release);
+        else value_ = v;
+    }
+    
+    T exchange(T v) noexcept {
+        if constexpr (THREADED) return value_.exchange(v, std::memory_order_acq_rel);
+        else { T old = value_; value_ = v; return old; }
+    }
+    
+    T fetch_add(T v) noexcept {
+        if constexpr (THREADED) return value_.fetch_add(v, std::memory_order_acq_rel);
+        else { T old = value_; value_ += v; return old; }
+    }
+    
+    T fetch_sub(T v) noexcept {
+        if constexpr (THREADED) return value_.fetch_sub(v, std::memory_order_acq_rel);
+        else { T old = value_; value_ -= v; return old; }
+    }
+    
+    T fetch_or(T v) noexcept {
+        if constexpr (THREADED) return value_.fetch_or(v, std::memory_order_acq_rel);
+        else { T old = value_; value_ |= v; return old; }
+    }
+    
+    T fetch_and(T v) noexcept {
+        if constexpr (THREADED) return value_.fetch_and(v, std::memory_order_acq_rel);
+        else { T old = value_; value_ &= v; return old; }
+    }
+};
+
+// Convenience alias for size counters
+template <bool THREADED>
+using atomic_counter = atomic_storage<size_t, THREADED>;
+
+// =============================================================================
+// HEADER FLAGS AND CONSTANTS
+// =============================================================================
+
 // Header: [LEAF:1][TYPE:2][VERSION:61]
 // TYPE: 00=EOS, 01=SKIP, 10=LIST, 11=FULL
 static constexpr uint64_t FLAG_LEAF = 1ULL << 63;
@@ -100,29 +155,30 @@ constexpr T to_big_endian(T value) noexcept {
 template <typename T>
 constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
+// =============================================================================
+// SMALL_LIST - packed list of up to 7 chars
+// =============================================================================
+
 class small_list {
-    // Use atomic to prevent torn reads in concurrent access
-    // Relaxed ordering is sufficient - correctness is ensured by version checks
-    std::atomic<uint64_t> data_{0};
+    atomic_storage<uint64_t, true> data_;  // Always atomic for thread-safety
 public:
     small_list() noexcept = default;
     
-    // Copy constructor/assignment for non-atomic copying
-    small_list(const small_list& o) noexcept : data_(o.data_.load(std::memory_order_relaxed)) {}
+    small_list(const small_list& o) noexcept : data_(o.data_.load()) {}
     small_list& operator=(const small_list& o) noexcept {
-        data_.store(o.data_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        data_.store(o.data_.load());
         return *this;
     }
     
     int count() const noexcept { 
-        return static_cast<int>((data_.load(std::memory_order_acquire) >> 56) & 0xFF); 
+        return static_cast<int>((data_.load() >> 56) & 0xFF); 
     }
     unsigned char char_at(int i) const noexcept {
-        return static_cast<unsigned char>((data_.load(std::memory_order_acquire) >> (i * 8)) & 0xFF);
+        return static_cast<unsigned char>((data_.load() >> (i * 8)) & 0xFF);
     }
     
     int find(unsigned char c) const noexcept {
-        uint64_t d = data_.load(std::memory_order_acquire);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         for (int i = 0; i < n; ++i) {
             if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
@@ -131,15 +187,15 @@ public:
     }
     
     int add(unsigned char c) noexcept {
-        uint64_t d = data_.load(std::memory_order_relaxed);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
             (static_cast<uint64_t>(n + 1) << 56);
-        data_.store(d, std::memory_order_release);  // Release to synchronize with readers
+        data_.store(d);
         return n;
     }
     void remove_at(int idx) noexcept {
-        uint64_t d = data_.load(std::memory_order_relaxed);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         for (int i = idx; i < n - 1; ++i) {
             unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
@@ -148,9 +204,13 @@ public:
         }
         d = (d & ~(0xFFULL << ((n-1) * 8))) & ~(0xFFULL << 56);
         d |= (static_cast<uint64_t>(n - 1) << 56);
-        data_.store(d, std::memory_order_release);  // Release to synchronize with readers
+        data_.store(d);
     }
 };
+
+// =============================================================================
+// BITMAP256 - 256-bit bitmap for FULL nodes
+// =============================================================================
 
 class bitmap256 {
     uint64_t bits_[4] = {};
@@ -177,7 +237,7 @@ public:
             while (bits) {
                 unsigned char c = static_cast<unsigned char>((w << 6) | std::countr_zero(bits));
                 fn(c);
-                bits &= bits - 1;  // Clear LSB - safe for uint64_t when bits != 0
+                bits &= bits - 1;
             }
         }
     }
@@ -196,28 +256,32 @@ public:
     }
 };
 
+// =============================================================================
+// EMPTY_MUTEX - no-op mutex for non-threaded mode
+// =============================================================================
+
 struct empty_mutex {
     void lock() noexcept {}
     void unlock() noexcept {}
 };
 
-// Fast skip matching - uses memcmp for longer strings
+// =============================================================================
+// SKIP MATCHING
+// =============================================================================
+
 inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexcept {
     size_t min_len = skip.size() < key.size() ? skip.size() : key.size();
     
-    // For short strings, byte-by-byte is fine (cache-friendly)
     if (min_len <= 8) {
         size_t i = 0;
         while (i < min_len && skip[i] == key[i]) ++i;
         return i;
     }
     
-    // For longer strings, use memcmp to find if they match fully
     if (std::memcmp(skip.data(), key.data(), min_len) == 0) {
         return min_len;
     }
     
-    // Find first mismatch
     size_t i = 0;
     while (i < min_len && skip[i] == key[i]) ++i;
     return i;

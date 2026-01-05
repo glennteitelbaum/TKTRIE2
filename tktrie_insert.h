@@ -203,7 +203,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_list(
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
     ptr_t interior = builder_.make_interior_list(common);
-
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
 
@@ -275,7 +274,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         }
         res.new_node = interior;
     } else {
-        // FULL leaf - create FULL interior node
         ptr_t interior = builder_.make_interior_full(leaf_skip);
         interior->as_full()->eos_ptr = new T(value);
         leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
@@ -342,12 +340,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
     if (leaf->is_list()) {
         int leaf_count = leaf->as_list()->chars.count();
         int existing_idx = leaf->as_list()->chars.find(first_c);
-        
-        // Check if we need FULL node (existing entries + possibly 1 new > LIST_MAX)
         bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
         
         if (need_full) {
-            // Create FULL interior node
             ptr_t interior = builder_.make_interior_full(leaf_skip);
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = leaf->as_list()->chars.char_at(i);
@@ -355,15 +350,11 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
                 interior->as_full()->valid.set(c);
                 interior->as_full()->children[c].store(child);
             }
-            
-            // Add new entry
             ptr_t child = create_leaf_for_key(key.substr(1), value);
             interior->as_full()->valid.set(first_c);
             interior->as_full()->children[first_c].store(child);
-            
             res.new_node = interior;
         } else {
-            // Create LIST interior node
             ptr_t interior = builder_.make_interior_list(leaf_skip);
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = leaf->as_list()->chars.char_at(i);
@@ -387,7 +378,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             res.new_node = interior;
         }
     } else {
-        // FULL leaf - create FULL interior node
         ptr_t interior = builder_.make_interior_full(leaf_skip);
         leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
             ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
@@ -562,10 +552,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
-#undef TKTRIE_TEMPLATE
-#undef TKTRIE_CLASS
-
 }  // namespace gteitelbaum
 
-// Include speculative insert implementation
 #include "tktrie_insert_probe.h"

@@ -355,84 +355,45 @@ bool TKTRIE_CLASS::commit_speculative(
     speculative_info& info, pre_alloc& alloc, const T& value) {
     switch (info.op) {
     case spec_op::EMPTY_TREE:
-        // Must verify root is still null - another thread may have inserted
-        if (root_.load() != nullptr) {
-            return false;
-        }
+        if (root_.load() != nullptr) return false;
         root_.store(alloc.root_replacement);
         return true;
 
     case spec_op::DEMOTE_LEAF_EOS: {
         ptr_t interior = alloc.root_replacement;
-        
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-        
+        if (slot->load() != info.target) return false;
         *interior->as_list()->eos_ptr = info.target->as_eos()->leaf_value;
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(interior);
         return true;
     }
     case spec_op::SPLIT_LEAF_SKIP: {
         ptr_t interior = alloc.root_replacement;
-        
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-        
+        if (slot->load() != info.target) return false;
         ptr_t old_child = interior->as_list()->children[0].load();
         old_child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(interior);
         return true;
     }
     case spec_op::PREFIX_LEAF_SKIP: {
         ptr_t interior = alloc.root_replacement;
-        
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-        
+        if (slot->load() != info.target) return false;
         ptr_t child = interior->as_list()->children[0].load();
         child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(interior);
         return true;
     }
     case spec_op::EXTEND_LEAF_SKIP: {
         ptr_t interior = alloc.root_replacement;
-        
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-        
+        if (slot->load() != info.target) return false;
         *interior->as_list()->eos_ptr = info.target->as_skip()->leaf_value;
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(interior);
         return true;
     }
@@ -440,21 +401,12 @@ bool TKTRIE_CLASS::commit_speculative(
         ptr_t interior = alloc.root_replacement;
         std::string_view skip = info.target_skip;
         size_t m = info.match_pos;
-
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-
+        if (slot->load() != info.target) return false;
         ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(m + 1));
         interior->as_list()->children[0].store(old_child);
         alloc.add(old_child);
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(interior);
         return true;
     }
@@ -462,73 +414,42 @@ bool TKTRIE_CLASS::commit_speculative(
         ptr_t interior = alloc.root_replacement;
         std::string_view skip = info.target_skip;
         size_t m = info.match_pos;
-
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-
+        if (slot->load() != info.target) return false;
         ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(m + 1));
         interior->as_list()->children[0].store(old_child);
         alloc.add(old_child);
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(interior);
         return true;
     }
     case spec_op::LIST_TO_FULL_LEAF: {
         ptr_t full = alloc.root_replacement;
-        
-        // Verify slot still points to target before replacing
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (slot->load() != info.target) {
-            return false;
-        }
-        
+        if (slot->load() != info.target) return false;
         auto* list = info.target->as_list();
         for (int i = 0; i < list->chars.count(); ++i) {
             unsigned char ch = list->chars.char_at(i);
             full->as_full()->valid.set(ch);
             full->as_full()->construct_leaf_value(ch, list->leaf_values[i]);
         }
-
-        // CRITICAL: Bump parent version BEFORE storing new child
-        if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
-        }
+        if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
         slot->store(full);
         return true;
     }
     case spec_op::IN_PLACE_LEAF: {
         ptr_t n = info.target;
         unsigned char c = info.c;
-
-        // Re-verify version hasn't changed (TOCTOU protection)
-        if (n->version() != info.target_version) {
-            return false;
-        }
-        
-        // Verify the slot still points to this node (not replaced by another thread)
+        if (n->version() != info.target_version) return false;
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (!slot || slot->load() != n) {
-            return false;
-        }
+        if (!slot || slot->load() != n) return false;
 
         if (n->is_list()) {
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
-
-            // CRITICAL: Bump version BEFORE modifying data
             n->bump_version();
-            
             int idx = n->as_list()->chars.add(c);
             n->as_list()->construct_leaf_value(idx, value);
-
-            // Clean up any pre-allocated nodes
             if (alloc.root_replacement) {
                 delete alloc.root_replacement->as_eos();
                 alloc.clear();
@@ -537,45 +458,26 @@ bool TKTRIE_CLASS::commit_speculative(
         }
         // FULL
         if (n->as_full()->valid.test(c)) return false;
-        
-        // CRITICAL: Bump version BEFORE modifying data
         n->bump_version();
-        
         n->as_full()->valid.template atomic_set<THREADED>(c);
         n->as_full()->construct_leaf_value(c, value);
         return true;
     }
     case spec_op::IN_PLACE_INTERIOR: {
         ptr_t n = info.target;
-
-        // Re-verify version hasn't changed (TOCTOU protection)
         if (n->version() != info.target_version) {
-            if (alloc.in_place_eos) {
-                delete alloc.in_place_eos;
-                alloc.in_place_eos = nullptr;
-            }
+            if (alloc.in_place_eos) { delete alloc.in_place_eos; alloc.in_place_eos = nullptr; }
             return false;
         }
-        
-        // Verify the slot still points to this node (not replaced by another thread)
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
         if (!slot || slot->load() != n) {
-            if (alloc.in_place_eos) {
-                delete alloc.in_place_eos;
-                alloc.in_place_eos = nullptr;
-            }
+            if (alloc.in_place_eos) { delete alloc.in_place_eos; alloc.in_place_eos = nullptr; }
             return false;
         }
 
         if (info.is_eos) {
-            if (get_eos_ptr(n)) {
-                delete alloc.in_place_eos;
-                return false;
-            }
-            
-            // CRITICAL: Bump version BEFORE modifying data
+            if (get_eos_ptr(n)) { delete alloc.in_place_eos; return false; }
             n->bump_version();
-            
             set_eos_ptr(n, alloc.in_place_eos);
             alloc.in_place_eos = nullptr;
             return true;
@@ -587,20 +489,14 @@ bool TKTRIE_CLASS::commit_speculative(
         if (n->is_list()) {
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
-
-            // CRITICAL: Bump version BEFORE modifying data
             n->bump_version();
-            
             int idx = n->as_list()->chars.add(c);
             n->as_list()->children[idx].store(child);
             return true;
         }
         if (n->is_full()) {
             if (n->as_full()->valid.test(c)) return false;
-            
-            // CRITICAL: Bump version BEFORE modifying data
             n->bump_version();
-            
             n->as_full()->valid.template atomic_set<THREADED>(c);
             n->as_full()->children[c].store(child);
             return true;
@@ -613,7 +509,6 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::PREFIX_INTERIOR:
     case spec_op::ADD_CHILD_CONVERT:
         return false;
-
     default:
         return false;
     }
@@ -628,18 +523,11 @@ void TKTRIE_CLASS::dealloc_speculation(pre_alloc& alloc) {
     for (int i = 0; i < alloc.count; ++i) {
         ptr_t n = alloc.nodes[i];
         if (!n) continue;
-
         if (!n->is_leaf()) {
             T* eos = get_eos_ptr(n);
             if (eos) delete eos;
         }
-
-        switch (n->type()) {
-            case TYPE_EOS: delete n->as_eos(); break;
-            case TYPE_SKIP: delete n->as_skip(); break;
-            case TYPE_LIST: delete n->as_list(); break;
-            case TYPE_FULL: delete n->as_full(); break;
-        }
+        builder_t::delete_node(n);
     }
     alloc.clear();
 }
@@ -660,19 +548,15 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         if (res.new_node) root_.store(res.new_node);
         for (auto* old : res.old_nodes) retire_node(old);
-        ++size_;
+        size_.fetch_add(1);
 
         return {iterator(this, std::string(kb), value), true};
     } else {
-        // Try to reclaim old nodes BEFORE taking a guard
         ebr_global::instance().try_reclaim();
-        
-        // Keep EBR guard active during entire operation to prevent use-after-free
         auto& slot = get_ebr_slot();
         
         while (true) {
             auto guard = slot.get_guard();
-            
             speculative_info spec = probe_speculative(root_.load(), kb);
 
             if (spec.op == spec_op::EXISTS) {
@@ -681,15 +565,9 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
             if ((spec.op == spec_op::IN_PLACE_LEAF) | (spec.op == spec_op::IN_PLACE_INTERIOR)) {
                 pre_alloc alloc = allocate_speculative(spec, value);
-
                 {
                     std::lock_guard<mutex_t> lock(mutex_);
-
-                    if (!validate_path(spec)) {
-                        dealloc_speculation(alloc);
-                        continue;
-                    }
-
+                    if (!validate_path(spec)) { dealloc_speculation(alloc); continue; }
                     if (commit_speculative(spec, alloc, value)) {
                         size_.fetch_add(1);
                         return {iterator(this, std::string(kb), value), true};
@@ -700,19 +578,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             }
 
             pre_alloc alloc = allocate_speculative(spec, value);
-
             {
                 std::lock_guard<mutex_t> lock(mutex_);
-
-                if (!validate_path(spec)) {
-                    dealloc_speculation(alloc);
-                    continue;
-                }
-
+                if (!validate_path(spec)) { dealloc_speculation(alloc); continue; }
                 if (alloc.root_replacement && commit_speculative(spec, alloc, value)) {
-                    if (spec.target) {
-                        retire_node(spec.target);
-                    }
+                    if (spec.target) retire_node(spec.target);
                     size_.fetch_add(1);
                     return {iterator(this, std::string(kb), value), true};
                 }
@@ -724,25 +594,20 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     (spec.op == spec_op::ADD_CHILD_CONVERT)) {
 
                     dealloc_speculation(alloc);
-
                     if (validate_path(spec)) {
                         ptr_t root = root_.load();
                         auto res = insert_impl(&root_, root, kb, value);
-
                         if (!res.inserted) {
                             for (auto* old : res.old_nodes) retire_node(old);
                             return {find(key), false};
                         }
-
                         if (res.new_node) root_.store(res.new_node);
                         for (auto* old : res.old_nodes) retire_node(old);
                         size_.fetch_add(1);
-
                         return {iterator(this, std::string(kb), value), true};
                     }
                 }
             }
-
             dealloc_speculation(alloc);
         }
     }
@@ -753,5 +618,4 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
 }  // namespace gteitelbaum
 
-// Include erase implementation
 #include "tktrie_erase_probe.h"
