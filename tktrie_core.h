@@ -15,7 +15,10 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
     if (!ptr) return;
-    builder_t::delete_node(static_cast<ptr_t>(ptr));
+    auto* n = static_cast<ptr_t>(ptr);
+    // Never delete the static sentinel node
+    if (n == get_retry_sentinel<T, THREADED, Allocator>()) return;
+    builder_t::delete_node(n);
 }
 
 TKTRIE_TEMPLATE
@@ -48,12 +51,42 @@ void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n) return;
+    // Never retire the static sentinel node
+    if (n == get_retry_sentinel<T, THREADED, Allocator>()) return;
     if constexpr (THREADED) {
-        auto& ebr = ebr_global::instance();
-        ebr.retire(n, node_deleter);
-        ebr.advance_epoch();
+        n->poison();  // Mark as dead BEFORE adding to retire list
+        uint64_t epoch = ebr_slot::global_epoch().load(std::memory_order_acquire);
+        ebr_retire(n, epoch);
+        ebr_global::instance().advance_epoch();
     } else {
         node_deleter(n);
+    }
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
+    if constexpr (THREADED) {
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        retired_.push_back({n, epoch});
+    }
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::ebr_try_reclaim() {
+    if constexpr (THREADED) {
+        uint64_t safe = ebr_global::instance().compute_safe_epoch();
+        
+        std::vector<retired_node> still_retired;
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        
+        for (auto& r : retired_) {
+            if (r.epoch + 2 <= safe) {
+                node_deleter(r.ptr);
+            } else {
+                still_retired.push_back(r);
+            }
+        }
+        retired_ = std::move(still_retired);
     }
 }
 
@@ -69,54 +102,32 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
     return nullptr;
 }
 
-// Hybrid spin-then-lock-wait version for sentinel-based synchronization
-// Returns (child_ptr, hit_sentinel) - if hit_sentinel, caller should reset path
+// Check child and return with poison detection
+// Returns (child_ptr, hit_poison) - if hit_poison, caller should reset path
 TKTRIE_TEMPLATE
 std::pair<typename TKTRIE_CLASS::ptr_t, bool> TKTRIE_CLASS::find_child_wait(
     ptr_t n, unsigned char c) const noexcept {
-    ptr_t child = nullptr;
-    bool hit_sentinel = false;
-    
-    auto reload_child = [&]() -> ptr_t {
-        if (n->is_list()) {
-            int idx = n->as_list()->chars.find(c);
-            return (idx >= 0) ? n->as_list()->children[idx].load() : nullptr;
-        } else if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
-            return n->as_full()->children[c].load();
-        }
-        return nullptr;
-    };
-    
-    child = reload_child();
-    if (!child) return {nullptr, false};
-    
-    // Check for sentinel - if hit, try spin then lock-wait
-    if constexpr (THREADED) {
-        if (is_retry_sentinel(child)) {
-            hit_sentinel = true;
-            
-            // Fast path: spin for a while (writer might be almost done)
-            for (int spin = 0; spin < 48; ++spin) {
-                child = reload_child();
-                if (!is_retry_sentinel(child)) {
-                    return {child, hit_sentinel};
-                }
-                // Pause instruction hint for spin-wait
-                #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                    __builtin_ia32_pause();
-                #elif defined(__aarch64__) || defined(_M_ARM64)
-                    asm volatile("yield" ::: "memory");
-                #endif
-            }
-            
-            // Slow path: still sentinel, block on writer's mutex
-            mutex_.lock();
-            mutex_.unlock();
-            child = reload_child();
-        }
+    // Check if parent node is poisoned - must retry from root
+    if (n->is_poisoned()) {
+        return {nullptr, true};
     }
     
-    return {child, hit_sentinel};
+    ptr_t child = nullptr;
+    if (n->is_list()) {
+        int idx = n->as_list()->chars.find(c);
+        child = (idx >= 0) ? n->as_list()->children[idx].load() : nullptr;
+    } else if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
+        child = n->as_full()->children[c].load();
+    }
+    
+    if (!child) return {nullptr, false};
+    
+    // Child is poisoned (either sentinel or retired node) - signal retry
+    if (child->is_poisoned()) {
+        return {nullptr, true};
+    }
+    
+    return {child, false};
 }
 
 TKTRIE_TEMPLATE
@@ -199,6 +210,9 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept {
     if (!n) return false;
     
+    // Check if root is poisoned - must retry
+    if (n->is_poisoned()) return false;
+    
     // Record root in path
     if (!path.push(n)) return false;
     
@@ -220,7 +234,11 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
 
         // Use wait-load - blocks on mutex if sentinel hit
         auto [child, hit_sentinel] = find_child_wait(n, c);
-        if (!child) return false;
+        if (!child) {
+            // hit_sentinel true means poisoned node - signal retry
+            // hit_sentinel false means child doesn't exist
+            return false;
+        }
         
         if (hit_sentinel) {
             // We synchronized with writer via mutex lock/unlock
@@ -231,6 +249,9 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         // Record this node in path
         n = child;
         if (!path.push(n)) return false;
+        
+        // Double-check node isn't poisoned after push
+        if (n->is_poisoned()) return false;
     }
     
     // n is now a leaf
@@ -238,7 +259,10 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T& out, read_path& path) const noexcept {
+bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T& out, read_path& /*path*/) const noexcept {
+    // Check if leaf is poisoned
+    if (leaf->is_poisoned()) return false;
+    
     std::string_view skip = get_skip(leaf);
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) return false;
@@ -267,6 +291,10 @@ bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     for (int i = 0; i < path.len; ++i) {
+        // Check for poisoned nodes - they will never have matching versions
+        if (path.nodes[i]->is_poisoned()) {
+            return false;
+        }
         if (path.nodes[i]->version() != path.versions[i]) {
             return false;
         }
@@ -327,10 +355,18 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
     root_.store(nullptr);
-    if (r) builder_.dealloc_node(r);
+    // Never dealloc the static sentinel node
+    if (r && r != get_retry_sentinel<T, THREADED, Allocator>()) {
+        builder_.dealloc_node(r);
+    }
     size_.store(0);
     if constexpr (THREADED) {
-        ebr_global::instance().try_reclaim();
+        // Force reclaim all retired nodes for this trie
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        for (auto& rn : retired_) {
+            node_deleter(rn.ptr);
+        }
+        retired_.clear();
     }
 }
 
@@ -338,43 +374,30 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     if constexpr (THREADED) {
-        // Lock-free read with hybrid sentinel handling + version validation
+        // Lock-free read with EBR protection + version validation
+        auto& slot = get_ebr_slot();
+        auto guard = slot.get_guard();  // Register with EBR - blocks reclamation
+        
         for (int attempts = 0; attempts < 10; ++attempts) {
             T dummy;
             read_path path;
             
-            // Load root, hybrid spin-then-lock on sentinel
             ptr_t root = root_.load();
-            if (is_retry_sentinel(root)) {
-                // Fast path: spin for a while
-                for (int spin = 0; spin < 48; ++spin) {
-                    root = root_.load();
-                    if (!is_retry_sentinel(root)) goto root_ready;
-                    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                        __builtin_ia32_pause();
-                    #elif defined(__aarch64__) || defined(_M_ARM64)
-                        asm volatile("yield" ::: "memory");
-                    #endif
-                }
-                // Slow path: block on mutex
-                mutex_.lock();
-                mutex_.unlock();
-                root = root_.load();
-            }
-            root_ready:
             if (!root) return false;
+            
+            // Sentinel and poisoned nodes both have POISON_VERSION
+            // is_poisoned() catches both cases
+            if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, dummy, path);
             
-            // Validate all versions unchanged
+            // Validate all versions unchanged (also catches poison)
             if (validate_read_path(path)) {
                 return found;
             }
-            // Version mismatch - concurrent modification, retry
+            // Version mismatch or poison - concurrent modification, retry
         }
-        // Too many retries - fall back to guarded read (shouldn't happen normally)
-        auto& slot = get_ebr_slot();
-        auto guard = slot.get_guard();
+        // Too many retries - fall back to locked read (shouldn't happen normally)
         return contains_impl(root_.load(), kb);
     } else {
         return contains_impl(root_.load(), kb);
@@ -398,45 +421,31 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     auto kb = traits::to_bytes(key);
     T value;
     if constexpr (THREADED) {
-        // Lock-free read with hybrid sentinel handling + version validation
+        // Lock-free read with EBR protection + version validation
+        auto& slot = get_ebr_slot();
+        auto guard = slot.get_guard();  // Register with EBR - blocks reclamation
+        
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
             
-            // Load root, hybrid spin-then-lock on sentinel
             ptr_t root = root_.load();
-            if (is_retry_sentinel(root)) {
-                // Fast path: spin for a while
-                for (int spin = 0; spin < 48; ++spin) {
-                    root = root_.load();
-                    if (!is_retry_sentinel(root)) goto root_ready;
-                    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                        __builtin_ia32_pause();
-                    #elif defined(__aarch64__) || defined(_M_ARM64)
-                        asm volatile("yield" ::: "memory");
-                    #endif
-                }
-                // Slow path: block on mutex
-                mutex_.lock();
-                mutex_.unlock();
-                root = root_.load();
-            }
-            root_ready:
             if (!root) return end();
+            
+            // Sentinel and poisoned nodes both have POISON_VERSION
+            if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, value, path);
             
-            // Validate all versions unchanged
+            // Validate all versions unchanged (also catches poison)
             if (validate_read_path(path)) {
                 if (found) {
                     return iterator(this, std::string(kb), value);
                 }
                 return end();
             }
-            // Version mismatch - concurrent modification, retry
+            // Version mismatch or poison - concurrent modification, retry
         }
-        // Too many retries - fall back to guarded read
-        auto& slot = get_ebr_slot();
-        auto guard = slot.get_guard();
+        // Too many retries - fall back to locked read
         if (read_impl(root_.load(), kb, value)) {
             return iterator(this, std::string(kb), value);
         }
@@ -451,7 +460,12 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
-        ebr_global::instance().force_reclaim_all();
+        // Force reclaim all retired nodes for this trie
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        for (auto& rn : retired_) {
+            node_deleter(rn.ptr);
+        }
+        retired_.clear();
     }
 }
 

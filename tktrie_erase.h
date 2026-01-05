@@ -28,7 +28,7 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
         // Batch try_reclaim - only every 1024 operations per thread
         thread_local uint32_t reclaim_counter = 0;
         if ((++reclaim_counter & 0x3FF) == 0) {
-            ebr_global::instance().try_reclaim();
+            ebr_try_reclaim();
         }
         
         auto& ebr_slot_ref = get_ebr_slot();
@@ -44,10 +44,10 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 auto res = erase_impl(&root_, root, kb);
                 if (!res.erased) return false;
                 if (res.deleted_subtree) {
-                    root_.store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
                     root_.store(nullptr);
                 } else if (res.new_node) {
-                    root_.store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
                     root_.store(res.new_node);
                 }
                 for (auto* old : res.old_nodes) retire_node(old);
@@ -99,10 +99,10 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 auto res = erase_impl(&root_, root, kb);
                 if (!res.erased) return false;
                 if (res.deleted_subtree) {
-                    root_.store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
                     root_.store(nullptr);
                 } else if (res.new_node) {
-                    root_.store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
                     root_.store(res.new_node);
                 }
                 for (auto* old : res.old_nodes) retire_node(old);
@@ -117,7 +117,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_impl(
     atomic_ptr*, ptr_t n, std::string_view key) {
     erase_result res;
-    if (!n) return res;
+    if (!n || n->is_poisoned()) return res;
     if (n->is_leaf()) return erase_from_leaf(n, key);
     return erase_from_interior(n, key);
 }
@@ -202,7 +202,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
         n->bump_version();
         // Set sentinel to block readers, then store new value
         if constexpr (THREADED) {
-            get_child_slot(n, c)->store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+            get_child_slot(n, c)->store(get_retry_sentinel<T, THREADED, Allocator>());
         }
         get_child_slot(n, c)->store(child_res.new_node);
     }

@@ -185,11 +185,27 @@ public:
         void clear() { merged = nullptr; parent_merged = nullptr; }
     };
 
+    // -------------------------------------------------------------------------
+    // Per-trie EBR retired node tracking
+    // -------------------------------------------------------------------------
+    struct retired_node {
+        ptr_t ptr;
+        uint64_t epoch;
+    };
+
 private:
     atomic_ptr root_;
     atomic_counter<THREADED> size_;
     mutable mutex_t mutex_;  // mutable so const readers can lock for sentinel wait
     builder_t builder_;
+    
+    // Per-trie EBR state (only used when THREADED=true)
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
+    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_;  // int placeholder for non-threaded
+    
+    // Per-trie EBR methods
+    void ebr_retire(ptr_t n, uint64_t epoch);
+    void ebr_try_reclaim();
 
     // -------------------------------------------------------------------------
     // Static helpers

@@ -60,6 +60,16 @@ struct node_base {
         header_.store(gteitelbaum::bump_version(header_.load()));
     }
     
+    void poison() noexcept {
+        // Preserve type/leaf bits, set version to max (poison)
+        uint64_t h = header_.load();
+        header_.store((h & FLAGS_MASK) | POISON_VERSION);
+    }
+    
+    bool is_poisoned() const noexcept {
+        return is_poisoned_header(header());
+    }
+    
     bool is_eos() const noexcept { return type() == TYPE_EOS; }
     bool is_skip() const noexcept { return type() == TYPE_SKIP; }
     bool is_list() const noexcept { return type() == TYPE_LIST; }
@@ -390,6 +400,33 @@ struct full_node : node_base<T, THREADED, Allocator> {
         });
     }
 };
+
+// =============================================================================
+// RETRY SENTINEL - self-referential poisoned FULL node
+// Safe to dereference - all children point back to itself, poison check catches it
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator>
+node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept {
+    // Static sentinel per template instantiation
+    static full_node<T, THREADED, Allocator> sentinel;
+    static bool initialized = []() {
+        // Interior FULL with poisoned version
+        sentinel.set_header(SENTINEL_HEADER);
+        sentinel.eos_ptr = nullptr;
+        sentinel.skip.clear();
+        // All 256 children point back to sentinel - creates safe infinite loop
+        // that will eventually hit a poison check
+        auto* self = static_cast<node_base<T, THREADED, Allocator>*>(&sentinel);
+        for (int i = 0; i < 256; ++i) {
+            sentinel.children[i].store(self);
+            sentinel.valid.set(static_cast<unsigned char>(i));
+        }
+        return true;
+    }();
+    (void)initialized;
+    return &sentinel;
+}
 
 // =============================================================================
 // LAYOUT CONSTANTS

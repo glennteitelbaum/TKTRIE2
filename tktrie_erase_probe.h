@@ -15,6 +15,12 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     ptr_t n, std::string_view key, erase_spec_info& info) const noexcept {
+    // Check if leaf is poisoned
+    if (n->is_poisoned()) {
+        info.op = erase_op::NOT_FOUND;  // Signal retry needed
+        return info;
+    }
+    
     std::string_view skip = get_skip(n);
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
@@ -53,7 +59,8 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
     ptr_t n, std::string_view key) const noexcept {
     erase_spec_info info;
 
-    if (!n) {
+    // Check for null or poisoned (includes sentinel)
+    if (!n || n->is_poisoned()) {
         info.op = erase_op::NOT_FOUND;
         return info;
     }
@@ -89,6 +96,11 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
                     info.collapse_child = n->as_full()->children[info.collapse_char].load();
                 }
                 if (info.collapse_child) {
+                    // Check if collapse child is poisoned
+                    if (info.collapse_child->is_poisoned()) {
+                        info.op = erase_op::NOT_FOUND;  // Signal retry
+                        return info;
+                    }
                     info.collapse_child_version = info.collapse_child->version();
                     info.child_skip = std::string(get_skip(info.collapse_child));
                 }
@@ -104,6 +116,13 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
 
         key.remove_prefix(1);
         n = child;
+        
+        // Check if child is poisoned - signal retry
+        if (n->is_poisoned()) {
+            info.op = erase_op::NOT_FOUND;  // Signal retry needed
+            return info;
+        }
+        
         if (info.path_len < erase_spec_info::MAX_PATH) {
             info.path[info.path_len++] = {n, n->version(), c};
         }
@@ -274,14 +293,26 @@ void TKTRIE_CLASS::fill_collapse_node(ptr_t merged, ptr_t child) {
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexcept {
     for (int i = 0; i < info.path_len; ++i) {
+        // Check for poisoned nodes
+        if (info.path[i].node->is_poisoned()) return false;
         if (info.path[i].node->version() != info.path[i].version) return false;
     }
     if (info.target && (info.path_len == 0 || info.path[info.path_len-1].node != info.target)) {
+        if (info.target->is_poisoned()) return false;
         if (info.target->version() != info.target_version) return false;
     }
-    if (info.collapse_child && info.collapse_child->version() != info.collapse_child_version) return false;
-    if (info.parent && info.parent->version() != info.parent_version) return false;
-    if (info.parent_collapse_child && info.parent_collapse_child->version() != info.parent_collapse_child_version) return false;
+    if (info.collapse_child) {
+        if (info.collapse_child->is_poisoned()) return false;
+        if (info.collapse_child->version() != info.collapse_child_version) return false;
+    }
+    if (info.parent) {
+        if (info.parent->is_poisoned()) return false;
+        if (info.parent->version() != info.parent_version) return false;
+    }
+    if (info.parent_collapse_child) {
+        if (info.parent_collapse_child->is_poisoned()) return false;
+        if (info.parent_collapse_child->version() != info.parent_collapse_child_version) return false;
+    }
     return true;
 }
 

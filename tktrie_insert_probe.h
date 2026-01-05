@@ -15,6 +15,12 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     ptr_t n, std::string_view key, speculative_info& info) const noexcept {
+    // Check if leaf is poisoned
+    if (n->is_poisoned()) {
+        info.op = spec_op::EXISTS;  // Signal retry needed
+        return info;
+    }
+    
     std::string_view skip = get_skip(n);
     size_t m = match_skip_impl(skip, key);
 
@@ -88,6 +94,12 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         return info;
     }
 
+    // Check if poisoned (includes sentinel)
+    if (n->is_poisoned()) {
+        info.op = spec_op::EXISTS;  // Signal retry needed
+        return info;
+    }
+
     info.path[info.path_len++] = {n, n->version(), 0};
 
     // Loop only on interior nodes
@@ -145,6 +157,13 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
 
         key.remove_prefix(1);
         n = child;
+        
+        // Check if child is poisoned - signal retry
+        if (n->is_poisoned()) {
+            info.op = spec_op::EXISTS;  // Signal retry needed
+            return info;
+        }
+        
         if (info.path_len < speculative_info::MAX_PATH) {
             info.path[info.path_len++] = {n, n->version(), c};
         }
@@ -278,11 +297,18 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
     for (int i = 0; i < info.path_len; ++i) {
+        // Check for poisoned nodes
+        if (info.path[i].node->is_poisoned()) {
+            return false;
+        }
         if (info.path[i].node->version() != info.path[i].version) {
             return false;
         }
     }
     if (info.target && (info.path_len == 0 || info.path[info.path_len-1].node != info.target)) {
+        if (info.target->is_poisoned()) {
+            return false;
+        }
         if (info.target->version() != info.target_version) {
             return false;
         }
@@ -312,7 +338,7 @@ void TKTRIE_CLASS::commit_to_slot(atomic_ptr* slot, ptr_t new_node,
     if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
     // Set sentinel to block readers, then store new value
     if constexpr (THREADED) {
-        slot->store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+        slot->store(get_retry_sentinel<T, THREADED, Allocator>());
     }
     slot->store(new_node);
 }
@@ -494,7 +520,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
         // Batch try_reclaim - only every 1024 operations per thread
         thread_local uint32_t reclaim_counter = 0;
         if ((++reclaim_counter & 0x3FF) == 0) {
-            ebr_global::instance().try_reclaim();
+            ebr_try_reclaim();
         }
         
         auto& slot = get_ebr_slot();
@@ -597,7 +623,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 
                 if (res.new_node) {
                     // Set sentinel to block readers, then store new root
-                    root_.store(retry_sentinel<node_base<T, THREADED, Allocator>>());
+                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
                     root_.store(res.new_node);
                 }
                 for (auto* old : res.old_nodes) retire_node(old);

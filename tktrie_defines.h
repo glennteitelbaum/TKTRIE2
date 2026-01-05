@@ -112,17 +112,14 @@ static constexpr uint64_t VERSION_MASK = (1ULL << 61) - 1;
 
 static constexpr int LIST_MAX = 7;
 
-// Sentinel value indicating a slot is being modified - readers should spin
-static constexpr uintptr_t RETRY_SENTINEL_VALUE = 1;
+// Poison detection uses max version - no real node will ever reach this
+static constexpr uint64_t POISON_VERSION = VERSION_MASK;
 
-template <typename T>
-inline T* retry_sentinel() noexcept {
-    return reinterpret_cast<T*>(RETRY_SENTINEL_VALUE);
-}
+// Interior FULL node header with poisoned version - used for sentinel
+static constexpr uint64_t SENTINEL_HEADER = TYPE_FULL | POISON_VERSION;
 
-template <typename T>
-inline bool is_retry_sentinel(T* ptr) noexcept {
-    return reinterpret_cast<uintptr_t>(ptr) == RETRY_SENTINEL_VALUE;
+inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
+    return (h & VERSION_MASK) == POISON_VERSION;
 }
 
 inline constexpr uint64_t make_header(bool is_leaf, uint64_t type, uint64_t version = 0) noexcept {
