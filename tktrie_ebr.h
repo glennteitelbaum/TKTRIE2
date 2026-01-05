@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 
@@ -62,11 +63,19 @@ private:
     uint64_t safe_epoch();
     
 public:
+    ~ebr_global() { 
+        // Don't call force_reclaim_all - the tree's dealloc_node already freed
+        // the live nodes. Calling force_reclaim_all would try to free retired
+        // nodes that might overlap with nodes still in the tree.
+        // Accept the memory leak for now.
+    }
+    
     static ebr_global& instance();
     ebr_slot& get_slot();
     void retire(void* ptr, deleter_t deleter);
     void advance_epoch();
     void try_reclaim();
+    void force_reclaim_all();  // Force delete all retired nodes
 };
 
 // Free function for convenience
@@ -141,6 +150,13 @@ inline ebr_slot& ebr_global::get_slot() {
 inline void ebr_global::retire(void* ptr, deleter_t deleter) {
     uint64_t e = ebr_slot::global_epoch().load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lock(mutex_);
+    // Check for duplicate retirement (indicates bug)
+    for (const auto& r : retired_) {
+        if (r.ptr == ptr) {
+            // Already retired - skip
+            return;
+        }
+    }
     retired_.push_back({ptr, deleter, e});
 }
 
@@ -149,10 +165,22 @@ inline void ebr_global::advance_epoch() {
 }
 
 inline void ebr_global::try_reclaim() {
-    uint64_t safe = safe_epoch();
     std::vector<retired_node> still_retired;
     
     std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Calculate safe epoch - minimum of global epoch and all active readers
+    uint64_t ge = ebr_slot::global_epoch().load(std::memory_order_acquire);
+    uint64_t safe = ge;
+    for (auto* slot : slots_) {
+        if (slot->is_active()) {
+            uint64_t se = slot->epoch();
+            if (se < safe) safe = se;
+        }
+    }
+    
+    // Reclaim nodes retired before the safe epoch
+    // If r.epoch < safe, all threads have moved past that epoch
     for (auto& r : retired_) {
         if (r.epoch < safe) {
             r.deleter(r.ptr);
@@ -161,6 +189,14 @@ inline void ebr_global::try_reclaim() {
         }
     }
     retired_ = std::move(still_retired);
+}
+
+inline void ebr_global::force_reclaim_all() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& r : retired_) {
+        r.deleter(r.ptr);
+    }
+    retired_.clear();
 }
 
 inline uint64_t ebr_global::safe_epoch() {

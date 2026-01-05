@@ -5,6 +5,8 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -15,6 +17,29 @@
 #include <cassert>
 #define KTRIE_DEBUG_ASSERT(cond) assert(cond)
 #endif
+
+// =============================================================================
+// PLACEMENT NEW/DESTROY UTILITIES
+// C++20 compatible, uses std::construct_at/destroy_at if available (C++20+)
+// =============================================================================
+
+template <typename T, typename... Args>
+constexpr T* ktrie_construct_at(T* p, Args&&... args) {
+#if __cplusplus >= 202002L && defined(__cpp_lib_constexpr_dynamic_alloc)
+    return std::construct_at(p, std::forward<Args>(args)...);
+#else
+    return ::new (static_cast<void*>(p)) T(std::forward<Args>(args)...);
+#endif
+}
+
+template <typename T>
+constexpr void ktrie_destroy_at(T* p) {
+#if __cplusplus >= 202002L && defined(__cpp_lib_constexpr_dynamic_alloc)
+    std::destroy_at(p);
+#else
+    p->~T();
+#endif
+}
 
 namespace gteitelbaum {
 

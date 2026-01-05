@@ -90,6 +90,7 @@ struct eos_node : node_base<T, THREADED, Allocator> {
     };
     
     eos_node();
+    ~eos_node();
 };
 
 // =============================================================================
@@ -106,6 +107,7 @@ struct skip_node : node_base<T, THREADED, Allocator> {
     std::string skip;
     
     skip_node();
+    ~skip_node();
 };
 
 // =============================================================================
@@ -129,6 +131,17 @@ struct list_node : node_base<T, THREADED, Allocator> {
     };
     
     list_node();
+    ~list_node();
+    
+    // Helper to properly construct a leaf value at index
+    void construct_leaf_value(int idx, const T& value) {
+        new (&leaf_values[idx]) T(value);
+    }
+    
+    // Helper to destroy a leaf value at index
+    void destroy_leaf_value(int idx) {
+        leaf_values[idx].~T();
+    }
 };
 
 // =============================================================================
@@ -150,6 +163,17 @@ struct full_node : node_base<T, THREADED, Allocator> {
     };
     
     full_node();
+    ~full_node();
+    
+    // Helper to properly construct a leaf value at index
+    void construct_leaf_value(unsigned char c, const T& value) {
+        new (&leaf_values[c]) T(value);
+    }
+    
+    // Helper to destroy a leaf value at index
+    void destroy_leaf_value(unsigned char c) {
+        leaf_values[c].~T();
+    }
 };
 
 // =============================================================================
@@ -323,23 +347,60 @@ int node_base<T, THREADED, Allocator>::child_count() const noexcept {
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator>
-eos_node<T, THREADED, Allocator>::eos_node() : eos_ptr(nullptr) {}
+eos_node<T, THREADED, Allocator>::eos_node() {
+    // Don't initialize union - builder will do it after setting header
+}
 
 template <typename T, bool THREADED, typename Allocator>
-skip_node<T, THREADED, Allocator>::skip_node() : eos_ptr(nullptr) {}
+eos_node<T, THREADED, Allocator>::~eos_node() {
+    if (this->is_leaf()) {
+        leaf_value.~T();
+    }
+    // eos_ptr is managed externally, don't delete here
+}
+
+template <typename T, bool THREADED, typename Allocator>
+skip_node<T, THREADED, Allocator>::skip_node() {
+    // Don't initialize union - builder will do it after setting header
+}
+
+template <typename T, bool THREADED, typename Allocator>
+skip_node<T, THREADED, Allocator>::~skip_node() {
+    if (this->is_leaf()) {
+        leaf_value.~T();
+    }
+    // eos_ptr is managed externally, don't delete here
+}
 
 template <typename T, bool THREADED, typename Allocator>
 list_node<T, THREADED, Allocator>::list_node() : eos_ptr(nullptr) {
-    for (int i = 0; i < MAX_CHILDREN; ++i) {
-        children[i].store(nullptr);
+    // Don't initialize union - builder will do it after setting header
+}
+
+template <typename T, bool THREADED, typename Allocator>
+list_node<T, THREADED, Allocator>::~list_node() {
+    if (this->is_leaf()) {
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            leaf_values[i].~T();
+        }
     }
+    // children and eos_ptr are managed externally
 }
 
 template <typename T, bool THREADED, typename Allocator>
 full_node<T, THREADED, Allocator>::full_node() : eos_ptr(nullptr) {
-    for (int i = 0; i < 256; ++i) {
-        children[i].store(nullptr);
+    // Don't initialize union - builder will do it after setting header
+}
+
+template <typename T, bool THREADED, typename Allocator>
+full_node<T, THREADED, Allocator>::~full_node() {
+    if (this->is_leaf()) {
+        valid.for_each_set([this](unsigned char c) {
+            leaf_values[c].~T();
+        });
     }
+    // children and eos_ptr are managed externally
 }
 
 // =============================================================================
@@ -351,7 +412,7 @@ typename node_builder<T, THREADED, Allocator>::ptr_t
 node_builder<T, THREADED, Allocator>::make_leaf_eos(const T& value) {
     auto* n = new eos_t();
     n->set_header(make_header(true, TYPE_EOS));
-    n->leaf_value = value;
+    new (&n->leaf_value) T(value);
     return n;
 }
 
@@ -361,7 +422,7 @@ node_builder<T, THREADED, Allocator>::make_leaf_skip(std::string_view sk, const 
     auto* n = new skip_t();
     n->set_header(make_header(true, TYPE_SKIP));
     n->skip = std::string(sk);
-    n->leaf_value = value;
+    new (&n->leaf_value) T(value);
     return n;
 }
 
@@ -408,6 +469,10 @@ node_builder<T, THREADED, Allocator>::make_interior_list(std::string_view sk) {
     auto* n = new list_t();
     n->set_header(make_header(false, TYPE_LIST));
     n->skip = std::string(sk);
+    // Initialize children array for interior node
+    for (int i = 0; i < list_t::MAX_CHILDREN; ++i) {
+        n->children[i].store(nullptr);
+    }
     return n;
 }
 
@@ -417,6 +482,10 @@ node_builder<T, THREADED, Allocator>::make_interior_full(std::string_view sk) {
     auto* n = new full_t();
     n->set_header(make_header(false, TYPE_FULL));
     n->skip = std::string(sk);
+    // Initialize children array for interior node
+    for (int i = 0; i < 256; ++i) {
+        n->children[i].store(nullptr);
+    }
     return n;
 }
 
@@ -482,7 +551,7 @@ node_builder<T, THREADED, Allocator>::deep_copy(ptr_t src) {
                 d->chars = s->chars;
                 int cnt = s->chars.count();
                 for (int i = 0; i < cnt; ++i) {
-                    d->leaf_values[i] = s->leaf_values[i];
+                    d->construct_leaf_value(i, s->leaf_values[i]);
                 }
                 return d;
             }
@@ -493,7 +562,7 @@ node_builder<T, THREADED, Allocator>::deep_copy(ptr_t src) {
                 d->skip = s->skip;
                 d->valid = s->valid;
                 s->valid.for_each_set([s, d](unsigned char c) {
-                    d->leaf_values[c] = s->leaf_values[c];
+                    d->construct_leaf_value(c, s->leaf_values[c]);
                 });
                 return d;
             }
