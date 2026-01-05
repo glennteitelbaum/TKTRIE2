@@ -13,6 +13,42 @@ namespace gteitelbaum {
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
+typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
+    ptr_t n, std::string_view key, erase_spec_info& info) const noexcept {
+    std::string_view skip = get_skip(n);
+    size_t m = match_skip_impl(skip, key);
+    if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
+    key.remove_prefix(m);
+
+    if (n->is_eos() | n->is_skip()) {
+        if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
+        info.op = n->is_eos() ? erase_op::DELETE_LEAF_EOS : erase_op::DELETE_LEAF_SKIP;
+        info.target = n;
+        info.target_version = n->version();
+        return info;
+    }
+
+    if (key.size() != 1) { info.op = erase_op::NOT_FOUND; return info; }
+
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    info.c = c;
+    info.target = n;
+    info.target_version = n->version();
+
+    if (n->is_list()) {
+        int idx = n->as_list()->chars.find(c);
+        if (idx < 0) { info.op = erase_op::NOT_FOUND; return info; }
+        info.op = (n->as_list()->chars.count() == 1) ? 
+            erase_op::DELETE_LAST_LEAF_LIST : erase_op::IN_PLACE_LEAF_LIST;
+        return info;
+    }
+
+    if (!n->as_full()->valid.test(c)) { info.op = erase_op::NOT_FOUND; return info; }
+    info.op = erase_op::IN_PLACE_LEAF_FULL;
+    return info;
+}
+
+TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
     ptr_t n, std::string_view key) const noexcept {
     erase_spec_info info;
@@ -24,41 +60,8 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
 
     info.path[info.path_len++] = {n, n->version(), 0};
 
-    while (n) {
-        if (n->is_leaf()) {
-            std::string_view skip = get_skip(n);
-            size_t m = match_skip_impl(skip, key);
-            if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
-            key.remove_prefix(m);
-
-            if (n->is_eos() | n->is_skip()) {
-                if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
-                info.op = n->is_eos() ? erase_op::DELETE_LEAF_EOS : erase_op::DELETE_LEAF_SKIP;
-                info.target = n;
-                info.target_version = n->version();
-                return info;
-            }
-
-            if (key.size() != 1) { info.op = erase_op::NOT_FOUND; return info; }
-
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            info.c = c;
-            info.target = n;
-            info.target_version = n->version();
-
-            if (n->is_list()) {
-                int idx = n->as_list()->chars.find(c);
-                if (idx < 0) { info.op = erase_op::NOT_FOUND; return info; }
-                info.op = (n->as_list()->chars.count() == 1) ? 
-                    erase_op::DELETE_LAST_LEAF_LIST : erase_op::IN_PLACE_LEAF_LIST;
-                return info;
-            }
-
-            if (!n->as_full()->valid.test(c)) { info.op = erase_op::NOT_FOUND; return info; }
-            info.op = erase_op::IN_PLACE_LEAF_FULL;
-            return info;
-        }
-
+    // Loop only on interior nodes
+    while (!n->is_leaf()) {
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
         if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
@@ -106,8 +109,8 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
         }
     }
 
-    info.op = erase_op::NOT_FOUND;
-    return info;
+    // n is now a leaf
+    return probe_leaf_erase(n, key, info);
 }
 
 TKTRIE_TEMPLATE

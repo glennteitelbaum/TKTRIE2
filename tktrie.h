@@ -221,6 +221,7 @@ private:
     // Speculative insert operations
     // -------------------------------------------------------------------------
     speculative_info probe_speculative(ptr_t n, std::string_view key) const noexcept;
+    speculative_info probe_leaf_speculative(ptr_t n, std::string_view key, speculative_info& info) const noexcept;
     pre_alloc allocate_speculative(const speculative_info& info, const T& value);
     bool validate_path(const speculative_info& info) const noexcept;
     atomic_ptr* find_slot_for_commit(const speculative_info& info) noexcept;
@@ -234,6 +235,7 @@ private:
     // Erase operations
     // -------------------------------------------------------------------------
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
+    erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     void capture_parent_collapse_info(erase_spec_info& info) const noexcept;
     bool check_collapse_needed(ptr_t parent, unsigned char removed_c, unsigned char& collapse_c, ptr_t& collapse_child) const noexcept;
     ptr_t allocate_collapse_node_impl(std::string_view prefix_skip, unsigned char edge_char,

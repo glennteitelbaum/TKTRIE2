@@ -13,6 +13,71 @@ namespace gteitelbaum {
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
+typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
+    ptr_t n, std::string_view key, speculative_info& info) const noexcept {
+    std::string_view skip = get_skip(n);
+    size_t m = match_skip_impl(skip, key);
+
+    if (n->is_eos()) {
+        if (key.empty()) { info.op = spec_op::EXISTS; return info; }
+        info.op = spec_op::DEMOTE_LEAF_EOS;
+        info.target = n;
+        info.target_version = n->version();
+        info.remaining_key = std::string(key);
+        return info;
+    }
+
+    if (n->is_skip()) {
+        if ((m == skip.size()) & (m == key.size())) { info.op = spec_op::EXISTS; return info; }
+        info.target = n;
+        info.target_version = n->version();
+        info.target_skip = std::string(skip);
+        info.match_pos = m;
+
+        if ((m < skip.size()) & (m < key.size())) { info.op = spec_op::SPLIT_LEAF_SKIP; }
+        else if (m == key.size()) { info.op = spec_op::PREFIX_LEAF_SKIP; }
+        else { info.op = spec_op::EXTEND_LEAF_SKIP; }
+        info.remaining_key = std::string(key);
+        return info;
+    }
+
+    // LIST or FULL leaf
+    info.target = n;
+    info.target_version = n->version();
+    info.target_skip = std::string(skip);
+
+    if ((m < skip.size()) & (m < key.size())) {
+        info.op = spec_op::SPLIT_LEAF_LIST;
+        info.match_pos = m;
+        info.remaining_key = std::string(key);
+        return info;
+    }
+    if (m < skip.size()) {
+        info.op = spec_op::PREFIX_LEAF_LIST;
+        info.match_pos = m;
+        info.remaining_key = std::string(key);
+        return info;
+    }
+    key.remove_prefix(m);
+    info.remaining_key = std::string(key);
+
+    if (key.empty()) { info.op = spec_op::ADD_EOS_LEAF_LIST; return info; }
+    if (key.size() != 1) { info.op = spec_op::DEMOTE_LEAF_LIST; return info; }
+
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    info.c = c;
+
+    if (n->is_list()) {
+        if (n->as_list()->chars.find(c) >= 0) { info.op = spec_op::EXISTS; return info; }
+        info.op = (n->as_list()->chars.count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
+        return info;
+    }
+    // FULL
+    info.op = n->as_full()->valid.test(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
+    return info;
+}
+
+TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
     ptr_t n, std::string_view key) const noexcept {
     speculative_info info;
@@ -25,102 +90,8 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
 
     info.path[info.path_len++] = {n, n->version(), 0};
 
-    while (n) {
-        if (n->is_leaf()) {
-            std::string_view skip = get_skip(n);
-            size_t m = match_skip_impl(skip, key);
-
-            if (n->is_eos()) {
-                if (key.empty()) {
-                    info.op = spec_op::EXISTS;
-                    return info;
-                }
-                info.op = spec_op::DEMOTE_LEAF_EOS;
-                info.target = n;
-                info.target_version = n->version();
-                info.remaining_key = std::string(key);
-                return info;
-            }
-
-            if (n->is_skip()) {
-                if ((m == skip.size()) & (m == key.size())) {
-                    info.op = spec_op::EXISTS;
-                    return info;
-                }
-                info.target = n;
-                info.target_version = n->version();
-                info.target_skip = std::string(skip);
-                info.match_pos = m;
-
-                if ((m < skip.size()) & (m < key.size())) {
-                    info.op = spec_op::SPLIT_LEAF_SKIP;
-                    info.remaining_key = std::string(key);
-                    return info;
-                }
-                if (m == key.size()) {
-                    info.op = spec_op::PREFIX_LEAF_SKIP;
-                    info.remaining_key = std::string(key);
-                    return info;
-                }
-                info.op = spec_op::EXTEND_LEAF_SKIP;
-                info.remaining_key = std::string(key);
-                return info;
-            }
-
-            // LIST or FULL leaf
-            info.target = n;
-            info.target_version = n->version();
-            info.target_skip = std::string(skip);
-
-            if ((m < skip.size()) & (m < key.size())) {
-                info.op = spec_op::SPLIT_LEAF_LIST;
-                info.match_pos = m;
-                info.remaining_key = std::string(key);
-                return info;
-            }
-            if (m < skip.size()) {
-                info.op = spec_op::PREFIX_LEAF_LIST;
-                info.match_pos = m;
-                info.remaining_key = std::string(key);
-                return info;
-            }
-            key.remove_prefix(m);
-            info.remaining_key = std::string(key);
-
-            if (key.empty()) {
-                info.op = spec_op::ADD_EOS_LEAF_LIST;
-                return info;
-            }
-            if (key.size() != 1) {
-                info.op = spec_op::DEMOTE_LEAF_LIST;
-                return info;
-            }
-
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            info.c = c;
-
-            if (n->is_list()) {
-                if (n->as_list()->chars.find(c) >= 0) {
-                    info.op = spec_op::EXISTS;
-                    return info;
-                }
-                if (n->as_list()->chars.count() < LIST_MAX) {
-                    info.op = spec_op::IN_PLACE_LEAF;
-                    return info;
-                }
-                info.op = spec_op::LIST_TO_FULL_LEAF;
-                return info;
-            }
-            // FULL
-            if (n->as_full()->valid.test(c)) {
-                info.op = spec_op::EXISTS;
-                return info;
-            }
-            info.op = spec_op::IN_PLACE_LEAF;
-            return info;
-        }
-
-        // Interior node
+    // Loop only on interior nodes
+    while (!n->is_leaf()) {
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
 
@@ -146,10 +117,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
 
         if (key.empty()) {
             T* p = get_eos_ptr(n);
-            if (p) {
-                info.op = spec_op::EXISTS;
-                return info;
-            }
+            if (p) { info.op = spec_op::EXISTS; return info; }
             info.op = spec_op::IN_PLACE_INTERIOR;
             info.target = n;
             info.target_version = n->version();
@@ -167,15 +135,11 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             info.c = c;
             info.remaining_key = std::string(key.substr(1));
 
-            if (n->is_list() && n->as_list()->chars.count() < LIST_MAX) {
+            if ((n->is_list() && n->as_list()->chars.count() < LIST_MAX) | n->is_full()) {
                 info.op = spec_op::IN_PLACE_INTERIOR;
-                return info;
+            } else {
+                info.op = spec_op::ADD_CHILD_CONVERT;
             }
-            if (n->is_full()) {
-                info.op = spec_op::IN_PLACE_INTERIOR;
-                return info;
-            }
-            info.op = spec_op::ADD_CHILD_CONVERT;
             return info;
         }
 
@@ -186,8 +150,8 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         }
     }
 
-    info.op = spec_op::EMPTY_TREE;
-    return info;
+    // n is now a leaf
+    return probe_leaf_speculative(n, key, info);
 }
 
 TKTRIE_TEMPLATE

@@ -87,9 +87,10 @@ typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigne
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexcept {
-    while (n) {
-        if (n->is_leaf()) return read_from_leaf(n, key, out);
-
+    if (!n) return false;
+    
+    // Loop only on interior nodes
+    while (!n->is_leaf()) {
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
         if (m < skip.size()) return false;
@@ -104,11 +105,12 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexce
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        ptr_t child = find_child(n, c);
-        if (!child) return false;
-        n = child;
+        n = find_child(n, c);
+        if (!n) return false;
     }
-    return false;
+    
+    // n is now a leaf
+    return read_from_leaf(n, key, out);
 }
 
 TKTRIE_TEMPLATE
@@ -118,14 +120,9 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
     if (m < skip.size()) return false;
     key.remove_prefix(m);
 
-    if (leaf->is_eos()) {
+    if (leaf->is_eos() | leaf->is_skip()) {
         if (!key.empty()) return false;
-        out = leaf->as_eos()->leaf_value;
-        return true;
-    }
-    if (leaf->is_skip()) {
-        if (!key.empty()) return false;
-        out = leaf->as_skip()->leaf_value;
+        out = leaf->is_eos() ? leaf->as_eos()->leaf_value : leaf->as_skip()->leaf_value;
         return true;
     }
     if (key.size() != 1) return false;
@@ -137,12 +134,10 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
         out = leaf->as_list()->leaf_values[idx];
         return true;
     }
-    if (leaf->is_full()) {
-        if (!leaf->as_full()->valid.test(c)) return false;
-        out = leaf->as_full()->leaf_values[c];
-        return true;
-    }
-    return false;
+    // FULL
+    if (!leaf->as_full()->valid.test(c)) return false;
+    out = leaf->as_full()->leaf_values[c];
+    return true;
 }
 
 TKTRIE_TEMPLATE
