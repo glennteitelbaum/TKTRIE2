@@ -14,19 +14,21 @@
 namespace gteitelbaum {
 
 // =============================================================================
-// KEY TRAITS
+// KEY TRAITS - provides to_bytes, from_bytes, and FIXED_LEN
 // =============================================================================
 
 template <typename Key> struct tktrie_traits;
 
 template <>
 struct tktrie_traits<std::string> {
+    static constexpr size_t FIXED_LEN = 0;  // Variable length
     static std::string_view to_bytes(const std::string& k) noexcept { return k; }
     static std::string from_bytes(std::string_view b) { return std::string(b); }
 };
 
 template <typename T> requires std::is_integral_v<T>
 struct tktrie_traits<T> {
+    static constexpr size_t FIXED_LEN = sizeof(T);  // Fixed length
     using unsigned_t = std::make_unsigned_t<T>;
     static std::string to_bytes(T k) {
         unsigned_t sortable;
@@ -62,10 +64,13 @@ template <typename Key, typename T, bool THREADED = false, typename Allocator = 
 class tktrie {
 public:
     using traits = tktrie_traits<Key>;
-    using ptr_t = node_base<T, THREADED, Allocator>*;
-    using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator>;
-    using builder_t = node_builder<T, THREADED, Allocator>;
-    using skip_t = skip_node<T, THREADED, Allocator>;
+    static constexpr size_t FIXED_LEN = traits::FIXED_LEN;
+    
+    using ptr_t = node_base<T, THREADED, Allocator, FIXED_LEN>*;
+    using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator, FIXED_LEN>;
+    using builder_t = node_builder<T, THREADED, Allocator, FIXED_LEN>;
+    using skip_t = skip_node<T, THREADED, Allocator, FIXED_LEN>;
+    using data_t = dataptr<T, THREADED, Allocator>;
     using iterator = tktrie_iterator<Key, T, THREADED, Allocator>;
     using mutex_t = std::conditional_t<THREADED, std::mutex, empty_mutex>;
 
@@ -178,14 +183,12 @@ public:
 private:
     atomic_ptr root_;
     atomic_counter<THREADED> size_;
-    mutable mutex_t mutex_;  // mutable so const readers can lock for sentinel wait
+    mutable mutex_t mutex_;
     builder_t builder_;
     
-    // Per-trie EBR state (only used when THREADED=true)
     mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
-    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_;  // int placeholder for non-threaded
+    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_;
     
-    // Per-trie EBR methods
     void ebr_retire(ptr_t n, uint64_t epoch);
     void ebr_try_reclaim();
 
@@ -194,14 +197,18 @@ private:
     // -------------------------------------------------------------------------
     static void node_deleter(void* ptr);
     static std::string_view get_skip(ptr_t n) noexcept;
-    static T* get_eos_ptr(ptr_t n) noexcept;
-    static void set_eos_ptr(ptr_t n, T* p) noexcept;
+    
+    // EOS access - only available when FIXED_LEN == 0
+    static bool has_eos(ptr_t n) noexcept;
+    static bool try_read_eos(ptr_t n, T& out) noexcept;
+    static void set_eos(ptr_t n, const T& value);
+    static void clear_eos(ptr_t n);
 
     // -------------------------------------------------------------------------
     // Instance helpers
     // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
-    void maybe_reclaim() noexcept;  // Batched reclaim (every 1024 ops)
+    void maybe_reclaim() noexcept;
     ptr_t find_child(ptr_t n, unsigned char c) const noexcept;
     atomic_ptr* get_child_slot(ptr_t n, unsigned char c) noexcept;
 
@@ -212,7 +219,6 @@ private:
     bool read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept;
     bool contains_impl(ptr_t n, std::string_view key) const noexcept;
     
-    // Optimistic read operations (lock-free fast path)
     bool read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept;
     bool validate_read_path(const read_path& path) const noexcept;
 
@@ -349,5 +355,4 @@ using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator>;
 
 }  // namespace gteitelbaum
 
-// Include implementation
 #include "tktrie_core.h"

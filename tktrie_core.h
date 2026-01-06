@@ -26,16 +26,46 @@ std::string_view TKTRIE_CLASS::get_skip(ptr_t n) noexcept {
 }
 
 TKTRIE_TEMPLATE
-T* TKTRIE_CLASS::get_eos_ptr(ptr_t n) noexcept {
-    if (n->is_leaf()) return nullptr;
-    if (n->is_list()) [[likely]] return n->template as_list<false>()->eos_ptr;
-    return n->template as_full<false>()->eos_ptr;
+bool TKTRIE_CLASS::has_eos(ptr_t n) noexcept {
+    if constexpr (FIXED_LEN == 0) {
+        if (n->is_leaf()) return false;
+        if (n->is_list()) [[likely]] return n->template as_list<false>()->eos.has_data();
+        return n->template as_full<false>()->eos.has_data();
+    } else {
+        return false;  // Fixed-length keys can't have EOS
+    }
 }
 
 TKTRIE_TEMPLATE
-void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
-    if (n->is_list()) [[likely]] n->template as_list<false>()->eos_ptr = p;
-    else n->template as_full<false>()->eos_ptr = p;
+bool TKTRIE_CLASS::try_read_eos(ptr_t n, T& out) noexcept {
+    if constexpr (FIXED_LEN == 0) {
+        if (n->is_leaf()) return false;
+        if (n->is_list()) [[likely]] return n->template as_list<false>()->eos.try_read(out);
+        return n->template as_full<false>()->eos.try_read(out);
+    } else {
+        (void)n; (void)out;
+        return false;
+    }
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::set_eos(ptr_t n, const T& value) {
+    if constexpr (FIXED_LEN == 0) {
+        if (n->is_list()) [[likely]] n->template as_list<false>()->eos.set(value);
+        else n->template as_full<false>()->eos.set(value);
+    } else {
+        (void)n; (void)value;
+    }
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::clear_eos(ptr_t n) {
+    if constexpr (FIXED_LEN == 0) {
+        if (n->is_list()) [[likely]] n->template as_list<false>()->eos.clear();
+        else n->template as_full<false>()->eos.clear();
+    } else {
+        (void)n;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -132,9 +162,7 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexce
         key.remove_prefix(m);
 
         if (key.empty()) {
-            T* p = get_eos_ptr(n);
-            if (p) { out = *p; return true; }
-            return false;
+            return try_read_eos(n, out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
@@ -160,8 +188,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
 
     if (leaf->is_skip()) {
         if (!key.empty()) return false;
-        out = leaf->as_skip()->leaf_value;
-        return true;
+        return leaf->as_skip()->value.try_read(out);
     }
     
     if (key.size() != 1) return false;
@@ -170,12 +197,10 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
     if (leaf->is_list()) [[likely]] {
         int idx = leaf->template as_list<true>()->chars.find(c);
         if (idx < 0) return false;
-        out = leaf->template as_list<true>()->leaf_values[idx];
-        return true;
+        return leaf->template as_list<true>()->values[idx].try_read(out);
     }
     if (!leaf->template as_full<true>()->valid.template atomic_test<THREADED>(c)) return false;
-    out = leaf->template as_full<true>()->leaf_values[c];
-    return true;
+    return leaf->template as_full<true>()->values[c].try_read(out);
 }
 
 TKTRIE_TEMPLATE
@@ -191,9 +216,7 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         key.remove_prefix(m);
 
         if (key.empty()) {
-            T* p = get_eos_ptr(n);
-            if (p) { out = *p; return true; }
-            return false;
+            return try_read_eos(n, out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);

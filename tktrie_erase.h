@@ -1,6 +1,6 @@
 #pragma once
 
-// This file contains implementation details for tktrie (erase implementation)
+// This file contains erase implementation
 // It should only be included from tktrie_erase_probe.h
 
 namespace gteitelbaum {
@@ -13,10 +13,10 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
     auto apply_erase_result = [this](erase_result& res) -> bool {
         if (!res.erased) return false;
         if (res.deleted_subtree) {
-            if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator>());
+            if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             root_.store(nullptr);
         } else if (res.new_node) {
-            if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator>());
+            if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             root_.store(res.new_node);
         }
         for (auto* old : res.old_nodes) retire_node(old);
@@ -107,7 +107,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         }
 
         leaf->bump_version();
-        ln->shift_leaf_values_down(idx);
+        ln->shift_values_down(idx);
         res.erased = true;
         return res;
     }
@@ -115,7 +115,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     auto* fn = leaf->template as_full<true>();
     if (!fn->valid.template atomic_test<THREADED>(c)) return res;
     leaf->bump_version();
-    fn->template remove_leaf_entry<THREADED>(c);
+    fn->template remove_entry<THREADED>(c);
     res.erased = true;
     return res;
 }
@@ -130,13 +130,15 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     key.remove_prefix(m);
 
     if (key.empty()) {
-        T* p = get_eos_ptr(n);
-        if (!p) return res;
-        n->bump_version();
-        delete p;
-        set_eos_ptr(n, nullptr);
-        res.erased = true;
-        return try_collapse_interior(n);
+        if constexpr (FIXED_LEN > 0) {
+            return res;  // Fixed-length keys can't have EOS
+        } else {
+            if (!has_eos(n)) return res;
+            n->bump_version();
+            clear_eos(n);
+            res.erased = true;
+            return try_collapse_interior(n);
+        }
     }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
@@ -154,7 +156,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     if (child_res.new_node) {
         n->bump_version();
         if constexpr (THREADED) {
-            get_child_slot(n, c)->store(get_retry_sentinel<T, THREADED, Allocator>());
+            get_child_slot(n, c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
         }
         get_child_slot(n, c)->store(child_res.new_node);
     }
@@ -168,8 +170,8 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
     erase_result res;
     res.erased = true;
 
-    T* eos = get_eos_ptr(n);
-    if (eos) return res;
+    bool eos_exists = has_eos(n);
+    if (eos_exists) return res;
 
     int child_cnt = n->child_count();
     if (child_cnt == 0) {
@@ -202,7 +204,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     res.old_nodes = std::move(child_res.old_nodes);
     res.erased = true;
 
-    T* eos = get_eos_ptr(n);
+    bool eos_exists = has_eos(n);
     int remaining = n->child_count();
 
     if (n->is_list()) {
@@ -214,7 +216,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (fn->valid.template atomic_test<THREADED>(removed_c)) remaining--;
     }
 
-    if ((!eos) & (remaining == 0)) {
+    if ((!eos_exists) & (remaining == 0)) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
         return res;
@@ -238,12 +240,12 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
-        if (ln->chars.count() == 1 && !eos) {
+        if (ln->chars.count() == 1 && !eos_exists) {
             c = ln->chars.char_at(0);
             child = ln->children[0].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
-    } else if (n->is_full() && !eos) {
+    } else if (n->is_full() && !eos_exists) {
         auto* fn = n->template as_full<false>();
         int cnt = fn->valid.count();
         if (cnt == 1) {
@@ -269,13 +271,15 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
     ptr_t merged;
     if (child->is_leaf()) {
         if (child->is_skip()) {
-            merged = builder_.make_leaf_skip(new_skip, child->as_skip()->leaf_value);
+            T val;
+            child->as_skip()->value.try_read(val);
+            merged = builder_.make_leaf_skip(new_skip, val);
         } else if (child->is_list()) [[likely]] {
             merged = builder_.make_leaf_list(new_skip);
-            child->template as_list<true>()->copy_leaf_values_to(merged->template as_list<true>());
+            child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
         } else {
             merged = builder_.make_leaf_full(new_skip);
-            child->template as_full<true>()->copy_leaf_values_to(merged->template as_full<true>());
+            child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
         }
     } else {
         if (child->is_list()) [[likely]] {

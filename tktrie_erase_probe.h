@@ -1,6 +1,6 @@
 #pragma once
 
-// This file contains implementation details for tktrie (erase probing and allocation)
+// This file contains erase probing for concurrent operations
 // It should only be included from tktrie_insert_probe.h
 
 namespace gteitelbaum {
@@ -106,7 +106,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint6
     if (count <= 1) return false;
 
     leaf->bump_version();
-    ln->shift_leaf_values_down(idx);
+    ln->shift_values_down(idx);
     return true;
 }
 
@@ -116,7 +116,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
     auto* fn = leaf->template as_full<true>();
     if (!fn->valid.template atomic_test<THREADED>(c)) return false;
     leaf->bump_version();
-    fn->template remove_leaf_entry<THREADED>(c);
+    fn->template remove_entry<THREADED>(c);
     return true;
 }
 
