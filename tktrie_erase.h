@@ -131,7 +131,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (m < skip.size()) return res;
     key.remove_prefix(m);
 
-    if (leaf->is_eos() | leaf->is_skip()) {
+    if (leaf->is_skip()) {
         if (!key.empty()) return res;
         res.erased = true;
         res.deleted_subtree = true;
@@ -139,10 +139,11 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         return res;
     }
 
+    // LIST or FULL leaf
     if (key.size() != 1) return res;
     unsigned char c = static_cast<unsigned char>(key[0]);
 
-    if (leaf->is_list()) {
+    if (leaf->is_list()) [[likely]] {
         int idx = leaf->as_list()->chars.find(c);
         if (idx < 0) return res;
 
@@ -307,10 +308,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
 
     ptr_t merged;
     if (child->is_leaf()) {
-        if (child->is_eos() | child->is_skip()) {
-            T& val = child->is_eos() ? child->as_eos()->leaf_value : child->as_skip()->leaf_value;
-            merged = builder_.make_leaf_skip(new_skip, val);
-        } else if (child->is_list()) {
+        if (child->is_skip()) {
+            merged = builder_.make_leaf_skip(new_skip, child->as_skip()->leaf_value);
+        } else if (child->is_list()) [[likely]] {
             merged = builder_.make_leaf_list(new_skip);
             child->as_list()->copy_leaf_values_to(merged->as_list());
         } else {
@@ -318,11 +318,8 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             child->as_full()->copy_leaf_values_to(merged->as_full());
         }
     } else {
-        if (child->is_eos() | child->is_skip()) {
-            merged = builder_.make_interior_skip(new_skip);
-            merged->as_skip()->eos_ptr = get_eos_ptr(child);
-            set_eos_ptr(child, nullptr);
-        } else if (child->is_list()) {
+        // Interior: LIST or FULL only
+        if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
             child->as_list()->move_interior_to(merged->as_list());
         } else {

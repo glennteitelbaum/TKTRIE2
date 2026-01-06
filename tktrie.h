@@ -65,7 +65,6 @@ public:
     using ptr_t = node_base<T, THREADED, Allocator>*;
     using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator>;
     using builder_t = node_builder<T, THREADED, Allocator>;
-    using eos_t = eos_node<T, THREADED, Allocator>;
     using skip_t = skip_node<T, THREADED, Allocator>;
     using list_t = list_node<T, THREADED, Allocator>;
     using full_t = full_node<T, THREADED, Allocator>;
@@ -119,7 +118,7 @@ public:
     // -------------------------------------------------------------------------
     enum class spec_op {
         EXISTS, IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
-        DEMOTE_LEAF_EOS, SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
+        SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
         SPLIT_LEAF_LIST, PREFIX_LEAF_LIST, ADD_EOS_LEAF_LIST, LIST_TO_FULL_LEAF,
         DEMOTE_LEAF_LIST, SPLIT_INTERIOR, PREFIX_INTERIOR, ADD_CHILD_CONVERT,
     };
@@ -151,7 +150,7 @@ public:
     // Speculative erase types
     // -------------------------------------------------------------------------
     enum class erase_op {
-        NOT_FOUND, DELETE_LEAF_EOS, DELETE_LEAF_SKIP, DELETE_LAST_LEAF_LIST,
+        NOT_FOUND, DELETE_LEAF_SKIP, DELETE_LAST_LEAF_LIST,
         IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL, DELETE_EOS_INTERIOR,
         IN_PLACE_INTERIOR_LIST, IN_PLACE_INTERIOR_FULL, COLLAPSE_AFTER_REMOVE,
     };
@@ -242,7 +241,6 @@ private:
     insert_result insert_into_leaf(atomic_ptr* slot, ptr_t leaf, std::string_view key, const T& value);
     insert_result insert_into_interior(atomic_ptr* slot, ptr_t n, std::string_view key, const T& value);
     ptr_t create_leaf_for_key(std::string_view key, const T& value);
-    insert_result demote_leaf_eos(ptr_t leaf, std::string_view key, const T& value);
     insert_result split_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
     insert_result prefix_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
     insert_result extend_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);

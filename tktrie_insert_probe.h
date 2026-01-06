@@ -24,15 +24,6 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     std::string_view skip = get_skip(n);
     size_t m = match_skip_impl(skip, key);
 
-    if (n->is_eos()) {
-        if (key.empty()) { info.op = spec_op::EXISTS; return info; }
-        info.op = spec_op::DEMOTE_LEAF_EOS;
-        info.target = n;
-        info.target_version = n->version();
-        info.remaining_key = std::string(key);
-        return info;
-    }
-
     if (n->is_skip()) {
         if ((m == skip.size()) & (m == key.size())) { info.op = spec_op::EXISTS; return info; }
         info.target = n;
@@ -73,7 +64,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     unsigned char c = static_cast<unsigned char>(key[0]);
     info.c = c;
 
-    if (n->is_list()) {
+    if (n->is_list()) [[likely]] {
         if (n->as_list()->chars.find(c) >= 0) { info.op = spec_op::EXISTS; return info; }
         info.op = (n->as_list()->chars.count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
         return info;
@@ -187,22 +178,13 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         alloc.add(alloc.root_replacement);
         break;
     }
-    case spec_op::DEMOTE_LEAF_EOS: {
-        ptr_t interior = builder_.make_interior_list("");
-        interior->as_list()->eos_ptr = new T();
-        ptr_t child = create_leaf_for_key(key.substr(1), value);
-        interior->as_list()->add_child(static_cast<unsigned char>(key[0]), child);
-        alloc.root_replacement = interior;
-        alloc.add(interior);
-        alloc.add(child);
-        break;
-    }
     case spec_op::SPLIT_LEAF_SKIP: {
         std::string common(skip.substr(0, m));
         unsigned char old_c = static_cast<unsigned char>(skip[m]);
         unsigned char new_c = static_cast<unsigned char>(key[m]);
 
         ptr_t interior = builder_.make_interior_list(common);
+        // Create SKIP for remaining bytes (may be empty string)
         ptr_t old_child = builder_.make_leaf_skip(skip.substr(m + 1), T{});
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         interior->as_list()->add_two_children(old_c, old_child, new_c, new_child);
@@ -216,6 +198,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::PREFIX_LEAF_SKIP: {
         ptr_t interior = builder_.make_interior_list(std::string(key));
         interior->as_list()->eos_ptr = new T(value);
+        // Create SKIP for remaining bytes (may be empty string)
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), T{});
         interior->as_list()->add_child(static_cast<unsigned char>(skip[m]), child);
 
@@ -352,13 +335,6 @@ bool TKTRIE_CLASS::commit_speculative(
         root_.store(alloc.root_replacement);
         return true;
 
-    case spec_op::DEMOTE_LEAF_EOS: {
-        atomic_ptr* slot = get_verified_slot(info);
-        if (!slot) return false;
-        *alloc.root_replacement->as_list()->eos_ptr = info.target->as_eos()->leaf_value;
-        commit_to_slot(slot, alloc.root_replacement, info);
-        return true;
-    }
     case spec_op::SPLIT_LEAF_SKIP: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
@@ -412,7 +388,7 @@ bool TKTRIE_CLASS::commit_speculative(
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
         if (!slot | (slot->load() != n)) return false;
 
-        if (n->is_list()) {
+        if (n->is_list()) [[likely]] {
             if (n->as_list()->chars.find(c) >= 0) return false;
             if (n->as_list()->chars.count() >= LIST_MAX) return false;
             n->bump_version();

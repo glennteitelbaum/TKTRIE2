@@ -99,27 +99,24 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][TYPE:2][VERSION:61]
-// TYPE: 00=EOS, 01=SKIP, 10=LIST, 11=FULL
-static constexpr uint64_t FLAG_LEAF = 1ULL << 63;
-static constexpr uint64_t TYPE_EOS  = 0ULL << 61;
-static constexpr uint64_t TYPE_SKIP = 1ULL << 61;
-static constexpr uint64_t TYPE_LIST = 2ULL << 61;
-static constexpr uint64_t TYPE_FULL = 3ULL << 61;
-static constexpr uint64_t TYPE_MASK = 3ULL << 61;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | TYPE_MASK;
-static constexpr uint64_t VERSION_MASK = (1ULL << 61) - 1;
+// Header: [LEAF:1][TYPE:2][POISON:1][VERSION:60]
+// TYPE: 00=SKIP (always leaf), 01=LIST, 10=FULL
+static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
+static constexpr uint64_t TYPE_SKIP   = 0ULL << 61;  // always leaf
+static constexpr uint64_t TYPE_LIST   = 1ULL << 61;  // leaf or interior
+static constexpr uint64_t TYPE_FULL   = 2ULL << 61;  // leaf or interior
+static constexpr uint64_t TYPE_MASK   = 3ULL << 61;
+static constexpr uint64_t FLAG_POISON = 1ULL << 60;
+static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | TYPE_MASK | FLAG_POISON;
 
 static constexpr int LIST_MAX = 7;
 
-// Poison detection uses max version - no real node will ever reach this
-static constexpr uint64_t POISON_VERSION = VERSION_MASK;
-
-// Interior FULL node header with poisoned version - used for sentinel
-static constexpr uint64_t SENTINEL_HEADER = TYPE_FULL | POISON_VERSION;
+// Interior FULL node header with poison flag set - used for sentinel
+static constexpr uint64_t SENTINEL_HEADER = TYPE_FULL | FLAG_POISON;
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
-    return (h & VERSION_MASK) == POISON_VERSION;
+    return (h & FLAG_POISON) != 0;
 }
 
 inline constexpr uint64_t make_header(bool is_leaf, uint64_t type, uint64_t version = 0) noexcept {
@@ -129,7 +126,7 @@ inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0
 inline constexpr uint64_t get_type(uint64_t h) noexcept { return h & TYPE_MASK; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
 
-// Bump version preserving flags
+// Bump version preserving flags (including poison)
 inline constexpr uint64_t bump_version(uint64_t h) noexcept {
     uint64_t flags = h & FLAGS_MASK;
     uint64_t ver = (h & VERSION_MASK) + 1;

@@ -23,25 +23,23 @@ void TKTRIE_CLASS::node_deleter(void* ptr) {
 
 TKTRIE_TEMPLATE
 std::string_view TKTRIE_CLASS::get_skip(ptr_t n) noexcept {
-    if (n->type() == TYPE_EOS) return {};
-    const std::string* skip_ptr = reinterpret_cast<const std::string*>(
-        reinterpret_cast<const char*>(n) + NODE_SKIP_OFFSET);
-    return *skip_ptr;
+    // All node types have skip string - use the node's method
+    return n->skip_str();
 }
 
 TKTRIE_TEMPLATE
 T* TKTRIE_CLASS::get_eos_ptr(ptr_t n) noexcept {
+    // Only interior LIST and FULL have eos_ptr
     if (n->is_leaf()) return nullptr;
-    auto* ptr_loc = reinterpret_cast<atomic_storage<T*, THREADED>*>(
-        reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
-    return ptr_loc->load();
+    if (n->is_list()) [[likely]] return n->as_list()->eos_ptr;
+    return n->as_full()->eos_ptr;
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
-    auto* ptr_loc = reinterpret_cast<atomic_storage<T*, THREADED>*>(
-        reinterpret_cast<char*>(n) + NODE_EOS_OFFSET);
-    ptr_loc->store(p);
+    // Only interior LIST and FULL have eos_ptr
+    if (n->is_list()) [[likely]] n->as_list()->eos_ptr = p;
+    else n->as_full()->eos_ptr = p;
 }
 
 // -----------------------------------------------------------------------------
@@ -92,7 +90,7 @@ void TKTRIE_CLASS::ebr_try_reclaim() {
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) const noexcept {
-    if (n->is_list()) {
+    if (n->is_list()) [[likely]] {
         int idx = n->as_list()->chars.find(c);
         return idx >= 0 ? n->as_list()->children[idx].load() : nullptr;
     }
@@ -113,7 +111,7 @@ std::pair<typename TKTRIE_CLASS::ptr_t, bool> TKTRIE_CLASS::find_child_wait(
     }
     
     ptr_t child = nullptr;
-    if (n->is_list()) {
+    if (n->is_list()) [[likely]] {
         int idx = n->as_list()->chars.find(c);
         child = (idx >= 0) ? n->as_list()->children[idx].load() : nullptr;
     } else if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
@@ -132,7 +130,7 @@ std::pair<typename TKTRIE_CLASS::ptr_t, bool> TKTRIE_CLASS::find_child_wait(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigned char c) noexcept {
-    if (n->is_list()) {
+    if (n->is_list()) [[likely]] {
         int idx = n->as_list()->chars.find(c);
         return idx >= 0 ? &n->as_list()->children[idx] : nullptr;
     }
@@ -181,15 +179,17 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
     if (m < skip.size()) return false;
     key.remove_prefix(m);
 
-    if (leaf->is_eos() | leaf->is_skip()) {
+    if (leaf->is_skip()) {
         if (!key.empty()) return false;
-        out = leaf->is_eos() ? leaf->as_eos()->leaf_value : leaf->as_skip()->leaf_value;
+        out = leaf->as_skip()->leaf_value;
         return true;
     }
+    
+    // LIST or FULL leaf
     if (key.size() != 1) return false;
-
     unsigned char c = static_cast<unsigned char>(key[0]);
-    if (leaf->is_list()) {
+    
+    if (leaf->is_list()) [[likely]] {
         int idx = leaf->as_list()->chars.find(c);
         if (idx < 0) return false;
         out = leaf->as_list()->leaf_values[idx];
@@ -268,15 +268,17 @@ bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T
     if (m < skip.size()) return false;
     key.remove_prefix(m);
 
-    if (leaf->is_eos() | leaf->is_skip()) {
+    if (leaf->is_skip()) {
         if (!key.empty()) return false;
-        out = leaf->is_eos() ? leaf->as_eos()->leaf_value : leaf->as_skip()->leaf_value;
+        out = leaf->as_skip()->leaf_value;
         return true;
     }
+    
+    // LIST or FULL leaf
     if (key.size() != 1) return false;
-
     unsigned char c = static_cast<unsigned char>(key[0]);
-    if (leaf->is_list()) {
+    
+    if (leaf->is_list()) [[likely]] {
         int idx = leaf->as_list()->chars.find(c);
         if (idx < 0) return false;
         out = leaf->as_list()->leaf_values[idx];
@@ -385,7 +387,7 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             ptr_t root = root_.load();
             if (!root) return false;
             
-            // Sentinel and poisoned nodes both have POISON_VERSION
+            // Sentinel and poisoned nodes both have FLAG_POISON
             // is_poisoned() catches both cases
             if (root->is_poisoned()) continue;
             
@@ -431,7 +433,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             ptr_t root = root_.load();
             if (!root) return end();
             
-            // Sentinel and poisoned nodes both have POISON_VERSION
+            // Sentinel and poisoned nodes both have FLAG_POISON
             if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, value, path);

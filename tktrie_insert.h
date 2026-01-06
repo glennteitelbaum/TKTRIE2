@@ -33,20 +33,15 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_leaf(
     insert_result res;
     std::string_view leaf_skip = get_skip(leaf);
 
-    if (leaf->is_eos()) {
-        if (key.empty()) return res;
-        return demote_leaf_eos(leaf, key, value);
-    }
-
     if (leaf->is_skip()) {
         size_t m = match_skip_impl(leaf_skip, key);
-        if ((m == leaf_skip.size()) & (m == key.size())) return res;
+        if ((m == leaf_skip.size()) & (m == key.size())) return res;  // exists
         if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_skip(leaf, key, value, m);
         if (m == key.size()) return prefix_leaf_skip(leaf, key, value, m);
         return extend_leaf_skip(leaf, key, value, m);
     }
 
-    // LIST or FULL
+    // LIST or FULL leaf
     size_t m = match_skip_impl(leaf_skip, key);
     if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_list(leaf, key, value, m);
     if (m < leaf_skip.size()) return prefix_leaf_list(leaf, key, value, m);
@@ -98,31 +93,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::create_leaf_for_key(std::string_view key, const T& value) {
-    if (key.empty()) return builder_.make_leaf_eos(value);
-    if (key.size() == 1) {
-        ptr_t leaf = builder_.make_leaf_list("");
-        leaf->as_list()->add_leaf_entry(static_cast<unsigned char>(key[0]), value);
-        return leaf;
-    }
-    ptr_t leaf = builder_.make_leaf_list(key.substr(0, key.size() - 1));
-    leaf->as_list()->add_leaf_entry(static_cast<unsigned char>(key.back()), value);
-    return leaf;
-}
-
-TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_eos(
-    ptr_t leaf, std::string_view key, const T& value) {
-    insert_result res;
-    ptr_t interior = builder_.make_interior_list("");
-    interior->as_list()->eos_ptr = new T(leaf->as_eos()->leaf_value);
-
-    ptr_t child = create_leaf_for_key(key.substr(1), value);
-    interior->as_list()->add_child(static_cast<unsigned char>(key[0]), child);
-
-    res.new_node = interior;
-    res.old_nodes.push_back(leaf);
-    res.inserted = true;
-    return res;
+    // Always create SKIP leaf (even for empty key - that's SKIP with len=0)
+    return builder_.make_leaf_skip(key, value);
 }
 
 TKTRIE_TEMPLATE
@@ -136,6 +108,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
     ptr_t interior = builder_.make_interior_list(common);
+    // Create SKIP for remaining bytes (may be empty string)
     ptr_t old_child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->as_skip()->leaf_value);
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
     interior->as_list()->add_two_children(old_c, old_child, new_c, new_child);
@@ -155,6 +128,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
     ptr_t interior = builder_.make_interior_list(std::string(key));
     interior->as_list()->eos_ptr = new T(value);
 
+    // Create SKIP for remaining bytes (may be empty string)
     ptr_t child = builder_.make_leaf_skip(old_skip.substr(m + 1), leaf->as_skip()->leaf_value);
     interior->as_list()->add_child(static_cast<unsigned char>(old_skip[m]), child);
 
@@ -246,13 +220,13 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
     insert_result res;
     std::string_view leaf_skip = get_skip(leaf);
 
-    if (leaf->is_list()) {
+    if (leaf->is_list()) [[likely]] {
         ptr_t interior = builder_.make_interior_list(leaf_skip);
         interior->as_list()->eos_ptr = new T(value);
         int cnt = leaf->as_list()->chars.count();
         for (int i = 0; i < cnt; ++i) {
             unsigned char c = leaf->as_list()->chars.char_at(i);
-            ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
+            ptr_t child = builder_.make_leaf_skip("", leaf->as_list()->leaf_values[i]);
             interior->as_list()->add_child(c, child);
         }
         res.new_node = interior;
@@ -260,7 +234,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         ptr_t interior = builder_.make_interior_full(leaf_skip);
         interior->as_full()->eos_ptr = new T(value);
         leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
-            ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
+            ptr_t child = builder_.make_leaf_skip("", leaf->as_full()->leaf_values[c]);
             interior->as_full()->add_child(c, child);
         });
         res.new_node = interior;
@@ -316,7 +290,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
     std::string_view leaf_skip = get_skip(leaf);
     unsigned char first_c = static_cast<unsigned char>(key[0]);
 
-    if (leaf->is_list()) {
+    if (leaf->is_list()) [[likely]] {
         int leaf_count = leaf->as_list()->chars.count();
         int existing_idx = leaf->as_list()->chars.find(first_c);
         bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
@@ -325,7 +299,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             ptr_t interior = builder_.make_interior_full(leaf_skip);
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = leaf->as_list()->chars.char_at(i);
-                ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
+                ptr_t child = builder_.make_leaf_skip("", leaf->as_list()->leaf_values[i]);
                 interior->as_full()->add_child(c, child);
             }
             ptr_t child = create_leaf_for_key(key.substr(1), value);
@@ -335,7 +309,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             ptr_t interior = builder_.make_interior_list(leaf_skip);
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = leaf->as_list()->chars.char_at(i);
-                ptr_t child = builder_.make_leaf_eos(leaf->as_list()->leaf_values[i]);
+                ptr_t child = builder_.make_leaf_skip("", leaf->as_list()->leaf_values[i]);
                 interior->as_list()->add_child(c, child);
             }
 
@@ -355,7 +329,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
     } else {
         ptr_t interior = builder_.make_interior_full(leaf_skip);
         leaf->as_full()->valid.for_each_set([this, leaf, interior](unsigned char c) {
-            ptr_t child = builder_.make_leaf_eos(leaf->as_full()->leaf_values[c]);
+            ptr_t child = builder_.make_leaf_skip("", leaf->as_full()->leaf_values[c]);
             interior->as_full()->add_child(c, child);
         });
 
@@ -401,20 +375,15 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std::string_view new_skip) {
-    if (n->is_list()) {
+    // Interior nodes can only be LIST or FULL
+    if (n->is_list()) [[likely]] {
         ptr_t clone = builder_.make_interior_list(new_skip);
         n->as_list()->move_interior_to(clone->as_list());
         return clone;
     }
-    if (n->is_full()) {
-        ptr_t clone = builder_.make_interior_full(new_skip);
-        n->as_full()->move_interior_to(clone->as_full());
-        return clone;
-    }
-    // EOS or SKIP
-    ptr_t clone = builder_.make_interior_skip(new_skip);
-    clone->as_skip()->eos_ptr = get_eos_ptr(n);
-    set_eos_ptr(n, nullptr);
+    // FULL
+    ptr_t clone = builder_.make_interior_full(new_skip);
+    n->as_full()->move_interior_to(clone->as_full());
     return clone;
 }
 

@@ -13,7 +13,6 @@ namespace gteitelbaum {
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator> struct node_base;
-template <typename T, bool THREADED, typename Allocator> struct eos_node;
 template <typename T, bool THREADED, typename Allocator> struct skip_node;
 template <typename T, bool THREADED, typename Allocator> struct list_node;
 template <typename T, bool THREADED, typename Allocator> struct full_node;
@@ -61,24 +60,19 @@ struct node_base {
     }
     
     void poison() noexcept {
-        // Preserve type/leaf bits, set version to max (poison)
-        uint64_t h = header_.load();
-        header_.store((h & FLAGS_MASK) | POISON_VERSION);
+        // Set the poison flag bit
+        header_.store(header_.load() | FLAG_POISON);
     }
     
     bool is_poisoned() const noexcept {
         return is_poisoned_header(header());
     }
     
-    bool is_eos() const noexcept { return type() == TYPE_EOS; }
     bool is_skip() const noexcept { return type() == TYPE_SKIP; }
     bool is_list() const noexcept { return type() == TYPE_LIST; }
     bool is_full() const noexcept { return type() == TYPE_FULL; }
     
     // Downcasts
-    eos_node<T, THREADED, Allocator>* as_eos() noexcept {
-        return static_cast<eos_node<T, THREADED, Allocator>*>(this);
-    }
     skip_node<T, THREADED, Allocator>* as_skip() noexcept {
         return static_cast<skip_node<T, THREADED, Allocator>*>(this);
     }
@@ -89,9 +83,6 @@ struct node_base {
         return static_cast<full_node<T, THREADED, Allocator>*>(this);
     }
     
-    const eos_node<T, THREADED, Allocator>* as_eos() const noexcept {
-        return static_cast<const eos_node<T, THREADED, Allocator>*>(this);
-    }
     const skip_node<T, THREADED, Allocator>* as_skip() const noexcept {
         return static_cast<const skip_node<T, THREADED, Allocator>*>(this);
     }
@@ -102,55 +93,32 @@ struct node_base {
         return static_cast<const full_node<T, THREADED, Allocator>*>(this);
     }
     
-    // Common accessors
+    // Common accessors - all node types have skip string
     std::string_view skip_str() const noexcept {
-        switch (type()) {
-            case TYPE_SKIP: return as_skip()->skip;
-            case TYPE_LIST: return as_list()->skip;
-            case TYPE_FULL: return as_full()->skip;
-            default: return {};
-        }
+        if (is_skip()) return as_skip()->skip;
+        if (is_list()) [[likely]] return as_list()->skip;
+        return as_full()->skip;
     }
     
     int child_count() const noexcept {
-        if (is_list()) return as_list()->chars.count();
+        if (is_list()) [[likely]] return as_list()->chars.count();
         if (is_full()) return as_full()->valid.count();
-        return 0;
+        return 0;  // SKIP has no children
     }
 };
 
 // =============================================================================
-// EOS_NODE - minimal node with just a value
-// =============================================================================
-
-template <typename T, bool THREADED, typename Allocator>
-struct eos_node : node_base<T, THREADED, Allocator> {
-    union {
-        T leaf_value;
-        T* eos_ptr;
-    };
-    
-    eos_node() {}
-    ~eos_node() {
-        if (this->is_leaf()) leaf_value.~T();
-    }
-};
-
-// =============================================================================
-// SKIP_NODE - skip string + value
+// SKIP_NODE - skip string + value (always leaf)
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator>
 struct skip_node : node_base<T, THREADED, Allocator> {
-    union {
-        T leaf_value;
-        T* eos_ptr;
-    };
+    T leaf_value;
     std::string skip;
     
     skip_node() {}
     ~skip_node() {
-        if (this->is_leaf()) leaf_value.~T();
+        leaf_value.~T();
     }
 };
 
@@ -429,13 +397,6 @@ node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept {
 }
 
 // =============================================================================
-// LAYOUT CONSTANTS
-// =============================================================================
-
-static constexpr size_t NODE_EOS_OFFSET = 8;
-static constexpr size_t NODE_SKIP_OFFSET = 16;
-
-// =============================================================================
 // NODE_BUILDER - allocation and type-safe construction
 // =============================================================================
 
@@ -444,30 +405,19 @@ class node_builder {
 public:
     using base_t = node_base<T, THREADED, Allocator>;
     using ptr_t = base_t*;
-    using eos_t = eos_node<T, THREADED, Allocator>;
     using skip_t = skip_node<T, THREADED, Allocator>;
     using list_t = list_node<T, THREADED, Allocator>;
     using full_t = full_node<T, THREADED, Allocator>;
     
-    // Unified node deletion - eliminates repeated switch statements
+    // Unified node deletion
     static void delete_node(ptr_t n) {
         if (!n) return;
-        switch (n->type()) {
-            case TYPE_EOS: delete n->as_eos(); break;
-            case TYPE_SKIP: delete n->as_skip(); break;
-            case TYPE_LIST: delete n->as_list(); break;
-            case TYPE_FULL: delete n->as_full(); break;
-        }
+        if (n->is_skip()) delete n->as_skip();
+        else if (n->is_list()) [[likely]] delete n->as_list();
+        else delete n->as_full();
     }
     
-    // Leaf builders
-    ptr_t make_leaf_eos(const T& value) {
-        auto* n = new eos_t();
-        n->set_header(make_header(true, TYPE_EOS));
-        new (&n->leaf_value) T(value);
-        return n;
-    }
-    
+    // Leaf builder - SKIP is always leaf
     ptr_t make_leaf_skip(std::string_view sk, const T& value) {
         auto* n = new skip_t();
         n->set_header(make_header(true, TYPE_SKIP));
@@ -490,22 +440,7 @@ public:
         return n;
     }
     
-    // Interior builders
-    ptr_t make_interior_eos() {
-        auto* n = new eos_t();
-        n->set_header(make_header(false, TYPE_EOS));
-        n->eos_ptr = nullptr;
-        return n;
-    }
-    
-    ptr_t make_interior_skip(std::string_view sk) {
-        auto* n = new skip_t();
-        n->set_header(make_header(false, TYPE_SKIP));
-        n->skip = std::string(sk);
-        n->eos_ptr = nullptr;
-        return n;
-    }
-    
+    // Interior builders - only LIST and FULL can be interior
     ptr_t make_interior_list(std::string_view sk) {
         auto* n = new list_t();
         n->set_header(make_header(false, TYPE_LIST));
@@ -531,23 +466,20 @@ public:
         if (!n) return;
         
         if (!n->is_leaf()) {
-            if (n->is_list()) {
+            // Interior nodes are only LIST or FULL
+            if (n->is_list()) [[likely]] {
                 auto* ln = n->as_list();
                 int cnt = ln->chars.count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
                 }
                 delete ln->eos_ptr;
-            } else if (n->is_full()) {
+            } else {
                 auto* fn = n->as_full();
                 fn->valid.for_each_set([this, fn](unsigned char c) {
                     dealloc_node(fn->children[c].load());
                 });
                 delete fn->eos_ptr;
-            } else if (n->is_skip()) {
-                delete n->as_skip()->eos_ptr;
-            } else {
-                delete n->as_eos()->eos_ptr;
             }
         }
         delete_node(n);
@@ -558,78 +490,58 @@ public:
         if (!src) return nullptr;
         
         if (src->is_leaf()) {
-            switch (src->type()) {
-                case TYPE_EOS: return make_leaf_eos(src->as_eos()->leaf_value);
-                case TYPE_SKIP: return make_leaf_skip(src->as_skip()->skip, src->as_skip()->leaf_value);
-                case TYPE_LIST: {
-                    auto* s = src->as_list();
-                    auto* d = new list_t();
-                    d->set_header(s->header());
-                    d->skip = s->skip;
-                    d->chars = s->chars;
-                    int cnt = s->chars.count();
-                    for (int i = 0; i < cnt; ++i) {
-                        d->construct_leaf_value(i, s->leaf_values[i]);
-                    }
-                    return d;
-                }
-                case TYPE_FULL: {
-                    auto* s = src->as_full();
-                    auto* d = new full_t();
-                    d->set_header(s->header());
-                    d->skip = s->skip;
-                    d->valid = s->valid;
-                    s->valid.for_each_set([s, d](unsigned char c) {
-                        d->construct_leaf_value(c, s->leaf_values[c]);
-                    });
-                    return d;
-                }
+            if (src->is_skip()) {
+                return make_leaf_skip(src->as_skip()->skip, src->as_skip()->leaf_value);
             }
-        } else {
-            switch (src->type()) {
-                case TYPE_EOS: {
-                    auto* s = src->as_eos();
-                    auto* d = new eos_t();
-                    d->set_header(s->header());
-                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
-                    return d;
+            if (src->is_list()) [[likely]] {
+                auto* s = src->as_list();
+                auto* d = new list_t();
+                d->set_header(s->header());
+                d->skip = s->skip;
+                d->chars = s->chars;
+                int cnt = s->chars.count();
+                for (int i = 0; i < cnt; ++i) {
+                    d->construct_leaf_value(i, s->leaf_values[i]);
                 }
-                case TYPE_SKIP: {
-                    auto* s = src->as_skip();
-                    auto* d = new skip_t();
-                    d->set_header(s->header());
-                    d->skip = s->skip;
-                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
-                    return d;
-                }
-                case TYPE_LIST: {
-                    auto* s = src->as_list();
-                    auto* d = new list_t();
-                    d->set_header(s->header());
-                    d->skip = s->skip;
-                    d->chars = s->chars;
-                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
-                    int cnt = s->chars.count();
-                    for (int i = 0; i < cnt; ++i) {
-                        d->children[i].store(deep_copy(s->children[i].load()));
-                    }
-                    return d;
-                }
-                case TYPE_FULL: {
-                    auto* s = src->as_full();
-                    auto* d = new full_t();
-                    d->set_header(s->header());
-                    d->skip = s->skip;
-                    d->valid = s->valid;
-                    d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
-                    s->valid.for_each_set([this, s, d](unsigned char c) {
-                        d->children[c].store(deep_copy(s->children[c].load()));
-                    });
-                    return d;
-                }
+                return d;
             }
+            // FULL leaf
+            auto* s = src->as_full();
+            auto* d = new full_t();
+            d->set_header(s->header());
+            d->skip = s->skip;
+            d->valid = s->valid;
+            s->valid.for_each_set([s, d](unsigned char c) {
+                d->construct_leaf_value(c, s->leaf_values[c]);
+            });
+            return d;
         }
-        return nullptr;
+        
+        // Interior - only LIST or FULL
+        if (src->is_list()) [[likely]] {
+            auto* s = src->as_list();
+            auto* d = new list_t();
+            d->set_header(s->header());
+            d->skip = s->skip;
+            d->chars = s->chars;
+            d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
+            int cnt = s->chars.count();
+            for (int i = 0; i < cnt; ++i) {
+                d->children[i].store(deep_copy(s->children[i].load()));
+            }
+            return d;
+        }
+        // FULL interior
+        auto* s = src->as_full();
+        auto* d = new full_t();
+        d->set_header(s->header());
+        d->skip = s->skip;
+        d->valid = s->valid;
+        d->eos_ptr = s->eos_ptr ? new T(*s->eos_ptr) : nullptr;
+        s->valid.for_each_set([this, s, d](unsigned char c) {
+            d->children[c].store(deep_copy(s->children[c].load()));
+        });
+        return d;
     }
 };
 

@@ -26,14 +26,15 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
     key.remove_prefix(m);
 
-    if (n->is_eos() | n->is_skip()) {
+    if (n->is_skip()) {
         if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
-        info.op = n->is_eos() ? erase_op::DELETE_LEAF_EOS : erase_op::DELETE_LEAF_SKIP;
+        info.op = erase_op::DELETE_LEAF_SKIP;
         info.target = n;
         info.target_version = n->version();
         return info;
     }
 
+    // LIST or FULL leaf
     if (key.size() != 1) { info.op = erase_op::NOT_FOUND; return info; }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
@@ -41,7 +42,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     info.target = n;
     info.target_version = n->version();
 
-    if (n->is_list()) {
+    if (n->is_list()) [[likely]] {
         int idx = n->as_list()->chars.find(c);
         if (idx < 0) { info.op = erase_op::NOT_FOUND; return info; }
         info.op = (n->as_list()->chars.count() == 1) ? 
@@ -226,12 +227,13 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::allocate_collapse_node_impl(
     new_skip.append(child_skip);
 
     if (child->is_leaf()) {
-        if (child->is_eos() | child->is_skip()) return builder_.make_leaf_skip(new_skip, T{});
-        if (child->is_list()) return builder_.make_leaf_list(new_skip);
+        // Leaf types: SKIP, LIST, FULL
+        if (child->is_skip()) return builder_.make_leaf_skip(new_skip, T{});
+        if (child->is_list()) [[likely]] return builder_.make_leaf_list(new_skip);
         return builder_.make_leaf_full(new_skip);
     } else {
-        if (child->is_eos() | child->is_skip()) return builder_.make_interior_skip(new_skip);
-        if (child->is_list()) return builder_.make_interior_list(new_skip);
+        // Interior types: LIST, FULL only
+        if (child->is_list()) [[likely]] return builder_.make_interior_list(new_skip);
         return builder_.make_interior_full(new_skip);
     }
 }
@@ -270,19 +272,16 @@ void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::fill_collapse_node(ptr_t merged, ptr_t child) {
     if (child->is_leaf()) {
-        if (child->is_eos() | child->is_skip()) {
-            T& val = child->is_eos() ? child->as_eos()->leaf_value : child->as_skip()->leaf_value;
-            merged->as_skip()->leaf_value = val;
-        } else if (child->is_list()) {
+        if (child->is_skip()) {
+            merged->as_skip()->leaf_value = child->as_skip()->leaf_value;
+        } else if (child->is_list()) [[likely]] {
             child->as_list()->copy_leaf_values_to(merged->as_list());
         } else {
             child->as_full()->copy_leaf_values_to(merged->as_full());
         }
     } else {
-        if (child->is_eos() | child->is_skip()) {
-            merged->as_skip()->eos_ptr = get_eos_ptr(child);
-            set_eos_ptr(child, nullptr);
-        } else if (child->is_list()) {
+        // Interior: LIST or FULL only
+        if (child->is_list()) [[likely]] {
             child->as_list()->move_interior_to(merged->as_list());
         } else {
             child->as_full()->move_interior_to(merged->as_full());
