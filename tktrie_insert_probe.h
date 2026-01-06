@@ -15,9 +15,8 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     ptr_t n, std::string_view key, speculative_info& info) const noexcept {
-    // Check if leaf is poisoned
     if (n->is_poisoned()) {
-        info.op = spec_op::EXISTS;  // Signal retry needed
+        info.op = spec_op::EXISTS;
         return info;
     }
     
@@ -38,7 +37,6 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
         return info;
     }
 
-    // LIST or FULL leaf
     info.target = n;
     info.target_version = n->version();
     info.target_skip = std::string(skip);
@@ -65,12 +63,13 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     info.c = c;
 
     if (n->is_list()) [[likely]] {
-        if (n->as_list()->chars.find(c) >= 0) { info.op = spec_op::EXISTS; return info; }
-        info.op = (n->as_list()->chars.count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
+        auto* ln = n->template as_list<true>();
+        if (ln->chars.find(c) >= 0) { info.op = spec_op::EXISTS; return info; }
+        info.op = (ln->chars.count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
         return info;
     }
-    // FULL
-    info.op = n->as_full()->valid.template atomic_test<THREADED>(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
+    auto* fn = n->template as_full<true>();
+    info.op = fn->valid.template atomic_test<THREADED>(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
     return info;
 }
 
@@ -85,15 +84,13 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         return info;
     }
 
-    // Check if poisoned (includes retry sentinel)
     if (n->is_poisoned()) {
-        info.op = spec_op::EXISTS;  // Signal retry needed
+        info.op = spec_op::EXISTS;
         return info;
     }
 
     info.path[info.path_len++] = {n, n->version(), 0};
 
-    // Loop only on interior nodes
     while (!n->is_leaf()) {
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
@@ -131,7 +128,6 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         unsigned char c = static_cast<unsigned char>(key[0]);
         ptr_t child = find_child(n, c);
 
-        // Check if child is NOT_FOUND sentinel (treat as no child)
         if (!child || builder_t::is_sentinel(child)) {
             info.target = n;
             info.target_version = n->version();
@@ -139,10 +135,11 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             info.c = c;
             info.remaining_key = std::string(key.substr(1));
 
-            if ((n->is_list() && n->as_list()->chars.count() < LIST_MAX) | n->is_full()) {
-                info.op = spec_op::IN_PLACE_INTERIOR;
+            if (n->is_list()) {
+                info.op = (n->template as_list<false>()->chars.count() < LIST_MAX) 
+                    ? spec_op::IN_PLACE_INTERIOR : spec_op::ADD_CHILD_CONVERT;
             } else {
-                info.op = spec_op::ADD_CHILD_CONVERT;
+                info.op = spec_op::IN_PLACE_INTERIOR;
             }
             return info;
         }
@@ -150,9 +147,8 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         key.remove_prefix(1);
         n = child;
         
-        // Check if child is poisoned - signal retry
         if (n->is_poisoned()) {
-            info.op = spec_op::EXISTS;  // Signal retry needed
+            info.op = spec_op::EXISTS;
             return info;
         }
         
@@ -161,7 +157,6 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         }
     }
 
-    // n is now a leaf
     return probe_leaf_speculative(n, key, info);
 }
 
@@ -185,10 +180,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         unsigned char new_c = static_cast<unsigned char>(key[m]);
 
         ptr_t interior = builder_.make_interior_list(common);
-        // Create SKIP for remaining bytes (may be empty string)
         ptr_t old_child = builder_.make_leaf_skip(skip.substr(m + 1), T{});
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->as_list()->add_two_children(old_c, old_child, new_c, new_child);
+        interior->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -198,10 +192,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     }
     case spec_op::PREFIX_LEAF_SKIP: {
         ptr_t interior = builder_.make_interior_list(std::string(key));
-        interior->as_list()->eos_ptr = new T(value);
-        // Create SKIP for remaining bytes (may be empty string)
+        interior->template as_list<false>()->eos_ptr = new T(value);
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), T{});
-        interior->as_list()->add_child(static_cast<unsigned char>(skip[m]), child);
+        interior->template as_list<false>()->add_child(static_cast<unsigned char>(skip[m]), child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -210,9 +203,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     }
     case spec_op::EXTEND_LEAF_SKIP: {
         ptr_t interior = builder_.make_interior_list(std::string(skip));
-        interior->as_list()->eos_ptr = new T();
+        interior->template as_list<false>()->eos_ptr = new T();
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->as_list()->add_child(static_cast<unsigned char>(key[m]), child);
+        interior->template as_list<false>()->add_child(static_cast<unsigned char>(key[m]), child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -226,10 +219,10 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 
         ptr_t interior = builder_.make_interior_list(common);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        // Note: children[0] will be set during commit with cloned old_child
-        interior->as_list()->chars.add(old_c);
-        interior->as_list()->chars.add(new_c);
-        interior->as_list()->children[1].store(new_child);
+        auto* ln = interior->template as_list<false>();
+        ln->chars.add(old_c);
+        ln->chars.add(new_c);
+        ln->children[1].store(new_child);
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -238,9 +231,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     }
     case spec_op::PREFIX_LEAF_LIST: {
         ptr_t interior = builder_.make_interior_list(std::string(key));
-        interior->as_list()->eos_ptr = new T(value);
-        // Note: child[0] will be set during commit with cloned old_child
-        interior->as_list()->chars.add(static_cast<unsigned char>(skip[m]));
+        auto* ln = interior->template as_list<false>();
+        ln->eos_ptr = new T(value);
+        ln->chars.add(static_cast<unsigned char>(skip[m]));
 
         alloc.root_replacement = interior;
         alloc.add(interior);
@@ -248,7 +241,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     }
     case spec_op::LIST_TO_FULL_LEAF: {
         ptr_t full = builder_.make_leaf_full(std::string(skip));
-        full->as_full()->add_leaf_entry(info.c, value);
+        full->template as_full<true>()->add_leaf_entry(info.c, value);
 
         alloc.root_replacement = full;
         alloc.add(full);
@@ -264,12 +257,6 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         }
         break;
     }
-    case spec_op::ADD_EOS_LEAF_LIST:
-    case spec_op::DEMOTE_LEAF_LIST:
-    case spec_op::ADD_CHILD_CONVERT:
-    case spec_op::SPLIT_INTERIOR:
-    case spec_op::PREFIX_INTERIOR:
-        break;
     default:
         break;
     }
@@ -280,21 +267,12 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
     for (int i = 0; i < info.path_len; ++i) {
-        // Check for poisoned nodes
-        if (info.path[i].node->is_poisoned()) {
-            return false;
-        }
-        if (info.path[i].node->version() != info.path[i].version) {
-            return false;
-        }
+        if (info.path[i].node->is_poisoned()) return false;
+        if (info.path[i].node->version() != info.path[i].version) return false;
     }
     if (info.target && (info.path_len == 0 || info.path[info.path_len-1].node != info.target)) {
-        if (info.target->is_poisoned()) {
-            return false;
-        }
-        if (info.target->version() != info.target_version) {
-            return false;
-        }
+        if (info.target->is_poisoned()) return false;
+        if (info.target->version() != info.target_version) return false;
     }
     return true;
 }
@@ -319,7 +297,6 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::commit_to_slot(atomic_ptr* slot, ptr_t new_node, 
                                    const speculative_info& info) noexcept {
     if (info.path_len > 1) info.path[info.path_len - 2].node->bump_version();
-    // Set sentinel to block readers, then store new value
     if constexpr (THREADED) {
         slot->store(get_retry_sentinel<T, THREADED, Allocator>());
     }
@@ -338,7 +315,7 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::SPLIT_LEAF_SKIP: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
-        ptr_t old_child = alloc.root_replacement->as_list()->children[0].load();
+        ptr_t old_child = alloc.root_replacement->template as_list<false>()->children[0].load();
         old_child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
         commit_to_slot(slot, alloc.root_replacement, info);
         return true;
@@ -346,7 +323,7 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::PREFIX_LEAF_SKIP: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
-        ptr_t child = alloc.root_replacement->as_list()->children[0].load();
+        ptr_t child = alloc.root_replacement->template as_list<false>()->children[0].load();
         child->as_skip()->leaf_value = info.target->as_skip()->leaf_value;
         commit_to_slot(slot, alloc.root_replacement, info);
         return true;
@@ -354,7 +331,7 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::EXTEND_LEAF_SKIP: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
-        *alloc.root_replacement->as_list()->eos_ptr = info.target->as_skip()->leaf_value;
+        *alloc.root_replacement->template as_list<false>()->eos_ptr = info.target->as_skip()->leaf_value;
         commit_to_slot(slot, alloc.root_replacement, info);
         return true;
     }
@@ -364,7 +341,7 @@ bool TKTRIE_CLASS::commit_speculative(
         if (!slot) return false;
         std::string_view skip = info.target_skip;
         ptr_t old_child = clone_leaf_with_skip(info.target, skip.substr(info.match_pos + 1));
-        alloc.root_replacement->as_list()->children[0].store(old_child);
+        alloc.root_replacement->template as_list<false>()->children[0].store(old_child);
         alloc.add(old_child);
         commit_to_slot(slot, alloc.root_replacement, info);
         return true;
@@ -372,10 +349,11 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::LIST_TO_FULL_LEAF: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
-        auto* list = info.target->as_list();
-        for (int i = 0; i < list->chars.count(); ++i) {
-            unsigned char ch = list->chars.char_at(i);
-            alloc.root_replacement->as_full()->add_leaf_entry(ch, list->leaf_values[i]);
+        auto* src = info.target->template as_list<true>();
+        auto* dst = alloc.root_replacement->template as_full<true>();
+        for (int i = 0; i < src->chars.count(); ++i) {
+            unsigned char ch = src->chars.char_at(i);
+            dst->add_leaf_entry(ch, src->leaf_values[i]);
         }
         commit_to_slot(slot, alloc.root_replacement, info);
         return true;
@@ -388,20 +366,17 @@ bool TKTRIE_CLASS::commit_speculative(
         if (!slot || slot->load() != n) return false;
 
         if (n->is_list()) [[likely]] {
-            if (n->as_list()->chars.find(c) >= 0) return false;
-            if (n->as_list()->chars.count() >= LIST_MAX) return false;
+            auto* ln = n->template as_list<true>();
+            if (ln->chars.find(c) >= 0) return false;
+            if (ln->chars.count() >= LIST_MAX) return false;
             n->bump_version();
-            n->as_list()->add_leaf_entry(c, value);
-            if (alloc.root_replacement) {
-                delete alloc.root_replacement->as_eos();
-                alloc.clear();
-            }
+            ln->add_leaf_entry(c, value);
             return true;
         }
-        // FULL
-        if (n->as_full()->valid.template atomic_test<THREADED>(c)) return false;
+        auto* fn = n->template as_full<true>();
+        if (fn->valid.template atomic_test<THREADED>(c)) return false;
         n->bump_version();
-        n->as_full()->template add_leaf_entry_atomic<THREADED>(c, value);
+        fn->template add_leaf_entry_atomic<THREADED>(c, value);
         return true;
     }
     case spec_op::IN_PLACE_INTERIOR: {
@@ -428,26 +403,22 @@ bool TKTRIE_CLASS::commit_speculative(
         ptr_t child = alloc.root_replacement;
 
         if (n->is_list()) {
-            if (n->as_list()->chars.find(c) >= 0) return false;
-            if (n->as_list()->chars.count() >= LIST_MAX) return false;
+            auto* ln = n->template as_list<false>();
+            if (ln->chars.find(c) >= 0) return false;
+            if (ln->chars.count() >= LIST_MAX) return false;
             n->bump_version();
-            n->as_list()->add_child(c, child);
+            ln->add_child(c, child);
             return true;
         }
         if (n->is_full()) {
-            if (n->as_full()->valid.template atomic_test<THREADED>(c)) return false;
+            auto* fn = n->template as_full<false>();
+            if (fn->valid.template atomic_test<THREADED>(c)) return false;
             n->bump_version();
-            n->as_full()->template add_child_atomic<THREADED>(c, child);
+            fn->template add_child_atomic<THREADED>(c, child);
             return true;
         }
         return false;
     }
-    case spec_op::ADD_EOS_LEAF_LIST:
-    case spec_op::DEMOTE_LEAF_LIST:
-    case spec_op::SPLIT_INTERIOR:
-    case spec_op::PREFIX_INTERIOR:
-    case spec_op::ADD_CHILD_CONVERT:
-        return false;
     default:
         return false;
     }
@@ -503,7 +474,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, std::string(kb), value), false};
             }
 
-            // Fast path for IN_PLACE operations - no allocation needed
             if (spec.op == spec_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_path(spec)) continue;
@@ -512,18 +482,16 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 unsigned char c = spec.c;
                 
                 if (n->is_list()) {
-                    if (n->as_list()->chars.find(c) >= 0) continue;  // Now exists
-                    if (n->as_list()->chars.count() >= LIST_MAX) {
-                        // Need to convert to FULL - fall through to slow path
-                        goto slow_path;
-                    }
+                    auto* ln = n->template as_list<true>();
+                    if (ln->chars.find(c) >= 0) continue;
+                    if (ln->chars.count() >= LIST_MAX) goto slow_path;
                     n->bump_version();
-                    int idx = n->as_list()->chars.add(c);
-                    n->as_list()->construct_leaf_value(idx, value);
+                    ln->add_leaf_entry(c, value);
                 } else {
-                    if (n->as_full()->valid.template atomic_test<THREADED>(c)) continue;  // Now exists
+                    auto* fn = n->template as_full<true>();
+                    if (fn->valid.template atomic_test<THREADED>(c)) continue;
                     n->bump_version();
-                    n->as_full()->template add_leaf_entry_atomic<THREADED>(c, value);
+                    fn->template add_leaf_entry_atomic<THREADED>(c, value);
                 }
                 size_.fetch_add(1);
                 return {iterator(this, std::string(kb), value), true};
@@ -531,20 +499,18 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
             if (spec.op == spec_op::IN_PLACE_INTERIOR) {
                 if (spec.is_eos) {
-                    // Adding EOS to interior node
                     T* new_eos = new T(value);
                     std::lock_guard<mutex_t> lock(mutex_);
                     if (!validate_path(spec)) { delete new_eos; continue; }
                     
                     ptr_t n = spec.target;
-                    if (get_eos_ptr(n)) { delete new_eos; continue; }  // Now exists
+                    if (get_eos_ptr(n)) { delete new_eos; continue; }
                     
                     n->bump_version();
                     set_eos_ptr(n, new_eos);
                     size_.fetch_add(1);
                     return {iterator(this, std::string(kb), value), true};
                 } else {
-                    // Adding child to interior node
                     ptr_t child = create_leaf_for_key(spec.remaining_key, value);
                     std::lock_guard<mutex_t> lock(mutex_);
                     if (!validate_path(spec)) { builder_.dealloc_node(child); continue; }
@@ -553,18 +519,19 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     unsigned char c = spec.c;
                     
                     if (n->is_list()) {
-                        if (n->as_list()->chars.find(c) >= 0) { builder_.dealloc_node(child); continue; }
-                        if (n->as_list()->chars.count() >= LIST_MAX) {
+                        auto* ln = n->template as_list<false>();
+                        if (ln->chars.find(c) >= 0) { builder_.dealloc_node(child); continue; }
+                        if (ln->chars.count() >= LIST_MAX) {
                             builder_.dealloc_node(child);
                             goto slow_path;
                         }
                         n->bump_version();
-                        int idx = n->as_list()->chars.add(c);
-                        n->as_list()->children[idx].store(child);
+                        ln->add_child(c, child);
                     } else if (n->is_full()) {
-                        if (n->as_full()->valid.template atomic_test<THREADED>(c)) { builder_.dealloc_node(child); continue; }
+                        auto* fn = n->template as_full<false>();
+                        if (fn->valid.template atomic_test<THREADED>(c)) { builder_.dealloc_node(child); continue; }
                         n->bump_version();
-                        n->as_full()->template add_child_atomic<THREADED>(c, child);
+                        fn->template add_child_atomic<THREADED>(c, child);
                     } else {
                         builder_.dealloc_node(child);
                         goto slow_path;
@@ -575,10 +542,8 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             }
 
             slow_path:
-            // Slow path: need structural changes
             {
                 std::lock_guard<mutex_t> lock(mutex_);
-                // Re-validate under lock
                 if (!validate_path(spec)) continue;
                 
                 ptr_t root = root_.load();
@@ -590,7 +555,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 
                 if (res.new_node) {
-                    // Set sentinel to block readers, then store new root
                     root_.store(get_retry_sentinel<T, THREADED, Allocator>());
                     root_.store(res.new_node);
                 }

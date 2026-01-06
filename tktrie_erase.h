@@ -10,7 +10,6 @@ namespace gteitelbaum {
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
-    // Helper to apply erase result (used by both THREADED and non-THREADED paths)
     auto apply_erase_result = [this](erase_result& res) -> bool {
         if (!res.erased) return false;
         if (res.deleted_subtree) {
@@ -38,7 +37,6 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
             auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
 
-            // Fast path: IN_PLACE operations - direct modification
             if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
@@ -57,7 +55,6 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 continue;
             }
 
-            // Slow path: NOT_FOUND or structural changes needed
             {
                 std::lock_guard<mutex_t> lock(mutex_);
                 auto res = erase_impl(&root_, root_.load(), kb);
@@ -93,15 +90,15 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         return res;
     }
 
-    // LIST or FULL leaf
     if (key.size() != 1) return res;
     unsigned char c = static_cast<unsigned char>(key[0]);
 
     if (leaf->is_list()) [[likely]] {
-        int idx = leaf->as_list()->chars.find(c);
+        auto* ln = leaf->template as_list<true>();
+        int idx = ln->chars.find(c);
         if (idx < 0) return res;
 
-        int count = leaf->as_list()->chars.count();
+        int count = ln->chars.count();
         if (count == 1) {
             res.erased = true;
             res.deleted_subtree = true;
@@ -110,15 +107,15 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         }
 
         leaf->bump_version();
-        leaf->as_list()->shift_leaf_values_down(idx);
+        ln->shift_leaf_values_down(idx);
         res.erased = true;
         return res;
     }
 
-    // FULL
-    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return res;
+    auto* fn = leaf->template as_full<true>();
+    if (!fn->valid.template atomic_test<THREADED>(c)) return res;
     leaf->bump_version();
-    leaf->as_full()->template remove_leaf_entry<THREADED>(c);
+    fn->template remove_leaf_entry<THREADED>(c);
     res.erased = true;
     return res;
 }
@@ -145,7 +142,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     unsigned char c = static_cast<unsigned char>(key[0]);
     ptr_t child = find_child(n, c);
     
-    // Check if child is NOT_FOUND sentinel (treat as no child)
     if (!child || builder_t::is_sentinel(child)) return res;
 
     auto child_res = erase_impl(get_child_slot(n, c), child, key.substr(1));
@@ -157,7 +153,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
 
     if (child_res.new_node) {
         n->bump_version();
-        // Set sentinel to block readers, then store new value
         if constexpr (THREADED) {
             get_child_slot(n, c)->store(get_retry_sentinel<T, THREADED, Allocator>());
         }
@@ -187,11 +182,13 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
     unsigned char c = 0;
     ptr_t child = nullptr;
     if (n->is_list()) {
-        c = n->as_list()->chars.char_at(0);
-        child = n->as_list()->children[0].load();
+        auto* ln = n->template as_list<false>();
+        c = ln->chars.char_at(0);
+        child = ln->children[0].load();
     } else if (n->is_full()) {
-        c = n->as_full()->valid.first();
-        child = n->as_full()->children[c].load();
+        auto* fn = n->template as_full<false>();
+        c = fn->valid.first();
+        child = fn->children[c].load();
     }
     if (!child || builder_t::is_sentinel(child)) return res;
 
@@ -209,10 +206,12 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     int remaining = n->child_count();
 
     if (n->is_list()) {
-        int idx = n->as_list()->chars.find(removed_c);
+        auto* ln = n->template as_list<false>();
+        int idx = ln->chars.find(removed_c);
         if (idx >= 0) remaining--;
     } else if (n->is_full()) {
-        if (n->as_full()->valid.template atomic_test<THREADED>(removed_c)) remaining--;
+        auto* fn = n->template as_full<false>();
+        if (fn->valid.template atomic_test<THREADED>(removed_c)) remaining--;
     }
 
     if ((!eos) & (remaining == 0)) {
@@ -222,29 +221,34 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     }
 
     if (n->is_list()) {
-        int idx = n->as_list()->chars.find(removed_c);
+        auto* ln = n->template as_list<false>();
+        int idx = ln->chars.find(removed_c);
         if (idx >= 0) {
             n->bump_version();
-            n->as_list()->shift_children_down(idx);
+            ln->shift_children_down(idx);
         }
     } else if (n->is_full()) {
         n->bump_version();
-        n->as_full()->template remove_child<THREADED>(removed_c);
+        n->template as_full<false>()->template remove_child<THREADED>(removed_c);
     }
 
     bool can_collapse = false;
     unsigned char c = 0;
     ptr_t child = nullptr;
 
-    if (n->is_list() && n->as_list()->chars.count() == 1 && !eos) {
-        c = n->as_list()->chars.char_at(0);
-        child = n->as_list()->children[0].load();
-        can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+    if (n->is_list()) {
+        auto* ln = n->template as_list<false>();
+        if (ln->chars.count() == 1 && !eos) {
+            c = ln->chars.char_at(0);
+            child = ln->children[0].load();
+            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+        }
     } else if (n->is_full() && !eos) {
-        int cnt = n->as_full()->valid.count();
+        auto* fn = n->template as_full<false>();
+        int cnt = fn->valid.count();
         if (cnt == 1) {
-            c = n->as_full()->valid.first();
-            child = n->as_full()->children[c].load();
+            c = fn->valid.first();
+            child = fn->children[c].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
     }
@@ -268,19 +272,18 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             merged = builder_.make_leaf_skip(new_skip, child->as_skip()->leaf_value);
         } else if (child->is_list()) [[likely]] {
             merged = builder_.make_leaf_list(new_skip);
-            child->as_list()->copy_leaf_values_to(merged->as_list());
+            child->template as_list<true>()->copy_leaf_values_to(merged->template as_list<true>());
         } else {
             merged = builder_.make_leaf_full(new_skip);
-            child->as_full()->copy_leaf_values_to(merged->as_full());
+            child->template as_full<true>()->copy_leaf_values_to(merged->template as_full<true>());
         }
     } else {
-        // Interior: LIST or FULL only
         if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
-            child->as_list()->move_interior_to(merged->as_list());
+            child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
         } else {
             merged = builder_.make_interior_full(new_skip);
-            child->as_full()->move_interior_to(merged->as_full());
+            child->template as_full<false>()->move_interior_to(merged->template as_full<false>());
         }
     }
 

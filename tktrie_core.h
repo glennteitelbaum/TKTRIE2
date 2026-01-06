@@ -16,30 +16,26 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
     if (!ptr) return;
     auto* n = static_cast<ptr_t>(ptr);
-    // Never delete sentinel nodes
     if (builder_t::is_sentinel(n)) return;
     builder_t::delete_node(n);
 }
 
 TKTRIE_TEMPLATE
 std::string_view TKTRIE_CLASS::get_skip(ptr_t n) noexcept {
-    // All node types have skip string - use the node's method
     return n->skip_str();
 }
 
 TKTRIE_TEMPLATE
 T* TKTRIE_CLASS::get_eos_ptr(ptr_t n) noexcept {
-    // Only interior LIST and FULL have eos_ptr
     if (n->is_leaf()) return nullptr;
-    if (n->is_list()) [[likely]] return n->as_list()->eos_ptr;
-    return n->as_full()->eos_ptr;
+    if (n->is_list()) [[likely]] return n->template as_list<false>()->eos_ptr;
+    return n->template as_full<false>()->eos_ptr;
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
-    // Only interior LIST and FULL have eos_ptr
-    if (n->is_list()) [[likely]] n->as_list()->eos_ptr = p;
-    else n->as_full()->eos_ptr = p;
+    if (n->is_list()) [[likely]] n->template as_list<false>()->eos_ptr = p;
+    else n->template as_full<false>()->eos_ptr = p;
 }
 
 // -----------------------------------------------------------------------------
@@ -49,10 +45,9 @@ void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n) return;
-    // Never retire sentinel nodes
     if (builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
-        n->poison();  // Mark as dead BEFORE adding to retire list
+        n->poison();
         uint64_t epoch = ebr_slot::global_epoch().load(std::memory_order_acquire);
         ebr_retire(n, epoch);
         ebr_global::instance().advance_epoch();
@@ -101,13 +96,11 @@ void TKTRIE_CLASS::ebr_try_reclaim() {
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) const noexcept {
     if (n->is_list()) [[likely]] {
-        int idx = n->as_list()->chars.find(c);
-        return idx >= 0 ? n->as_list()->children[idx].load() : nullptr;
+        int idx = n->template as_list<false>()->chars.find(c);
+        return idx >= 0 ? n->template as_list<false>()->children[idx].load() : nullptr;
     }
-    // FULL: No bitmap check needed - children default to NOT_FOUND sentinel
-    // Either returns real child or NOT_FOUND (which reader handles naturally)
     if (n->is_full()) {
-        return n->as_full()->children[c].load();
+        return n->template as_full<false>()->children[c].load();
     }
     return nullptr;
 }
@@ -115,12 +108,11 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigned char c) noexcept {
     if (n->is_list()) [[likely]] {
-        int idx = n->as_list()->chars.find(c);
-        return idx >= 0 ? &n->as_list()->children[idx] : nullptr;
+        int idx = n->template as_list<false>()->chars.find(c);
+        return idx >= 0 ? &n->template as_list<false>()->children[idx] : nullptr;
     }
-    // FULL: Return slot directly (bitmap still used for iteration/counting)
-    if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
-        return &n->as_full()->children[c];
+    if (n->is_full() && n->template as_full<false>()->valid.template atomic_test<THREADED>(c)) {
+        return &n->template as_full<false>()->children[c];
     }
     return nullptr;
 }
@@ -133,7 +125,6 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexcept {
     if (!n) return false;
     
-    // Loop only on interior nodes
     while (!n->is_leaf()) {
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
@@ -153,7 +144,6 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexce
         if (!n) return false;
     }
     
-    // n is now a leaf
     return read_from_leaf(n, key, out);
 }
 
@@ -174,35 +164,26 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
         return true;
     }
     
-    // LIST or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
     if (leaf->is_list()) [[likely]] {
-        int idx = leaf->as_list()->chars.find(c);
+        int idx = leaf->template as_list<true>()->chars.find(c);
         if (idx < 0) return false;
-        out = leaf->as_list()->leaf_values[idx];
+        out = leaf->template as_list<true>()->leaf_values[idx];
         return true;
     }
-    // FULL leaf - still need bitmap check (leaf values, not children)
-    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return false;
-    out = leaf->as_full()->leaf_values[c];
+    if (!leaf->template as_full<true>()->valid.template atomic_test<THREADED>(c)) return false;
+    out = leaf->template as_full<true>()->leaf_values[c];
     return true;
 }
-
-// -----------------------------------------------------------------------------
-// Optimistic read operations (lock-free fast path for THREADED mode)
-// Uses poison detection + version validation for safe lock-free reads
-// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept {
     if (!n || n->is_poisoned()) return false;
     
-    // Record root in path
     if (!path.push(n)) return false;
     
-    // Loop only on interior nodes
     while (!n->is_leaf()) {
         std::string_view skip = get_skip(n);
         size_t m = match_skip_impl(skip, key);
@@ -224,20 +205,14 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         if (!path.push(n)) return false;
     }
     
-    // n is now a leaf - read_from_leaf handles poison check via if constexpr (THREADED)
     return read_from_leaf(n, key, out);
 }
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     for (int i = 0; i < path.len; ++i) {
-        // Check for poisoned nodes - they will never have matching versions
-        if (path.nodes[i]->is_poisoned()) {
-            return false;
-        }
-        if (path.nodes[i]->version() != path.versions[i]) {
-            return false;
-        }
+        if (path.nodes[i]->is_poisoned()) return false;
+        if (path.nodes[i]->version() != path.versions[i]) return false;
     }
     return true;
 }
@@ -302,13 +277,11 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
     root_.store(nullptr);
-    // Never dealloc sentinel nodes
     if (r && !builder_t::is_sentinel(r)) {
         builder_.dealloc_node(r);
     }
     size_.store(0);
     if constexpr (THREADED) {
-        // Force reclaim all retired nodes for this trie
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         for (auto& rn : retired_) {
             node_deleter(rn.ptr);
@@ -321,9 +294,8 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     if constexpr (THREADED) {
-        // Lock-free read with EBR protection + version validation
         auto& slot = get_ebr_slot();
-        auto guard = slot.get_guard();  // Register with EBR - blocks reclamation
+        auto guard = slot.get_guard();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             T dummy;
@@ -331,20 +303,11 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             
             ptr_t root = root_.load();
             if (!root) return false;
-            
-            // Sentinel and poisoned nodes both have FLAG_POISON
-            // is_poisoned() catches both cases
             if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, dummy, path);
-            
-            // Validate all versions unchanged (also catches poison)
-            if (validate_read_path(path)) {
-                return found;
-            }
-            // Version mismatch or poison - concurrent modification, retry
+            if (validate_read_path(path)) return found;
         }
-        // Too many retries - fall back to locked read (shouldn't happen normally)
         return contains_impl(root_.load(), kb);
     } else {
         return contains_impl(root_.load(), kb);
@@ -368,31 +331,22 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     auto kb = traits::to_bytes(key);
     T value;
     if constexpr (THREADED) {
-        // Lock-free read with EBR protection + version validation
         auto& slot = get_ebr_slot();
-        auto guard = slot.get_guard();  // Register with EBR - blocks reclamation
+        auto guard = slot.get_guard();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
             
             ptr_t root = root_.load();
             if (!root) return end();
-            
-            // Sentinel and poisoned nodes both have FLAG_POISON
             if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, value, path);
-            
-            // Validate all versions unchanged (also catches poison)
             if (validate_read_path(path)) {
-                if (found) {
-                    return iterator(this, std::string(kb), value);
-                }
+                if (found) return iterator(this, std::string(kb), value);
                 return end();
             }
-            // Version mismatch or poison - concurrent modification, retry
         }
-        // Too many retries - fall back to locked read
         if (read_impl(root_.load(), kb, value)) {
             return iterator(this, std::string(kb), value);
         }
@@ -407,7 +361,6 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
-        // Force reclaim all retired nodes for this trie
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         for (auto& rn : retired_) {
             node_deleter(rn.ptr);

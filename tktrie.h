@@ -66,8 +66,6 @@ public:
     using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator>;
     using builder_t = node_builder<T, THREADED, Allocator>;
     using skip_t = skip_node<T, THREADED, Allocator>;
-    using list_t = list_node<T, THREADED, Allocator>;
-    using full_t = full_node<T, THREADED, Allocator>;
     using iterator = tktrie_iterator<Key, T, THREADED, Allocator>;
     using mutex_t = std::conditional_t<THREADED, std::mutex, empty_mutex>;
 
