@@ -150,9 +150,8 @@ public:
     // Speculative erase types
     // -------------------------------------------------------------------------
     enum class erase_op {
-        NOT_FOUND, DELETE_LEAF_SKIP, DELETE_LAST_LEAF_LIST,
-        IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL, DELETE_EOS_INTERIOR,
-        IN_PLACE_INTERIOR_LIST, IN_PLACE_INTERIOR_FULL, COLLAPSE_AFTER_REMOVE,
+        NOT_FOUND,
+        IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL,
     };
 
     struct erase_spec_info {
@@ -163,25 +162,6 @@ public:
         ptr_t target = nullptr;
         uint64_t target_version = 0;
         unsigned char c = 0;
-        ptr_t collapse_child = nullptr;
-        uint64_t collapse_child_version = 0;
-        unsigned char collapse_char = 0;
-        std::string target_skip;
-        std::string child_skip;
-        ptr_t parent = nullptr;
-        uint64_t parent_version = 0;
-        unsigned char parent_edge = 0;
-        std::string parent_skip;
-        ptr_t parent_collapse_child = nullptr;
-        uint64_t parent_collapse_child_version = 0;
-        unsigned char parent_collapse_char = 0;
-        std::string parent_child_skip;
-    };
-
-    struct erase_pre_alloc {
-        ptr_t merged = nullptr;
-        ptr_t parent_merged = nullptr;
-        void clear() { merged = nullptr; parent_merged = nullptr; }
     };
 
     // -------------------------------------------------------------------------
@@ -275,20 +255,8 @@ private:
     // -------------------------------------------------------------------------
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
-    void capture_parent_collapse_info(erase_spec_info& info) const noexcept;
-    bool check_collapse_needed(ptr_t parent, unsigned char removed_c, unsigned char& collapse_c, ptr_t& collapse_child) const noexcept;
-    ptr_t allocate_collapse_node_impl(std::string_view prefix_skip, unsigned char edge_char,
-                                       std::string_view child_skip, ptr_t child);
-    ptr_t allocate_collapse_node(const erase_spec_info& info);
-    ptr_t allocate_parent_collapse_node(const erase_spec_info& info);
-    erase_pre_alloc allocate_erase_speculative(const erase_spec_info& info);
-    void dealloc_erase_speculation(erase_pre_alloc& alloc);
-    void fill_collapse_node(ptr_t merged, ptr_t child);
-    bool validate_erase_path(const erase_spec_info& info) const noexcept;
     bool do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
-    bool do_inplace_interior_list_erase(ptr_t n, unsigned char c, uint64_t expected_version);
-    bool do_inplace_interior_full_erase(ptr_t n, unsigned char c, uint64_t expected_version);
     bool erase_locked(std::string_view kb);
     erase_result erase_impl(atomic_ptr* slot, ptr_t n, std::string_view key);
     erase_result erase_from_leaf(ptr_t leaf, std::string_view key);

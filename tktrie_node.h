@@ -189,15 +189,6 @@ struct list_node : node_base<T, THREADED, Allocator> {
         }
     }
     
-    // Helper to copy children to another list_node
-    void copy_children_to(list_node* dest) {
-        dest->chars = chars;
-        int cnt = chars.count();
-        for (int i = 0; i < cnt; ++i) {
-            dest->children[i].store(children[i].load());
-        }
-    }
-    
     // Helper to shift children down after removal at idx
     void shift_children_down(int idx) {
         int count = chars.count();

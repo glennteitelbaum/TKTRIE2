@@ -73,24 +73,6 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 }
                 continue;
             }
-            
-            if (info.op == erase_op::IN_PLACE_INTERIOR_LIST) {
-                std::lock_guard<mutex_t> lock(mutex_);
-                if (do_inplace_interior_list_erase(info.target, info.c, info.target_version)) {
-                    size_.fetch_sub(1);
-                    return true;
-                }
-                continue;
-            }
-            
-            if (info.op == erase_op::IN_PLACE_INTERIOR_FULL) {
-                std::lock_guard<mutex_t> lock(mutex_);
-                if (do_inplace_interior_full_erase(info.target, info.c, info.target_version)) {
-                    size_.fetch_sub(1);
-                    return true;
-                }
-                continue;
-            }
 
             // Slow path: structural changes needed
             {
