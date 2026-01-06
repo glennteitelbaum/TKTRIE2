@@ -14,6 +14,7 @@ namespace gteitelbaum {
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_base;
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_with_skip;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct skip_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
@@ -49,7 +50,6 @@ struct skip_string {
         len = static_cast<uint8_t>(sv.size());
         std::memcpy(data.data(), sv.data(), sv.size());
     }
-    
     void clear() noexcept { len = 0; }
 };
 
@@ -70,7 +70,7 @@ struct skip_string<0> {
 };
 
 // =============================================================================
-// ATOMIC_NODE_PTR - uses atomic storage, defaults to NOT_FOUND sentinel
+// ATOMIC_NODE_PTR - defaults to NOT_FOUND sentinel
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -89,7 +89,7 @@ struct atomic_node_ptr {
 };
 
 // =============================================================================
-// NODE_BASE - common header for all node types
+// NODE_BASE - header only, type queries and dispatchers
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -105,16 +105,18 @@ struct node_base {
     constexpr node_base() noexcept = default;
     constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     
+    // Header access
     uint64_t header() const noexcept { return header_.load(); }
     void set_header(uint64_t h) noexcept { header_.store(h); }
     
-    bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
+    // Version and poison
     uint64_t version() const noexcept { return get_version(header()); }
-    
     void bump_version() noexcept { header_.store(gteitelbaum::bump_version(header_.load())); }
     void poison() noexcept { header_.store(header_.load() | FLAG_POISON); }
     bool is_poisoned() const noexcept { return is_poisoned_header(header()); }
     
+    // Type queries
+    bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
     bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST)); }
@@ -144,35 +146,134 @@ struct node_base {
         return static_cast<const full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
     
+    // Skip access - all node types have skip via node_with_skip
     std::string_view skip_str() const noexcept {
-        if (is_skip()) return as_skip()->skip.view();
-        if (is_list()) [[likely]] {
-            if (is_leaf()) return as_list<true>()->skip.view();
-            return as_list<false>()->skip.view();
-        }
-        if (is_leaf()) return as_full<true>()->skip.view();
-        return as_full<false>()->skip.view();
+        return static_cast<const node_with_skip<T, THREADED, Allocator, FIXED_LEN>*>(this)->skip.view();
     }
     
-    int child_count() const noexcept {
-        if (is_leaf()) return 0;
-        if (is_list()) [[likely]] return as_list<false>()->chars.count();
-        return as_full<false>()->valid.count();
+    // =========================================================================
+    // DISPATCHERS - is_leaf param allows compiler to eliminate dead branches
+    // =========================================================================
+    
+    // Child access (interior nodes)
+    ptr_t get_child(bool is_leaf, unsigned char c) const noexcept {
+        if (is_leaf) [[unlikely]] {
+            return nullptr;
+        }
+        if (is_list()) [[likely]] {
+            return as_list<false>()->get_child(c);
+        }
+        return as_full<false>()->get_child(c);
+    }
+    
+    atomic_ptr* get_child_slot(bool is_leaf, unsigned char c) noexcept {
+        if (is_leaf) [[unlikely]] {
+            return nullptr;
+        }
+        if (is_list()) [[likely]] {
+            return as_list<false>()->get_child_slot(c);
+        }
+        return as_full<false>()->get_child_slot(c);
+    }
+    
+    int entry_count(bool is_leaf) const noexcept {
+        if (is_leaf) [[unlikely]] {
+            if (is_skip()) return 1;
+            if (is_list()) [[likely]] return as_list<true>()->count();
+            return as_full<true>()->count();
+        }
+        if (is_list()) [[likely]] return as_list<false>()->count();
+        return as_full<false>()->count();
+    }
+    
+    // Value access (leaf nodes) - handles SKIP/LIST/FULL
+    bool try_read_value(bool is_leaf, unsigned char c, T& out) const noexcept {
+        if (!is_leaf) [[unlikely]] return false;
+        if (is_skip()) {
+            return as_skip()->value.try_read(out);
+        }
+        if (is_list()) [[likely]] {
+            return as_list<true>()->get_value(c, out);
+        }
+        return as_full<true>()->get_value(c, out);
+    }
+    
+    bool has_value(bool is_leaf, unsigned char c) const noexcept {
+        if (!is_leaf) [[unlikely]] return false;
+        if (is_skip()) return as_skip()->value.has_data();
+        if (is_list()) [[likely]] return as_list<true>()->has(c);
+        return as_full<true>()->has(c);
+    }
+    
+    // EOS access (interior nodes, FIXED_LEN==0 only)
+    bool has_eos(bool is_leaf) const noexcept {
+        if constexpr (FIXED_LEN > 0) {
+            (void)is_leaf;
+            return false;
+        } else {
+            if (is_leaf) [[unlikely]] return false;
+            if (is_list()) [[likely]] return as_list<false>()->eos.has_data();
+            return as_full<false>()->eos.has_data();
+        }
+    }
+    
+    bool try_read_eos(bool is_leaf, T& out) const noexcept {
+        if constexpr (FIXED_LEN > 0) {
+            (void)is_leaf; (void)out;
+            return false;
+        } else {
+            if (is_leaf) [[unlikely]] return false;
+            if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
+            return as_full<false>()->eos.try_read(out);
+        }
+    }
+    
+    void set_eos(bool is_leaf, const T& value) {
+        if constexpr (FIXED_LEN > 0) {
+            (void)is_leaf; (void)value;
+        } else {
+            if (is_leaf) [[unlikely]] return;
+            if (is_list()) [[likely]] as_list<false>()->eos.set(value);
+            else as_full<false>()->eos.set(value);
+        }
+    }
+    
+    void clear_eos(bool is_leaf) {
+        if constexpr (FIXED_LEN > 0) {
+            (void)is_leaf;
+        } else {
+            if (is_leaf) [[unlikely]] return;
+            if (is_list()) [[likely]] as_list<false>()->eos.clear();
+            else as_full<false>()->eos.clear();
+        }
     }
 };
 
 // =============================================================================
-// SKIP_NODE - skip string + value (always leaf)
+// NODE_WITH_SKIP - intermediate base with skip field first
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct skip_node : node_base<T, THREADED, Allocator, FIXED_LEN> {
+struct node_with_skip : node_base<T, THREADED, Allocator, FIXED_LEN> {
     using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
-    using data_t = typename base_t::data_t;
     using skip_t = typename base_t::skip_t;
     
-    data_t value;
     skip_t skip;
+    
+    constexpr node_with_skip() noexcept = default;
+    constexpr explicit node_with_skip(uint64_t h) noexcept : base_t(h) {}
+};
+
+// =============================================================================
+// SKIP_NODE - skip string + single value (always leaf)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct skip_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using data_t = typename base_t::data_t;
+    
+    data_t value;
     
     skip_node() = default;
     ~skip_node() = default;
@@ -183,36 +284,57 @@ struct skip_node : node_base<T, THREADED, Allocator, FIXED_LEN> {
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct list_node<T, THREADED, Allocator, FIXED_LEN, true> : node_base<T, THREADED, Allocator, FIXED_LEN> {
-    using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
+struct list_node<T, THREADED, Allocator, FIXED_LEN, true> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
     using data_t = typename base_t::data_t;
-    using skip_t = typename base_t::skip_t;
     
     static constexpr int MAX_CHILDREN = 7;
     
-    skip_t skip;
     small_list chars;
     std::array<data_t, MAX_CHILDREN> values;
     
     list_node() = default;
     ~list_node() = default;
     
-    int add_entry(unsigned char c, const T& val) {
+    // Unified interface
+    int count() const noexcept { return chars.count(); }
+    bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
+    
+    bool get_value(unsigned char c, T& out) const noexcept {
+        int idx = chars.find(c);
+        if (idx < 0) return false;
+        return values[idx].try_read(out);
+    }
+    
+    void set_value(unsigned char c, const T& val) {
+        int idx = chars.find(c);
+        if (idx >= 0) {
+            values[idx].set(val);
+        } else {
+            idx = chars.add(c);
+            values[idx].set(val);
+        }
+    }
+    
+    int add_value(unsigned char c, const T& val) {
         int idx = chars.add(c);
         values[idx].set(val);
         return idx;
     }
     
-    void shift_values_down(int idx) {
-        int count = chars.count();
-        for (int i = idx; i < count - 1; ++i) {
+    void remove_value(unsigned char c) {
+        int idx = chars.find(c);
+        if (idx < 0) return;
+        int cnt = chars.count();
+        for (int i = idx; i < cnt - 1; ++i) {
             values[i] = std::move(values[i + 1]);
         }
-        values[count - 1].clear();
+        values[cnt - 1].clear();
         chars.remove_at(idx);
     }
     
-    void copy_values_to(list_node* dest) {
+    void copy_values_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
         for (int i = 0; i < cnt; ++i) {
@@ -222,46 +344,58 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true> : node_base<T, THREADE
 };
 
 // =============================================================================
-// LIST_NODE - INTERIOR specialization (stores child pointers)
-// FIXED_LEN > 0: no eos (fixed-length keys can't be prefixes)
-// FIXED_LEN == 0: has eos_ptr (variable-length keys can be prefixes)
+// LIST_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
 // =============================================================================
 
-// FIXED_LEN > 0: Interior LIST without eos
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct list_node<T, THREADED, Allocator, FIXED_LEN, false> : node_base<T, THREADED, Allocator, FIXED_LEN> {
-    using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
+struct list_node<T, THREADED, Allocator, FIXED_LEN, false> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
-    using skip_t = typename base_t::skip_t;
     
     static constexpr int MAX_CHILDREN = 7;
     
-    skip_t skip;
     small_list chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     list_node() = default;
     ~list_node() = default;
     
-    void add_child(unsigned char c, typename base_t::ptr_t child) {
+    // Unified interface
+    int count() const noexcept { return chars.count(); }
+    bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        int idx = chars.find(c);
+        return idx >= 0 ? children[idx].load() : nullptr;
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        int idx = chars.find(c);
+        return idx >= 0 ? &children[idx] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
         int idx = chars.add(c);
         children[idx].store(child);
     }
     
-    void add_two_children(unsigned char c1, typename base_t::ptr_t child1,
-                          unsigned char c2, typename base_t::ptr_t child2) {
+    void add_two_children(unsigned char c1, ptr_t child1, unsigned char c2, ptr_t child2) {
         chars.add(c1);
         chars.add(c2);
         children[0].store(child1);
         children[1].store(child2);
     }
     
-    void shift_children_down(int idx) {
-        int count = chars.count();
-        for (int i = idx; i < count - 1; ++i) {
+    void remove_child(unsigned char c) {
+        int idx = chars.find(c);
+        if (idx < 0) return;
+        int cnt = chars.count();
+        for (int i = idx; i < cnt - 1; ++i) {
             children[i].store(children[i + 1].load());
         }
-        children[count - 1].store(nullptr);
+        children[cnt - 1].store(nullptr);
         chars.remove_at(idx);
     }
     
@@ -275,54 +409,67 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false> : node_base<T, THREAD
     }
     
     void move_interior_to(list_node* dest) {
-        dest->chars = chars;
-        int cnt = chars.count();
-        for (int i = 0; i < cnt; ++i) {
-            dest->children[i].store(children[i].load());
-            children[i].store(nullptr);
-        }
+        move_children_to(dest);
     }
     
     void move_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest);
 };
 
-// FIXED_LEN == 0: Interior LIST with eos_ptr
+// =============================================================================
+// LIST_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator>
-struct list_node<T, THREADED, Allocator, 0, false> : node_base<T, THREADED, Allocator, 0> {
-    using base_t = node_base<T, THREADED, Allocator, 0>;
+struct list_node<T, THREADED, Allocator, 0, false> 
+    : node_with_skip<T, THREADED, Allocator, 0> {
+    using base_t = node_with_skip<T, THREADED, Allocator, 0>;
+    using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
     using data_t = typename base_t::data_t;
-    using skip_t = typename base_t::skip_t;
     
     static constexpr int MAX_CHILDREN = 7;
     
-    data_t eos;              // Value if key terminates here
-    skip_t skip;
+    data_t eos;
     small_list chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     list_node() = default;
     ~list_node() = default;
     
-    void add_child(unsigned char c, typename base_t::ptr_t child) {
+    // Unified interface
+    int count() const noexcept { return chars.count(); }
+    bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        int idx = chars.find(c);
+        return idx >= 0 ? children[idx].load() : nullptr;
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        int idx = chars.find(c);
+        return idx >= 0 ? &children[idx] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
         int idx = chars.add(c);
         children[idx].store(child);
     }
     
-    void add_two_children(unsigned char c1, typename base_t::ptr_t child1,
-                          unsigned char c2, typename base_t::ptr_t child2) {
+    void add_two_children(unsigned char c1, ptr_t child1, unsigned char c2, ptr_t child2) {
         chars.add(c1);
         chars.add(c2);
         children[0].store(child1);
         children[1].store(child2);
     }
     
-    void shift_children_down(int idx) {
-        int count = chars.count();
-        for (int i = idx; i < count - 1; ++i) {
+    void remove_child(unsigned char c) {
+        int idx = chars.find(c);
+        if (idx < 0) return;
+        int cnt = chars.count();
+        for (int i = idx; i < cnt - 1; ++i) {
             children[i].store(children[i + 1].load());
         }
-        children[count - 1].store(nullptr);
+        children[cnt - 1].store(nullptr);
         chars.remove_at(idx);
     }
     
@@ -336,13 +483,8 @@ struct list_node<T, THREADED, Allocator, 0, false> : node_base<T, THREADED, Allo
     }
     
     void move_interior_to(list_node* dest) {
-        dest->chars = chars;
         dest->eos = std::move(eos);
-        int cnt = chars.count();
-        for (int i = 0; i < cnt; ++i) {
-            dest->children[i].store(children[i].load());
-            children[i].store(nullptr);
-        }
+        move_children_to(dest);
     }
     
     void move_interior_to_full(full_node<T, THREADED, Allocator, 0, false>* dest);
@@ -353,36 +495,47 @@ struct list_node<T, THREADED, Allocator, 0, false> : node_base<T, THREADED, Allo
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct full_node<T, THREADED, Allocator, FIXED_LEN, true> : node_base<T, THREADED, Allocator, FIXED_LEN> {
-    using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
+struct full_node<T, THREADED, Allocator, FIXED_LEN, true> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
     using data_t = typename base_t::data_t;
-    using skip_t = typename base_t::skip_t;
     
-    skip_t skip;
     bitmap256 valid;
     std::array<data_t, 256> values;
     
     full_node() = default;
     ~full_node() = default;
     
-    void add_entry(unsigned char c, const T& val) {
+    // Unified interface
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    
+    bool get_value(unsigned char c, T& out) const noexcept {
+        if (!valid.template atomic_test<THREADED>(c)) return false;
+        return values[c].try_read(out);
+    }
+    
+    void set_value(unsigned char c, const T& val) {
+        values[c].set(val);
+        valid.template atomic_set<THREADED>(c);
+    }
+    
+    void add_value(unsigned char c, const T& val) {
         values[c].set(val);
         valid.set(c);
     }
     
-    template <bool THR>
-    void add_entry_atomic(unsigned char c, const T& val) {
+    void add_value_atomic(unsigned char c, const T& val) {
         values[c].set(val);
-        valid.template atomic_set<THR>(c);
+        valid.template atomic_set<THREADED>(c);
     }
     
-    template <bool THR>
-    void remove_entry(unsigned char c) {
+    void remove_value(unsigned char c) {
         values[c].clear();
-        valid.template atomic_clear<THR>(c);
+        valid.template atomic_clear<THREADED>(c);
     }
     
-    void copy_values_to(full_node* dest) {
+    void copy_values_to(full_node* dest) const {
         dest->valid = valid;
         valid.for_each_set([this, dest](unsigned char c) {
             dest->values[c].deep_copy_from(values[c]);
@@ -391,39 +544,46 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true> : node_base<T, THREADE
 };
 
 // =============================================================================
-// FULL_NODE - INTERIOR specialization (stores child pointers)
-// FIXED_LEN > 0: no eos
-// FIXED_LEN == 0: has eos_ptr
+// FULL_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
 // =============================================================================
 
-// FIXED_LEN > 0: Interior FULL without eos
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct full_node<T, THREADED, Allocator, FIXED_LEN, false> : node_base<T, THREADED, Allocator, FIXED_LEN> {
-    using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
+struct full_node<T, THREADED, Allocator, FIXED_LEN, false> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
-    using skip_t = typename base_t::skip_t;
     
-    skip_t skip;
     bitmap256 valid;
     std::array<atomic_ptr, 256> children;
     
     full_node() = default;
     ~full_node() = default;
     
-    void add_child(unsigned char c, typename base_t::ptr_t child) {
+    // Unified interface
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        return children[c].load();
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        return valid.template atomic_test<THREADED>(c) ? &children[c] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
         children[c].store(child);
         valid.set(c);
     }
     
-    template <bool THR>
-    void add_child_atomic(unsigned char c, typename base_t::ptr_t child) {
+    void add_child_atomic(unsigned char c, ptr_t child) {
         children[c].store(child);
-        valid.template atomic_set<THR>(c);
+        valid.template atomic_set<THREADED>(c);
     }
     
-    template <bool THR>
     void remove_child(unsigned char c) {
-        valid.template atomic_clear<THR>(c);
+        valid.template atomic_clear<THREADED>(c);
         children[c].store(nullptr);
     }
     
@@ -436,42 +596,55 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false> : node_base<T, THREAD
     }
 };
 
-// FIXED_LEN == 0: Interior FULL with eos
+// =============================================================================
+// FULL_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator>
-struct full_node<T, THREADED, Allocator, 0, false> : node_base<T, THREADED, Allocator, 0> {
-    using base_t = node_base<T, THREADED, Allocator, 0>;
+struct full_node<T, THREADED, Allocator, 0, false> 
+    : node_with_skip<T, THREADED, Allocator, 0> {
+    using base_t = node_with_skip<T, THREADED, Allocator, 0>;
+    using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
     using data_t = typename base_t::data_t;
-    using skip_t = typename base_t::skip_t;
     
-    data_t eos;              // Value if key terminates here
-    skip_t skip;
+    data_t eos;
     bitmap256 valid;
     std::array<atomic_ptr, 256> children;
     
     full_node() = default;
     ~full_node() = default;
     
-    void add_child(unsigned char c, typename base_t::ptr_t child) {
+    // Unified interface
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        return children[c].load();
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        return valid.template atomic_test<THREADED>(c) ? &children[c] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
         children[c].store(child);
         valid.set(c);
     }
     
-    template <bool THR>
-    void add_child_atomic(unsigned char c, typename base_t::ptr_t child) {
+    void add_child_atomic(unsigned char c, ptr_t child) {
         children[c].store(child);
-        valid.template atomic_set<THR>(c);
+        valid.template atomic_set<THREADED>(c);
     }
     
-    template <bool THR>
     void remove_child(unsigned char c) {
-        valid.template atomic_clear<THR>(c);
+        valid.template atomic_clear<THREADED>(c);
         children[c].store(nullptr);
     }
     
     void move_interior_to(full_node* dest) {
-        dest->valid = valid;
         dest->eos = std::move(eos);
+        dest->valid = valid;
         valid.for_each_set([this, dest](unsigned char c) {
             dest->children[c].store(children[c].load());
             children[c].store(nullptr);
@@ -510,34 +683,34 @@ void list_node<T, THREADED, Allocator, 0, false>::move_interior_to_full(
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct not_found_list_storage : node_base<T, THREADED, Allocator, FIXED_LEN> {
-    skip_string<FIXED_LEN> skip{};
+struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     small_list chars{};
     std::array<void*, 7> dummy_children{};
     
-    constexpr not_found_list_storage() noexcept 
-        : node_base<T, THREADED, Allocator, FIXED_LEN>(NOT_FOUND_SENTINEL_HEADER) {}
+    constexpr not_found_storage() noexcept {
+        this->set_header(NOT_FOUND_SENTINEL_HEADER);
+    }
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct retry_full_storage : node_base<T, THREADED, Allocator, FIXED_LEN> {
-    skip_string<FIXED_LEN> skip{};
+struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     bitmap256 valid{};
     std::array<void*, 256> dummy_children{};
     
-    constexpr retry_full_storage() noexcept 
-        : node_base<T, THREADED, Allocator, FIXED_LEN>(RETRY_SENTINEL_HEADER) {}
+    constexpr retry_storage() noexcept {
+        this->set_header(RETRY_SENTINEL_HEADER);
+    }
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept {
-    constinit static not_found_list_storage<T, THREADED, Allocator, FIXED_LEN> storage{};
+    static not_found_storage<T, THREADED, Allocator, FIXED_LEN> storage{};
     return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(&storage);
 }
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept {
-    constinit static retry_full_storage<T, THREADED, Allocator, FIXED_LEN> storage{};
+    static retry_storage<T, THREADED, Allocator, FIXED_LEN> storage{};
     return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(&storage);
 }
 
@@ -616,7 +789,7 @@ public:
         if (!n->is_leaf()) {
             if (n->is_list()) [[likely]] {
                 auto* ln = n->template as_list<false>();
-                int cnt = ln->chars.count();
+                int cnt = ln->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
                 }
@@ -647,21 +820,14 @@ public:
                 auto* d = new leaf_list_t();
                 d->set_header(s->header());
                 d->skip = s->skip;
-                d->chars = s->chars;
-                int cnt = s->chars.count();
-                for (int i = 0; i < cnt; ++i) {
-                    d->values[i].deep_copy_from(s->values[i]);
-                }
+                s->copy_values_to(d);
                 return d;
             }
             auto* s = src->template as_full<true>();
             auto* d = new leaf_full_t();
             d->set_header(s->header());
             d->skip = s->skip;
-            d->valid = s->valid;
-            s->valid.for_each_set([s, d](unsigned char c) {
-                d->values[c].deep_copy_from(s->values[c]);
-            });
+            s->copy_values_to(d);
             return d;
         }
         
@@ -675,7 +841,7 @@ public:
             if constexpr (FIXED_LEN == 0) {
                 d->eos.deep_copy_from(s->eos);
             }
-            int cnt = s->chars.count();
+            int cnt = s->count();
             for (int i = 0; i < cnt; ++i) {
                 d->children[i].store(deep_copy(s->children[i].load()));
             }

@@ -31,7 +31,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_leaf(
     atomic_ptr*, ptr_t leaf, std::string_view key, const T& value) {
     insert_result res;
-    std::string_view leaf_skip = get_skip(leaf);
+    std::string_view leaf_skip = leaf->skip_str();
 
     if (leaf->is_skip()) {
         size_t m = match_skip_impl(leaf_skip, key);
@@ -58,7 +58,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
     atomic_ptr*, ptr_t n, std::string_view key, const T& value) {
     insert_result res;
-    std::string_view skip = get_skip(n);
+    std::string_view skip = n->skip_str();
 
     size_t m = match_skip_impl(skip, key);
     if ((m < skip.size()) & (m < key.size())) return split_interior(n, key, value, m);
@@ -70,9 +70,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
     unsigned char c = static_cast<unsigned char>(key[0]);
     key.remove_prefix(1);
 
-    ptr_t child = find_child(n, c);
+    ptr_t child = n->get_child(false, c);
     if (child && !builder_t::is_sentinel(child)) {
-        atomic_ptr* child_slot = get_child_slot(n, c);
+        atomic_ptr* child_slot = n->get_child_slot(false, c);
         auto child_res = insert_impl(child_slot, child, key, value);
         if (child_res.new_node && child_res.new_node != child) {
             if constexpr (THREADED) {
@@ -98,7 +98,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = leaf->as_skip()->skip.view();
+    std::string_view old_skip = leaf->skip_str();
 
     std::string common(old_skip.substr(0, m));
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
@@ -121,11 +121,11 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = leaf->as_skip()->skip.view();
+    std::string_view old_skip = leaf->skip_str();
 
     ptr_t interior = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        interior->template as_list<false>()->eos.set(value);
+        interior->set_eos(false, value);
     }
 
     T old_value;
@@ -143,13 +143,13 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = leaf->as_skip()->skip.view();
+    std::string_view old_skip = leaf->skip_str();
 
     ptr_t interior = builder_.make_interior_list(std::string(old_skip));
     if constexpr (FIXED_LEN == 0) {
         T old_value;
         leaf->as_skip()->value.try_read(old_value);
-        interior->template as_list<false>()->eos.set(old_value);
+        interior->set_eos(false, old_value);
     }
 
     ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
@@ -165,7 +165,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_list(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = get_skip(leaf);
+    std::string_view old_skip = leaf->skip_str();
 
     std::string common(old_skip.substr(0, m));
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
@@ -186,11 +186,11 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_list(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = get_skip(leaf);
+    std::string_view old_skip = leaf->skip_str();
 
     ptr_t interior = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        interior->template as_list<false>()->eos.set(value);
+        interior->set_eos(false, value);
     }
 
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
@@ -206,22 +206,11 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_leaf_with_skip(ptr_t leaf, std::string_view new_skip) {
     if (leaf->is_list()) {
         ptr_t n = builder_.make_leaf_list(new_skip);
-        auto* src = leaf->template as_list<true>();
-        auto* dst = n->template as_list<true>();
-        dst->chars = src->chars;
-        int cnt = src->chars.count();
-        for (int i = 0; i < cnt; ++i) {
-            dst->values[i].deep_copy_from(src->values[i]);
-        }
+        leaf->template as_list<true>()->copy_values_to(n->template as_list<true>());
         return n;
     }
     ptr_t n = builder_.make_leaf_full(new_skip);
-    auto* src = leaf->template as_full<true>();
-    auto* dst = n->template as_full<true>();
-    dst->valid = src->valid;
-    src->valid.for_each_set([src, dst](unsigned char c) {
-        dst->values[c].deep_copy_from(src->values[c]);
-    });
+    leaf->template as_full<true>()->copy_values_to(n->template as_full<true>());
     return n;
 }
 
@@ -230,16 +219,15 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
     insert_result res;
     
     if constexpr (FIXED_LEN > 0) {
-        // Fixed-length keys can't have EOS - this shouldn't happen
         return res;
     } else {
-        std::string_view leaf_skip = get_skip(leaf);
+        std::string_view leaf_skip = leaf->skip_str();
 
         if (leaf->is_list()) [[likely]] {
-            ptr_t interior = builder_.make_interior_list(leaf_skip);
-            interior->template as_list<false>()->eos.set(value);
             auto* src = leaf->template as_list<true>();
-            int cnt = src->chars.count();
+            ptr_t interior = builder_.make_interior_list(leaf_skip);
+            interior->set_eos(false, value);
+            int cnt = src->count();
             for (int i = 0; i < cnt; ++i) {
                 unsigned char c = src->chars.char_at(i);
                 T val;
@@ -249,9 +237,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
             }
             res.new_node = interior;
         } else {
-            ptr_t interior = builder_.make_interior_full(leaf_skip);
-            interior->template as_full<false>()->eos.set(value);
             auto* src = leaf->template as_full<true>();
+            ptr_t interior = builder_.make_interior_full(leaf_skip);
+            interior->set_eos(false, value);
             src->valid.for_each_set([this, src, interior](unsigned char c) {
                 T val;
                 src->values[c].try_read(val);
@@ -274,24 +262,24 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
     if (leaf->is_list()) {
         auto* ln = leaf->template as_list<true>();
-        if (ln->chars.find(c) >= 0) return res;
+        if (ln->has(c)) return res;
 
-        if (ln->chars.count() < LIST_MAX) {
-            ln->add_entry(c, value);
+        if (ln->count() < LIST_MAX) {
+            ln->add_value(c, value);
             res.in_place = true;
             res.inserted = true;
             return res;
         }
 
-        ptr_t full = builder_.make_leaf_full(ln->skip.view());
+        ptr_t full = builder_.make_leaf_full(leaf->skip_str());
         auto* fn = full->template as_full<true>();
-        for (int i = 0; i < ln->chars.count(); ++i) {
+        for (int i = 0; i < ln->count(); ++i) {
             unsigned char ch = ln->chars.char_at(i);
             T val;
             ln->values[i].try_read(val);
-            fn->add_entry(ch, val);
+            fn->add_value(ch, val);
         }
-        fn->add_entry(c, value);
+        fn->add_value(c, value);
 
         res.new_node = full;
         res.old_nodes.push_back(leaf);
@@ -300,8 +288,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
     }
 
     auto* fn = leaf->template as_full<true>();
-    if (fn->valid.template atomic_test<THREADED>(c)) return res;
-    fn->template add_entry_atomic<THREADED>(c, value);
+    if (fn->has(c)) return res;
+    fn->add_value_atomic(c, value);
     res.in_place = true;
     res.inserted = true;
     return res;
@@ -311,12 +299,12 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
     ptr_t leaf, std::string_view key, const T& value) {
     insert_result res;
-    std::string_view leaf_skip = get_skip(leaf);
+    std::string_view leaf_skip = leaf->skip_str();
     unsigned char first_c = static_cast<unsigned char>(key[0]);
 
     if (leaf->is_list()) [[likely]] {
         auto* src = leaf->template as_list<true>();
-        int leaf_count = src->chars.count();
+        int leaf_count = src->count();
         int existing_idx = src->chars.find(first_c);
         bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
         
@@ -368,9 +356,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
             dst->add_child(c, child);
         });
 
-        if (dst->valid.template atomic_test<THREADED>(first_c)) {
-            ptr_t child = dst->children[first_c].load();
-            auto child_res = insert_impl(&dst->children[first_c], child, key.substr(1), value);
+        if (dst->has(first_c)) {
+            ptr_t child = dst->get_child(first_c);
+            auto child_res = insert_impl(dst->get_child_slot(first_c), child, key.substr(1), value);
             if (child_res.new_node) {
                 dst->children[first_c].store(child_res.new_node);
             }
@@ -391,7 +379,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
     ptr_t n, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = get_skip(n);
+    std::string_view old_skip = n->skip_str();
 
     std::string common(old_skip.substr(0, m));
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
@@ -424,11 +412,11 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
     ptr_t n, std::string_view key, const T& value, size_t m) {
     insert_result res;
-    std::string_view old_skip = get_skip(n);
+    std::string_view old_skip = n->skip_str();
 
     ptr_t new_int = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        new_int->template as_list<false>()->eos.set(value);
+        new_int->set_eos(false, value);
     }
 
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
@@ -445,11 +433,10 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::set_interior_eos(ptr_t n, con
     insert_result res;
     
     if constexpr (FIXED_LEN > 0) {
-        // Fixed-length keys can't have EOS
         return res;
     } else {
-        if (has_eos(n)) return res;
-        set_eos(n, value);
+        if (n->has_eos(false)) return res;
+        n->set_eos(false, value);
         res.in_place = true;
         res.inserted = true;
         return res;
@@ -464,13 +451,13 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
-        if (ln->chars.count() < LIST_MAX) {
+        if (ln->count() < LIST_MAX) {
             ln->add_child(c, child);
             res.in_place = true;
             res.inserted = true;
             return res;
         }
-        ptr_t full = builder_.make_interior_full(ln->skip.view());
+        ptr_t full = builder_.make_interior_full(n->skip_str());
         ln->move_interior_to_full(full->template as_full<false>());
         full->template as_full<false>()->add_child(c, child);
 
@@ -481,14 +468,13 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     }
 
     if (n->is_full()) {
-        n->template as_full<false>()->template add_child_atomic<THREADED>(c, child);
+        n->template as_full<false>()->add_child_atomic(c, child);
         res.in_place = true;
         res.inserted = true;
         return res;
     }
 
-    // Fallback - shouldn't normally reach here
-    ptr_t list = builder_.make_interior_list(get_skip(n));
+    ptr_t list = builder_.make_interior_list(n->skip_str());
     list->template as_list<false>()->add_child(c, child);
 
     res.new_node = list;

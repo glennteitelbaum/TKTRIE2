@@ -20,62 +20,13 @@ void TKTRIE_CLASS::node_deleter(void* ptr) {
     builder_t::delete_node(n);
 }
 
-TKTRIE_TEMPLATE
-std::string_view TKTRIE_CLASS::get_skip(ptr_t n) noexcept {
-    return n->skip_str();
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::has_eos(ptr_t n) noexcept {
-    if constexpr (FIXED_LEN == 0) {
-        if (n->is_leaf()) return false;
-        if (n->is_list()) [[likely]] return n->template as_list<false>()->eos.has_data();
-        return n->template as_full<false>()->eos.has_data();
-    } else {
-        return false;  // Fixed-length keys can't have EOS
-    }
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::try_read_eos(ptr_t n, T& out) noexcept {
-    if constexpr (FIXED_LEN == 0) {
-        if (n->is_leaf()) return false;
-        if (n->is_list()) [[likely]] return n->template as_list<false>()->eos.try_read(out);
-        return n->template as_full<false>()->eos.try_read(out);
-    } else {
-        (void)n; (void)out;
-        return false;
-    }
-}
-
-TKTRIE_TEMPLATE
-void TKTRIE_CLASS::set_eos(ptr_t n, const T& value) {
-    if constexpr (FIXED_LEN == 0) {
-        if (n->is_list()) [[likely]] n->template as_list<false>()->eos.set(value);
-        else n->template as_full<false>()->eos.set(value);
-    } else {
-        (void)n; (void)value;
-    }
-}
-
-TKTRIE_TEMPLATE
-void TKTRIE_CLASS::clear_eos(ptr_t n) {
-    if constexpr (FIXED_LEN == 0) {
-        if (n->is_list()) [[likely]] n->template as_list<false>()->eos.clear();
-        else n->template as_full<false>()->eos.clear();
-    } else {
-        (void)n;
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Instance helpers
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
-    if (!n) return;
-    if (builder_t::is_sentinel(n)) return;
+    if (!n || builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
         n->poison();
         uint64_t epoch = ebr_slot::global_epoch().load(std::memory_order_acquire);
@@ -123,30 +74,6 @@ void TKTRIE_CLASS::ebr_try_reclaim() {
     }
 }
 
-TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) const noexcept {
-    if (n->is_list()) [[likely]] {
-        int idx = n->template as_list<false>()->chars.find(c);
-        return idx >= 0 ? n->template as_list<false>()->children[idx].load() : nullptr;
-    }
-    if (n->is_full()) {
-        return n->template as_full<false>()->children[c].load();
-    }
-    return nullptr;
-}
-
-TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigned char c) noexcept {
-    if (n->is_list()) [[likely]] {
-        int idx = n->template as_list<false>()->chars.find(c);
-        return idx >= 0 ? &n->template as_list<false>()->children[idx] : nullptr;
-    }
-    if (n->is_full() && n->template as_full<false>()->valid.template atomic_test<THREADED>(c)) {
-        return &n->template as_full<false>()->children[c];
-    }
-    return nullptr;
-}
-
 // -----------------------------------------------------------------------------
 // Read operations
 // -----------------------------------------------------------------------------
@@ -156,20 +83,20 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexce
     if (!n) return false;
     
     while (!n->is_leaf()) {
-        std::string_view skip = get_skip(n);
+        std::string_view skip = n->skip_str();
         size_t m = match_skip_impl(skip, key);
         if (m < skip.size()) return false;
         key.remove_prefix(m);
 
         if (key.empty()) {
-            return try_read_eos(n, out);
+            return n->try_read_eos(false, out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = find_child(n, c);
-        if (!n) return false;
+        n = n->get_child(false, c);
+        if (!n || builder_t::is_sentinel(n)) return false;
     }
     
     return read_from_leaf(n, key, out);
@@ -181,7 +108,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
         if (leaf->is_poisoned()) return false;
     }
     
-    std::string_view skip = get_skip(leaf);
+    std::string_view skip = leaf->skip_str();
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) return false;
     key.remove_prefix(m);
@@ -193,14 +120,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
     
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
-    
-    if (leaf->is_list()) [[likely]] {
-        int idx = leaf->template as_list<true>()->chars.find(c);
-        if (idx < 0) return false;
-        return leaf->template as_list<true>()->values[idx].try_read(out);
-    }
-    if (!leaf->template as_full<true>()->valid.template atomic_test<THREADED>(c)) return false;
-    return leaf->template as_full<true>()->values[c].try_read(out);
+    return leaf->try_read_value(true, c, out);
 }
 
 TKTRIE_TEMPLATE
@@ -210,20 +130,20 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
     if (!path.push(n)) return false;
     
     while (!n->is_leaf()) {
-        std::string_view skip = get_skip(n);
+        std::string_view skip = n->skip_str();
         size_t m = match_skip_impl(skip, key);
         if (m < skip.size()) return false;
         key.remove_prefix(m);
 
         if (key.empty()) {
-            return try_read_eos(n, out);
+            return n->try_read_eos(false, out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = find_child(n, c);
-        if (!n || n->is_poisoned()) return false;
+        n = n->get_child(false, c);
+        if (!n || n->is_poisoned() || builder_t::is_sentinel(n)) return false;
         
         if (!path.push(n)) return false;
     }

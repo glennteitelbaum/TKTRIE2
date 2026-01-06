@@ -8,10 +8,6 @@ namespace gteitelbaum {
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
 
-// -----------------------------------------------------------------------------
-// Speculative insert operations  
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     ptr_t n, std::string_view key, speculative_info& info) const noexcept {
@@ -20,7 +16,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
         return info;
     }
     
-    std::string_view skip = get_skip(n);
+    std::string_view skip = n->skip_str();
     size_t m = match_skip_impl(skip, key);
 
     if (n->is_skip()) {
@@ -64,12 +60,12 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
 
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
-        if (ln->chars.find(c) >= 0) { info.op = spec_op::EXISTS; return info; }
-        info.op = (ln->chars.count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
+        if (ln->has(c)) { info.op = spec_op::EXISTS; return info; }
+        info.op = (ln->count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
         return info;
     }
     auto* fn = n->template as_full<true>();
-    info.op = fn->valid.template atomic_test<THREADED>(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
+    info.op = fn->has(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
     return info;
 }
 
@@ -92,7 +88,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
     info.path[info.path_len++] = {n, n->version(), 0};
 
     while (!n->is_leaf()) {
-        std::string_view skip = get_skip(n);
+        std::string_view skip = n->skip_str();
         size_t m = match_skip_impl(skip, key);
 
         if ((m < skip.size()) & (m < key.size())) {
@@ -116,7 +112,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (has_eos(n)) { info.op = spec_op::EXISTS; return info; }
+            if (n->has_eos(false)) { info.op = spec_op::EXISTS; return info; }
             info.op = spec_op::IN_PLACE_INTERIOR;
             info.target = n;
             info.target_version = n->version();
@@ -125,7 +121,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = find_child(n, c);
+        ptr_t child = n->get_child(false, c);
 
         if (!child || builder_t::is_sentinel(child)) {
             info.target = n;
@@ -135,7 +131,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             info.remaining_key = std::string(key.substr(1));
 
             if (n->is_list()) {
-                info.op = (n->template as_list<false>()->chars.count() < LIST_MAX) 
+                info.op = (n->template as_list<false>()->count() < LIST_MAX) 
                     ? spec_op::IN_PLACE_INTERIOR : spec_op::ADD_CHILD_CONVERT;
             } else {
                 info.op = spec_op::IN_PLACE_INTERIOR;
@@ -163,7 +159,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     const speculative_info& info, const T& value) {
     pre_alloc alloc;
-    (void)info; (void)value;  // Simplified - just use slow path for now
+    (void)info; (void)value;
     return alloc;
 }
 
@@ -186,7 +182,7 @@ typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::find_slot_for_commit(
     if (info.path_len <= 1) return &root_;
     ptr_t parent = info.path[info.path_len - 2].node;
     unsigned char edge = info.path[info.path_len - 1].edge;
-    return get_child_slot(parent, edge);
+    return parent->get_child_slot(false, edge);
 }
 
 TKTRIE_TEMPLATE
@@ -210,7 +206,7 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_speculative(
     speculative_info& info, pre_alloc& alloc, const T& value) {
     (void)info; (void)alloc; (void)value;
-    return false;  // Always use slow path for now
+    return false;
 }
 
 TKTRIE_TEMPLATE
@@ -267,15 +263,15 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 
                 if (n->is_list()) {
                     auto* ln = n->template as_list<true>();
-                    if (ln->chars.find(c) >= 0) continue;
-                    if (ln->chars.count() >= LIST_MAX) goto slow_path;
+                    if (ln->has(c)) continue;
+                    if (ln->count() >= LIST_MAX) goto slow_path;
                     n->bump_version();
-                    ln->add_entry(c, value);
+                    ln->add_value(c, value);
                 } else {
                     auto* fn = n->template as_full<true>();
-                    if (fn->valid.template atomic_test<THREADED>(c)) continue;
+                    if (fn->has(c)) continue;
                     n->bump_version();
-                    fn->template add_entry_atomic<THREADED>(c, value);
+                    fn->add_value_atomic(c, value);
                 }
                 size_.fetch_add(1);
                 return {iterator(this, std::string(kb), value), true};
@@ -284,16 +280,16 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (spec.op == spec_op::IN_PLACE_INTERIOR) {
                 if (spec.is_eos) {
                     if constexpr (FIXED_LEN > 0) {
-                        goto slow_path;  // Fixed-length keys can't have EOS
+                        goto slow_path;
                     } else {
                         std::lock_guard<mutex_t> lock(mutex_);
                         if (!validate_path(spec)) continue;
                         
                         ptr_t n = spec.target;
-                        if (has_eos(n)) continue;
+                        if (n->has_eos(false)) continue;
                         
                         n->bump_version();
-                        set_eos(n, value);
+                        n->set_eos(false, value);
                         size_.fetch_add(1);
                         return {iterator(this, std::string(kb), value), true};
                     }
@@ -307,8 +303,8 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     
                     if (n->is_list()) {
                         auto* ln = n->template as_list<false>();
-                        if (ln->chars.find(c) >= 0) { builder_.dealloc_node(child); continue; }
-                        if (ln->chars.count() >= LIST_MAX) {
+                        if (ln->has(c)) { builder_.dealloc_node(child); continue; }
+                        if (ln->count() >= LIST_MAX) {
                             builder_.dealloc_node(child);
                             goto slow_path;
                         }
@@ -316,9 +312,9 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         ln->add_child(c, child);
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
-                        if (fn->valid.template atomic_test<THREADED>(c)) { builder_.dealloc_node(child); continue; }
+                        if (fn->has(c)) { builder_.dealloc_node(child); continue; }
                         n->bump_version();
-                        fn->template add_child_atomic<THREADED>(c, child);
+                        fn->add_child_atomic(c, child);
                     } else {
                         builder_.dealloc_node(child);
                         goto slow_path;

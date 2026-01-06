@@ -77,7 +77,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     ptr_t leaf, std::string_view key) {
     erase_result res;
-    std::string_view skip = get_skip(leaf);
+    std::string_view skip = leaf->skip_str();
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) return res;
     key.remove_prefix(m);
@@ -95,11 +95,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
 
     if (leaf->is_list()) [[likely]] {
         auto* ln = leaf->template as_list<true>();
-        int idx = ln->chars.find(c);
-        if (idx < 0) return res;
+        if (!ln->has(c)) return res;
 
-        int count = ln->chars.count();
-        if (count == 1) {
+        if (ln->count() == 1) {
             res.erased = true;
             res.deleted_subtree = true;
             res.old_nodes.push_back(leaf);
@@ -107,15 +105,15 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         }
 
         leaf->bump_version();
-        ln->shift_values_down(idx);
+        ln->remove_value(c);
         res.erased = true;
         return res;
     }
 
     auto* fn = leaf->template as_full<true>();
-    if (!fn->valid.template atomic_test<THREADED>(c)) return res;
+    if (!fn->has(c)) return res;
     leaf->bump_version();
-    fn->template remove_entry<THREADED>(c);
+    fn->remove_value(c);
     res.erased = true;
     return res;
 }
@@ -124,29 +122,29 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     ptr_t n, std::string_view key) {
     erase_result res;
-    std::string_view skip = get_skip(n);
+    std::string_view skip = n->skip_str();
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) return res;
     key.remove_prefix(m);
 
     if (key.empty()) {
         if constexpr (FIXED_LEN > 0) {
-            return res;  // Fixed-length keys can't have EOS
+            return res;
         } else {
-            if (!has_eos(n)) return res;
+            if (!n->has_eos(false)) return res;
             n->bump_version();
-            clear_eos(n);
+            n->clear_eos(false);
             res.erased = true;
             return try_collapse_interior(n);
         }
     }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
-    ptr_t child = find_child(n, c);
+    ptr_t child = n->get_child(false, c);
     
     if (!child || builder_t::is_sentinel(child)) return res;
 
-    auto child_res = erase_impl(get_child_slot(n, c), child, key.substr(1));
+    auto child_res = erase_impl(n->get_child_slot(false, c), child, key.substr(1));
     if (!child_res.erased) return res;
 
     if (child_res.deleted_subtree) {
@@ -156,9 +154,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     if (child_res.new_node) {
         n->bump_version();
         if constexpr (THREADED) {
-            get_child_slot(n, c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
+            n->get_child_slot(false, c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
         }
-        get_child_slot(n, c)->store(child_res.new_node);
+        n->get_child_slot(false, c)->store(child_res.new_node);
     }
     res.erased = true;
     res.old_nodes = std::move(child_res.old_nodes);
@@ -170,10 +168,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
     erase_result res;
     res.erased = true;
 
-    bool eos_exists = has_eos(n);
+    bool eos_exists = n->has_eos(false);
     if (eos_exists) return res;
 
-    int child_cnt = n->child_count();
+    int child_cnt = n->entry_count(false);
     if (child_cnt == 0) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
@@ -204,16 +202,15 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     res.old_nodes = std::move(child_res.old_nodes);
     res.erased = true;
 
-    bool eos_exists = has_eos(n);
-    int remaining = n->child_count();
+    bool eos_exists = n->has_eos(false);
+    int remaining = n->entry_count(false);
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
-        int idx = ln->chars.find(removed_c);
-        if (idx >= 0) remaining--;
+        if (ln->has(removed_c)) remaining--;
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
-        if (fn->valid.template atomic_test<THREADED>(removed_c)) remaining--;
+        if (fn->has(removed_c)) remaining--;
     }
 
     if ((!eos_exists) & (remaining == 0)) {
@@ -224,14 +221,16 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
-        int idx = ln->chars.find(removed_c);
-        if (idx >= 0) {
+        if (ln->has(removed_c)) {
             n->bump_version();
-            ln->shift_children_down(idx);
+            ln->remove_child(removed_c);
         }
     } else if (n->is_full()) {
-        n->bump_version();
-        n->template as_full<false>()->template remove_child<THREADED>(removed_c);
+        auto* fn = n->template as_full<false>();
+        if (fn->has(removed_c)) {
+            n->bump_version();
+            fn->remove_child(removed_c);
+        }
     }
 
     bool can_collapse = false;
@@ -240,15 +239,14 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
-        if (ln->chars.count() == 1 && !eos_exists) {
+        if (ln->count() == 1 && !eos_exists) {
             c = ln->chars.char_at(0);
             child = ln->children[0].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
     } else if (n->is_full() && !eos_exists) {
         auto* fn = n->template as_full<false>();
-        int cnt = fn->valid.count();
-        if (cnt == 1) {
+        if (fn->count() == 1) {
             c = fn->valid.first();
             child = fn->children[c].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
@@ -264,9 +262,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
     ptr_t n, unsigned char c, ptr_t child, erase_result& res) {
-    std::string new_skip(get_skip(n));
+    std::string new_skip(n->skip_str());
     new_skip.push_back(static_cast<char>(c));
-    new_skip.append(get_skip(child));
+    new_skip.append(child->skip_str());
 
     ptr_t merged;
     if (child->is_leaf()) {

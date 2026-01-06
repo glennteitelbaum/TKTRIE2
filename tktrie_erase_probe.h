@@ -8,10 +8,6 @@ namespace gteitelbaum {
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
 
-// -----------------------------------------------------------------------------
-// Erase probing operations
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     ptr_t n, std::string_view key, erase_spec_info& info) const noexcept {
@@ -20,7 +16,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
         return info;
     }
     
-    std::string_view skip = get_skip(n);
+    std::string_view skip = n->skip_str();
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
     key.remove_prefix(m);
@@ -39,15 +35,14 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
 
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
-        int idx = ln->chars.find(c);
-        if (idx < 0) { info.op = erase_op::NOT_FOUND; return info; }
-        if (ln->chars.count() <= 1) { info.op = erase_op::NOT_FOUND; return info; }
+        if (!ln->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
+        if (ln->count() <= 1) { info.op = erase_op::NOT_FOUND; return info; }
         info.op = erase_op::IN_PLACE_LEAF_LIST;
         return info;
     }
 
     auto* fn = n->template as_full<true>();
-    if (!fn->valid.template atomic_test<THREADED>(c)) { info.op = erase_op::NOT_FOUND; return info; }
+    if (!fn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
     info.op = erase_op::IN_PLACE_LEAF_FULL;
     return info;
 }
@@ -65,7 +60,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
     info.path[info.path_len++] = {n, n->version(), 0};
 
     while (!n->is_leaf()) {
-        std::string_view skip = get_skip(n);
+        std::string_view skip = n->skip_str();
         size_t m = match_skip_impl(skip, key);
         if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
         key.remove_prefix(m);
@@ -73,7 +68,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
         if (key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = find_child(n, c);
+        ptr_t child = n->get_child(false, c);
         
         if (!child || builder_t::is_sentinel(child)) { 
             info.op = erase_op::NOT_FOUND; 
@@ -100,13 +95,11 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
     if (leaf->version() != expected_version) return false;
     auto* ln = leaf->template as_list<true>();
-    int idx = ln->chars.find(c);
-    if (idx < 0) return false;
-    int count = ln->chars.count();
-    if (count <= 1) return false;
+    if (!ln->has(c)) return false;
+    if (ln->count() <= 1) return false;
 
     leaf->bump_version();
-    ln->shift_values_down(idx);
+    ln->remove_value(c);
     return true;
 }
 
@@ -114,9 +107,9 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
     if (leaf->version() != expected_version) return false;
     auto* fn = leaf->template as_full<true>();
-    if (!fn->valid.template atomic_test<THREADED>(c)) return false;
+    if (!fn->has(c)) return false;
     leaf->bump_version();
-    fn->template remove_entry<THREADED>(c);
+    fn->remove_value(c);
     return true;
 }
 
