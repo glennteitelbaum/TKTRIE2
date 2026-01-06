@@ -9,9 +9,10 @@ namespace gteitelbaum {
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
-    auto apply_erase_result = [this](erase_result& res) -> bool {
-        if (!res.erased) return false;
+std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
+    // Returns (erased, retired_any)
+    auto apply_erase_result = [this](erase_result& res) -> std::pair<bool, bool> {
+        if (!res.erased) return {false, false};
         if (res.deleted_subtree) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             root_.store(nullptr);
@@ -19,9 +20,10 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             root_.store(res.new_node);
         }
+        bool retired_any = !res.old_nodes.empty();
         for (auto* old : res.old_nodes) retire_node(old);
         size_.fetch_sub(1);
-        return true;
+        return {true, retired_any};
     };
     
     if constexpr (!THREADED) {
@@ -37,11 +39,12 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
             auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
 
+            // In-place operations don't retire nodes
             if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
-                    return true;
+                    return {true, false};  // erased=true, retired_any=false
                 }
                 continue;
             }
@@ -50,11 +53,12 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
-                    return true;
+                    return {true, false};  // erased=true, retired_any=false
                 }
                 continue;
             }
 
+            // Slow path: NOT_FOUND or structural changes needed
             {
                 std::lock_guard<mutex_t> lock(mutex_);
                 auto res = erase_impl(&root_, root_.load(), kb);

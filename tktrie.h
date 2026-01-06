@@ -79,16 +79,29 @@ public:
     // -------------------------------------------------------------------------
     // Result types
     // -------------------------------------------------------------------------
+    
+    // Small fixed-capacity list for retired nodes (avoids heap allocation)
+    // Max 4: typical is 1-2, worst case split/collapse is 3
+    struct retired_list {
+        ptr_t nodes[4];  // Not initialized - only count elements are valid
+        uint8_t count = 0;
+        
+        void push_back(ptr_t n) noexcept { nodes[count++] = n; }
+        bool empty() const noexcept { return count == 0; }
+        ptr_t* begin() noexcept { return nodes; }
+        ptr_t* end() noexcept { return nodes + count; }
+    };
+    
     struct insert_result {
         ptr_t new_node = nullptr;
-        std::vector<ptr_t> old_nodes;
+        retired_list old_nodes;
         bool inserted = false;
         bool in_place = false;
     };
 
     struct erase_result {
         ptr_t new_node = nullptr;
-        std::vector<ptr_t> old_nodes;
+        retired_list old_nodes;
         bool erased = false;
         bool deleted_subtree = false;
     };
@@ -143,18 +156,23 @@ public:
     };
 
     struct pre_alloc {
-        std::array<ptr_t, 8> nodes{};
+        ptr_t nodes[8];  // Not initialized
         int count = 0;
         ptr_t root_replacement = nullptr;
-        T* in_place_eos = nullptr;
-        void add(ptr_t n) { if (n) nodes[count++] = n; }
-        void clear() { 
-            for (int i = 0; i < count; ++i) nodes[i] = nullptr; 
-            count = 0; 
-            root_replacement = nullptr; 
-            in_place_eos = nullptr; 
-        }
+        void add(ptr_t n) { nodes[count++] = n; }
     };
+    
+    // Retry statistics (for tuning)
+    struct retry_stats {
+        std::atomic<uint64_t> speculative_attempts{0};
+        std::atomic<uint64_t> speculative_successes{0};
+        std::atomic<uint64_t> retries[8]{};  // retries[i] = count that needed i retries
+        std::atomic<uint64_t> fallbacks{0};  // exceeded max retries
+    };
+    static retry_stats& get_retry_stats() {
+        static retry_stats stats;
+        return stats;
+    }
 
     // -------------------------------------------------------------------------
     // Speculative erase types
@@ -180,6 +198,7 @@ public:
     struct retired_node {
         ptr_t ptr;
         uint64_t epoch;
+        retired_node* next;
     };
 
 private:
@@ -188,10 +207,11 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
-    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_;
+    // Lock-free retired list (MPSC - multiple producers, single consumer)
+    std::conditional_t<THREADED, std::atomic<retired_node*>, retired_node*> retired_head_{nullptr};
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for reclaim
     
-    void ebr_retire(ptr_t n, uint64_t epoch);
+    void ebr_retire_node(ptr_t n, uint64_t epoch);  // Lock-free push
     void ebr_try_reclaim();
 
     // -------------------------------------------------------------------------
@@ -217,11 +237,11 @@ private:
     // -------------------------------------------------------------------------
     // Read operations
     // -------------------------------------------------------------------------
-    bool read_impl(ptr_t n, std::string_view key, T& out) const noexcept;
-    bool read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept;
+    bool read_impl(ptr_t n, std::string_view key, T* out) const noexcept;
+    bool read_from_leaf(ptr_t leaf, std::string_view key, T* out) const noexcept;
     bool contains_impl(ptr_t n, std::string_view key) const noexcept;
     
-    bool read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept;
+    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, read_path& path) const noexcept;
     bool validate_read_path(const read_path& path) const noexcept;
 
     // -------------------------------------------------------------------------
@@ -258,7 +278,7 @@ private:
     void commit_to_slot(atomic_ptr* slot, ptr_t new_node, const speculative_info& info) noexcept;
     bool commit_speculative(speculative_info& info, pre_alloc& alloc, const T& value);
     void dealloc_speculation(pre_alloc& alloc);
-    std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value);
+    std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value, bool* retired_any);
 
     // -------------------------------------------------------------------------
     // Erase operations
@@ -267,7 +287,7 @@ private:
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     bool do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
-    bool erase_locked(std::string_view kb);
+    std::pair<bool, bool> erase_locked(std::string_view kb);  // Returns (erased, retired_any)
     erase_result erase_impl(atomic_ptr* slot, ptr_t n, std::string_view key);
     erase_result erase_from_leaf(ptr_t leaf, std::string_view key);
     erase_result erase_from_interior(ptr_t n, std::string_view key);
@@ -309,19 +329,41 @@ class tktrie_iterator {
 public:
     using trie_t = tktrie<Key, T, THREADED, Allocator>;
     using traits = tktrie_traits<Key>;
+    static constexpr size_t FIXED_LEN = traits::FIXED_LEN;
+    
+    // Store bytes: array for fixed-length, string for variable-length
+    // We already converted for lookup - just keep them
+    using key_storage_t = std::conditional_t<(FIXED_LEN > 0),
+        std::array<char, FIXED_LEN>,
+        std::string>;
 
 private:
     const trie_t* trie_ = nullptr;
-    std::string key_bytes_;
+    key_storage_t key_bytes_{};
     T value_{};
     bool valid_ = false;
 
 public:
     tktrie_iterator() = default;
-    tktrie_iterator(const trie_t* t, const std::string& kb, const T& v)
-        : trie_(t), key_bytes_(kb), value_(v), valid_(true) {}
+    
+    // Constructor from string_view - stores the already-converted bytes
+    tktrie_iterator(const trie_t* t, std::string_view kb, const T& v)
+        : trie_(t), value_(v), valid_(true) {
+        if constexpr (FIXED_LEN > 0) {
+            std::memcpy(key_bytes_.data(), kb.data(), FIXED_LEN);
+        } else {
+            key_bytes_ = std::string(kb);
+        }
+    }
 
-    Key key() const { return traits::from_bytes(key_bytes_); }
+    // Convert bytes back to Key only when requested
+    Key key() const { 
+        if constexpr (FIXED_LEN > 0) {
+            return traits::from_bytes(std::string_view(key_bytes_.data(), FIXED_LEN));
+        } else {
+            return traits::from_bytes(key_bytes_);
+        }
+    }
     const T& value() const { return value_; }
     bool valid() const { return valid_; }
     explicit operator bool() const { return valid_; }

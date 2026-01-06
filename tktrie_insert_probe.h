@@ -157,9 +157,131 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
-    const speculative_info& info, const T& value) {
+    const speculative_info& info, [[maybe_unused]] const T& value) {
     pre_alloc alloc;
-    (void)info; (void)value;
+    std::string_view key = info.remaining_key;
+    std::string_view skip = info.target_skip;
+    size_t m = info.match_pos;
+
+    // Only allocate node shells - data filling happens inside lock after validation
+    switch (info.op) {
+    case spec_op::EMPTY_TREE: {
+        alloc.root_replacement = create_leaf_for_key(key, value);
+        alloc.add(alloc.root_replacement);
+        break;
+    }
+    case spec_op::SPLIT_LEAF_SKIP: {
+        std::string common(skip.substr(0, m));
+        ptr_t interior = builder_.make_interior_list(common);
+        ptr_t old_child = builder_.make_leaf_skip(skip.substr(m + 1), T{});  // Empty, filled later
+        ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
+        alloc.root_replacement = interior;
+        alloc.add(interior);
+        alloc.add(old_child);
+        alloc.add(new_child);
+        break;
+    }
+    case spec_op::PREFIX_LEAF_SKIP: {
+        ptr_t interior = builder_.make_interior_list(std::string(key));
+        ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), T{});  // Empty, filled later
+        alloc.root_replacement = interior;
+        alloc.add(interior);
+        alloc.add(child);
+        break;
+    }
+    case spec_op::EXTEND_LEAF_SKIP: {
+        ptr_t interior = builder_.make_interior_list(std::string(skip));
+        ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
+        alloc.root_replacement = interior;
+        alloc.add(interior);
+        alloc.add(child);
+        break;
+    }
+    case spec_op::SPLIT_LEAF_LIST: {
+        std::string common(skip.substr(0, m));
+        ptr_t interior = builder_.make_interior_list(common);
+        // Allocate same type as target
+        ptr_t old_child;
+        if (info.target->is_list()) {
+            old_child = builder_.make_leaf_list(skip.substr(m + 1));
+        } else {
+            old_child = builder_.make_leaf_full(skip.substr(m + 1));
+        }
+        ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
+        alloc.root_replacement = interior;
+        alloc.add(interior);
+        alloc.add(old_child);
+        alloc.add(new_child);
+        break;
+    }
+    case spec_op::PREFIX_LEAF_LIST: {
+        ptr_t interior = builder_.make_interior_list(std::string(key));
+        // Allocate same type as target
+        ptr_t old_child;
+        if (info.target->is_list()) {
+            old_child = builder_.make_leaf_list(skip.substr(m + 1));
+        } else {
+            old_child = builder_.make_leaf_full(skip.substr(m + 1));
+        }
+        alloc.root_replacement = interior;
+        alloc.add(interior);
+        alloc.add(old_child);
+        break;
+    }
+    case spec_op::LIST_TO_FULL_LEAF: {
+        ptr_t full = builder_.make_leaf_full(std::string(skip));
+        alloc.root_replacement = full;
+        alloc.add(full);
+        break;
+    }
+    case spec_op::SPLIT_INTERIOR: {
+        std::string common(skip.substr(0, m));
+        ptr_t new_int = builder_.make_interior_list(common);
+        // Allocate same type as target for old_child
+        ptr_t old_child;
+        if (info.target->is_list()) {
+            old_child = builder_.make_interior_list(skip.substr(m + 1));
+        } else {
+            old_child = builder_.make_interior_full(skip.substr(m + 1));
+        }
+        ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
+        alloc.root_replacement = new_int;
+        alloc.add(new_int);
+        alloc.add(old_child);
+        alloc.add(new_child);
+        break;
+    }
+    case spec_op::PREFIX_INTERIOR: {
+        ptr_t new_int = builder_.make_interior_list(std::string(key));
+        // Allocate same type as target for old_child
+        ptr_t old_child;
+        if (info.target->is_list()) {
+            old_child = builder_.make_interior_list(skip.substr(m + 1));
+        } else {
+            old_child = builder_.make_interior_full(skip.substr(m + 1));
+        }
+        alloc.root_replacement = new_int;
+        alloc.add(new_int);
+        alloc.add(old_child);
+        break;
+    }
+    case spec_op::ADD_CHILD_CONVERT: {
+        ptr_t full = builder_.make_interior_full(std::string(skip));
+        ptr_t child = create_leaf_for_key(info.remaining_key, value);
+        alloc.root_replacement = full;
+        alloc.add(full);
+        alloc.add(child);
+        break;
+    }
+    // These are handled differently (in-place or complex)
+    case spec_op::EXISTS:
+    case spec_op::IN_PLACE_LEAF:
+    case spec_op::IN_PLACE_INTERIOR:
+    case spec_op::ADD_EOS_LEAF_LIST:
+    case spec_op::DEMOTE_LEAF_LIST:
+        break;
+    }
+
     return alloc;
 }
 
@@ -205,26 +327,237 @@ void TKTRIE_CLASS::commit_to_slot(atomic_ptr* slot, ptr_t new_node,
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_speculative(
     speculative_info& info, pre_alloc& alloc, const T& value) {
-    (void)info; (void)alloc; (void)value;
+    
+    std::string_view skip = info.target_skip;
+    size_t m = info.match_pos;
+
+    switch (info.op) {
+    case spec_op::EMPTY_TREE:
+        if (root_.load() != nullptr) return false;
+        root_.store(alloc.root_replacement);
+        return true;
+
+    case spec_op::SPLIT_LEAF_SKIP: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        // Fill in data: interior with two children
+        unsigned char old_c = static_cast<unsigned char>(skip[m]);
+        unsigned char new_c = static_cast<unsigned char>(info.remaining_key[m]);
+        
+        T old_value{};
+        info.target->as_skip()->value.try_read(old_value);
+        alloc.nodes[1]->as_skip()->value.set(old_value);  // old_child
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        interior->add_two_children(old_c, alloc.nodes[1], new_c, alloc.nodes[2]);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::PREFIX_LEAF_SKIP: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        unsigned char old_c = static_cast<unsigned char>(skip[m]);
+        
+        T old_value{};
+        info.target->as_skip()->value.try_read(old_value);
+        alloc.nodes[1]->as_skip()->value.set(old_value);  // child
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        if constexpr (FIXED_LEN == 0) {
+            interior->set_eos(value);
+        }
+        interior->add_child(old_c, alloc.nodes[1]);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::EXTEND_LEAF_SKIP: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        unsigned char new_c = static_cast<unsigned char>(info.remaining_key[m]);
+        
+        T old_value{};
+        info.target->as_skip()->value.try_read(old_value);
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        if constexpr (FIXED_LEN == 0) {
+            interior->set_eos(old_value);
+        }
+        interior->add_child(new_c, alloc.nodes[1]);  // new child already has value
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::SPLIT_LEAF_LIST: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        unsigned char old_c = static_cast<unsigned char>(skip[m]);
+        unsigned char new_c = static_cast<unsigned char>(info.remaining_key[m]);
+        
+        // Copy values to old_child (same type as target)
+        if (info.target->is_list()) {
+            auto* src = info.target->template as_list<true>();
+            auto* dst = alloc.nodes[1]->template as_list<true>();
+            src->copy_values_to(dst);
+        } else {
+            auto* src = info.target->template as_full<true>();
+            auto* dst = alloc.nodes[1]->template as_full<true>();
+            src->copy_values_to(dst);
+        }
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        interior->add_two_children(old_c, alloc.nodes[1], new_c, alloc.nodes[2]);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::PREFIX_LEAF_LIST: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        unsigned char old_c = static_cast<unsigned char>(skip[m]);
+        
+        // Copy values to old_child (same type as target)
+        if (info.target->is_list()) {
+            auto* src = info.target->template as_list<true>();
+            auto* dst = alloc.nodes[1]->template as_list<true>();
+            src->copy_values_to(dst);
+        } else {
+            auto* src = info.target->template as_full<true>();
+            auto* dst = alloc.nodes[1]->template as_full<true>();
+            src->copy_values_to(dst);
+        }
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        if constexpr (FIXED_LEN == 0) {
+            interior->set_eos(value);
+        }
+        interior->add_child(old_c, alloc.nodes[1]);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::LIST_TO_FULL_LEAF: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        // Copy existing values + add new
+        auto* src = info.target->template as_list<true>();
+        auto* dst = alloc.root_replacement->template as_full<true>();
+        for (int i = 0; i < src->count(); ++i) {
+            unsigned char ch = src->chars.char_at(i);
+            T val{};
+            src->values[i].try_read(val);
+            dst->add_value(ch, val);
+        }
+        dst->add_value(info.c, value);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::SPLIT_INTERIOR: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        unsigned char old_c = static_cast<unsigned char>(skip[m]);
+        unsigned char new_c = static_cast<unsigned char>(info.remaining_key[m]);
+        
+        // Move children to old_child (same type as target)
+        if (info.target->is_list()) {
+            auto* src = info.target->template as_list<false>();
+            auto* dst = alloc.nodes[1]->template as_list<false>();
+            src->move_interior_to(dst);
+        } else {
+            auto* src = info.target->template as_full<false>();
+            auto* dst = alloc.nodes[1]->template as_full<false>();
+            src->move_interior_to(dst);
+        }
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        interior->add_two_children(old_c, alloc.nodes[1], new_c, alloc.nodes[2]);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::PREFIX_INTERIOR: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        unsigned char old_c = static_cast<unsigned char>(skip[m]);
+        
+        // Move children to old_child (same type as target)
+        if (info.target->is_list()) {
+            auto* src = info.target->template as_list<false>();
+            auto* dst = alloc.nodes[1]->template as_list<false>();
+            src->move_interior_to(dst);
+        } else {
+            auto* src = info.target->template as_full<false>();
+            auto* dst = alloc.nodes[1]->template as_full<false>();
+            src->move_interior_to(dst);
+        }
+        
+        auto* interior = alloc.root_replacement->template as_list<false>();
+        if constexpr (FIXED_LEN == 0) {
+            interior->set_eos(value);
+        }
+        interior->add_child(old_c, alloc.nodes[1]);
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+    
+    case spec_op::ADD_CHILD_CONVERT: {
+        atomic_ptr* slot = get_verified_slot(info);
+        if (!slot) return false;
+        
+        // Move children from list to full + add new child
+        auto* src = info.target->template as_list<false>();
+        auto* dst = alloc.root_replacement->template as_full<false>();
+        src->move_interior_to_full(dst);
+        dst->add_child(info.c, alloc.nodes[1]);  // new child
+        
+        commit_to_slot(slot, alloc.root_replacement, info);
+        return true;
+    }
+
+    // These should not reach commit_speculative
+    case spec_op::EXISTS:
+    case spec_op::IN_PLACE_LEAF:
+    case spec_op::IN_PLACE_INTERIOR:
+    case spec_op::ADD_EOS_LEAF_LIST:
+    case spec_op::DEMOTE_LEAF_LIST:
+        return false;
+    }
     return false;
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_speculation(pre_alloc& alloc) {
-    if (alloc.in_place_eos) {
-        delete alloc.in_place_eos;
-        alloc.in_place_eos = nullptr;
-    }
     for (int i = 0; i < alloc.count; ++i) {
         ptr_t n = alloc.nodes[i];
-        if (n) builder_t::delete_node(n);
+        if (n) builder_.dealloc_node(n);
     }
-    alloc.clear();
+    alloc.count = 0;
+    alloc.root_replacement = nullptr;
 }
 
 TKTRIE_TEMPLATE
 std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
-    const Key& key, std::string_view kb, const T& value) {
+    const Key& key, std::string_view kb, const T& value, bool* retired_any) {
+    if (retired_any) *retired_any = false;
+    
     if constexpr (!THREADED) {
         std::lock_guard<mutex_t> lock(mutex_);
 
@@ -232,28 +565,36 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
         auto res = insert_impl(&root_, root, kb, value);
 
         if (!res.inserted) {
+            if (retired_any && !res.old_nodes.empty()) *retired_any = true;
             for (auto* old : res.old_nodes) retire_node(old);
             return {find(key), false};
         }
 
         if (res.new_node) root_.store(res.new_node);
+        if (retired_any && !res.old_nodes.empty()) *retired_any = true;
         for (auto* old : res.old_nodes) retire_node(old);
         size_.fetch_add(1);
 
-        return {iterator(this, std::string(kb), value), true};
+        return {iterator(this, kb, value), true};
     } else {
         maybe_reclaim();
         
         auto& slot = get_ebr_slot();
+        constexpr int MAX_RETRIES = 7;
         
-        while (true) {
+        for (int retry = 0; retry <= MAX_RETRIES; ++retry) {
             auto guard = slot.get_guard();
             speculative_info spec = probe_speculative(root_.load(), kb);
+            
+            get_retry_stats().speculative_attempts.fetch_add(1, std::memory_order_relaxed);
 
             if (spec.op == spec_op::EXISTS) {
-                return {iterator(this, std::string(kb), value), false};
+                get_retry_stats().speculative_successes.fetch_add(1, std::memory_order_relaxed);
+                if (retry < 8) get_retry_stats().retries[retry].fetch_add(1, std::memory_order_relaxed);
+                return {iterator(this, kb, value), false};
             }
 
+            // In-place leaf - no allocation, brief lock
             if (spec.op == spec_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_path(spec)) continue;
@@ -264,7 +605,10 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 if (n->is_list()) {
                     auto* ln = n->template as_list<true>();
                     if (ln->has(c)) continue;
-                    if (ln->count() >= LIST_MAX) goto slow_path;
+                    if (ln->count() >= LIST_MAX) {
+                        // Need LIST_TO_FULL - re-probe will get it
+                        continue;
+                    }
                     n->bump_version();
                     ln->add_value(c, value);
                 } else {
@@ -274,13 +618,17 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     fn->add_value_atomic(c, value);
                 }
                 size_.fetch_add(1);
-                return {iterator(this, std::string(kb), value), true};
+                get_retry_stats().speculative_successes.fetch_add(1, std::memory_order_relaxed);
+                if (retry < 8) get_retry_stats().retries[retry].fetch_add(1, std::memory_order_relaxed);
+                return {iterator(this, kb, value), true};
             }
 
+            // In-place interior - brief lock
             if (spec.op == spec_op::IN_PLACE_INTERIOR) {
                 if (spec.is_eos) {
                     if constexpr (FIXED_LEN > 0) {
-                        goto slow_path;
+                        // Can't happen for fixed-length keys
+                        continue;
                     } else {
                         std::lock_guard<mutex_t> lock(mutex_);
                         if (!validate_path(spec)) continue;
@@ -291,9 +639,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         n->bump_version();
                         n->set_eos(false, value);
                         size_.fetch_add(1);
-                        return {iterator(this, std::string(kb), value), true};
+                        get_retry_stats().speculative_successes.fetch_add(1, std::memory_order_relaxed);
+                        if (retry < 8) get_retry_stats().retries[retry].fetch_add(1, std::memory_order_relaxed);
+                        return {iterator(this, kb, value), true};
                     }
                 } else {
+                    // Adding child to interior - allocate child outside lock
                     ptr_t child = create_leaf_for_key(spec.remaining_key, value);
                     std::lock_guard<mutex_t> lock(mutex_);
                     if (!validate_path(spec)) { builder_.dealloc_node(child); continue; }
@@ -306,7 +657,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         if (ln->has(c)) { builder_.dealloc_node(child); continue; }
                         if (ln->count() >= LIST_MAX) {
                             builder_.dealloc_node(child);
-                            goto slow_path;
+                            continue;  // Re-probe will get ADD_CHILD_CONVERT
                         }
                         n->bump_version();
                         ln->add_child(c, child);
@@ -317,34 +668,71 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         fn->add_child_atomic(c, child);
                     } else {
                         builder_.dealloc_node(child);
-                        goto slow_path;
+                        continue;
                     }
                     size_.fetch_add(1);
-                    return {iterator(this, std::string(kb), value), true};
+                    get_retry_stats().speculative_successes.fetch_add(1, std::memory_order_relaxed);
+                    if (retry < 8) get_retry_stats().retries[retry].fetch_add(1, std::memory_order_relaxed);
+                    return {iterator(this, kb, value), true};
                 }
             }
 
-            slow_path:
-            {
-                std::lock_guard<mutex_t> lock(mutex_);
-                if (!validate_path(spec)) continue;
-                
-                ptr_t root = root_.load();
-                auto res = insert_impl(&root_, root, kb, value);
-                
-                if (!res.inserted) {
-                    for (auto* old : res.old_nodes) retire_node(old);
-                    return {iterator(this, std::string(kb), value), false};
-                }
-                
-                if (res.new_node) {
-                    root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
-                    root_.store(res.new_node);
-                }
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_add(1);
-                return {iterator(this, std::string(kb), value), true};
+            // Complex ops that need full speculative path (ADD_EOS_LEAF_LIST, DEMOTE_LEAF_LIST)
+            // Fall through to allocation-based speculative or fallback
+            if (spec.op == spec_op::ADD_EOS_LEAF_LIST || spec.op == spec_op::DEMOTE_LEAF_LIST) {
+                // These are complex - use fallback
+                if (retry == MAX_RETRIES) break;
+                continue;
             }
+
+            // Speculative path: allocate outside lock, then brief lock for commit
+            pre_alloc alloc = allocate_speculative(spec, value);
+            
+            if (alloc.root_replacement) {
+                std::lock_guard<mutex_t> lock(mutex_);
+                if (!validate_path(spec)) {
+                    dealloc_speculation(alloc);
+                    continue;
+                }
+                
+                if (commit_speculative(spec, alloc, value)) {
+                    // Retire old node
+                    if (spec.target) {
+                        retire_node(spec.target);
+                        if (retired_any) *retired_any = true;
+                    }
+                    size_.fetch_add(1);
+                    get_retry_stats().speculative_successes.fetch_add(1, std::memory_order_relaxed);
+                    if (retry < 8) get_retry_stats().retries[retry].fetch_add(1, std::memory_order_relaxed);
+                    return {iterator(this, kb, value), true};
+                }
+                dealloc_speculation(alloc);
+                continue;
+            }
+        }
+        
+        // Fallback after MAX_RETRIES
+        get_retry_stats().fallbacks.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<mutex_t> lock(mutex_);
+            
+            ptr_t root = root_.load();
+            auto res = insert_impl(&root_, root, kb, value);
+            
+            if (!res.inserted) {
+                if (retired_any && !res.old_nodes.empty()) *retired_any = true;
+                for (auto* old : res.old_nodes) retire_node(old);
+                return {iterator(this, kb, value), false};
+            }
+            
+            if (res.new_node) {
+                root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
+                root_.store(res.new_node);
+            }
+            if (retired_any && !res.old_nodes.empty()) *retired_any = true;
+            for (auto* old : res.old_nodes) retire_node(old);
+            size_.fetch_add(1);
+            return {iterator(this, kb, value), true};
         }
     }
 }
