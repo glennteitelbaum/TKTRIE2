@@ -15,12 +15,6 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     ptr_t n, std::string_view key, erase_spec_info& info) const noexcept {
-    // Check if leaf is poisoned
-    if (n->is_poisoned()) {
-        info.op = erase_op::NOT_FOUND;  // Signal retry needed
-        return info;
-    }
-    
     std::string_view skip = get_skip(n);
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) { info.op = erase_op::NOT_FOUND; return info; }
@@ -59,8 +53,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
     ptr_t n, std::string_view key) const noexcept {
     erase_spec_info info;
 
-    // Check for null or poisoned (includes sentinel)
-    if (!n || n->is_poisoned()) {
+    if (!n) {
         info.op = erase_op::NOT_FOUND;
         return info;
     }
@@ -83,12 +76,6 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
 
         key.remove_prefix(1);
         n = child;
-        
-        // Check if child is poisoned - signal retry
-        if (n->is_poisoned()) {
-            info.op = erase_op::NOT_FOUND;
-            return info;
-        }
         
         if (info.path_len < erase_spec_info::MAX_PATH) {
             info.path[info.path_len++] = {n, n->version(), c};

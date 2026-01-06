@@ -17,7 +17,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_impl(
     atomic_ptr* slot, ptr_t n, std::string_view key, const T& value) {
     insert_result res;
 
-    if (!n || n->is_poisoned()) {
+    if (!n) {
         res.new_node = create_leaf_for_key(key, value);
         res.inserted = true;
         return res;
@@ -76,10 +76,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
         atomic_ptr* child_slot = get_child_slot(n, c);
         auto child_res = insert_impl(child_slot, child, key, value);
         if (child_res.new_node && child_res.new_node != child) {
-            // Set sentinel to block readers, then store new value
-            if constexpr (THREADED) {
-                child_slot->store(get_retry_sentinel<T, THREADED, Allocator>());
-            }
+            n->bump_version();
             child_slot->store(child_res.new_node);
         }
         res.inserted = child_res.inserted;
