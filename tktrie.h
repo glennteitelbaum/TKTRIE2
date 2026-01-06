@@ -175,8 +175,7 @@ public:
 private:
     atomic_ptr root_;
     atomic_counter<THREADED> size_;
-    atomic_counter<THREADED> trie_version_;  // Bumped on any root change
-    mutable mutex_t mutex_;
+    mutable mutex_t mutex_;  // mutable so const readers can lock for sentinel wait
     builder_t builder_;
     
     // Per-trie EBR state (only used when THREADED=true)

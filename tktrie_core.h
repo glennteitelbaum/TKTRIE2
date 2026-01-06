@@ -15,7 +15,10 @@ namespace gteitelbaum {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
     if (!ptr) return;
-    builder_t::delete_node(static_cast<ptr_t>(ptr));
+    auto* n = static_cast<ptr_t>(ptr);
+    // Never delete the static sentinel node
+    if (n == get_retry_sentinel<T, THREADED, Allocator>()) return;
+    builder_t::delete_node(n);
 }
 
 TKTRIE_TEMPLATE
@@ -46,7 +49,10 @@ void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n) return;
+    // Never retire the static sentinel node
+    if (n == get_retry_sentinel<T, THREADED, Allocator>()) return;
     if constexpr (THREADED) {
+        n->poison();  // Mark as dead BEFORE adding to retire list
         uint64_t epoch = ebr_slot::global_epoch().load(std::memory_order_acquire);
         ebr_retire(n, epoch);
         ebr_global::instance().advance_epoch();
@@ -150,6 +156,10 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexce
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept {
+    if constexpr (THREADED) {
+        if (leaf->is_poisoned()) return false;
+    }
+    
     std::string_view skip = get_skip(leaf);
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) return false;
@@ -179,12 +189,12 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
 
 // -----------------------------------------------------------------------------
 // Optimistic read operations (lock-free fast path for THREADED mode)
-// Uses trie_version + node version validation for safe lock-free reads
+// Uses poison detection + version validation for safe lock-free reads
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept {
-    if (!n) return false;
+    if (!n || n->is_poisoned()) return false;
     
     // Record root in path
     if (!path.push(n)) return false;
@@ -206,18 +216,22 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         key.remove_prefix(1);
 
         n = find_child(n, c);
-        if (!n) return false;
+        if (!n || n->is_poisoned()) return false;
         
         if (!path.push(n)) return false;
     }
     
-    // n is now a leaf
+    // n is now a leaf - read_from_leaf handles poison check via if constexpr (THREADED)
     return read_from_leaf(n, key, out);
 }
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     for (int i = 0; i < path.len; ++i) {
+        // Check for poisoned nodes - they will never have matching versions
+        if (path.nodes[i]->is_poisoned()) {
+            return false;
+        }
         if (path.nodes[i]->version() != path.versions[i]) {
             return false;
         }
@@ -278,10 +292,12 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
     root_.store(nullptr);
-    if (r) builder_.dealloc_node(r);
+    // Never dealloc the static sentinel node
+    if (r && r != get_retry_sentinel<T, THREADED, Allocator>()) {
+        builder_.dealloc_node(r);
+    }
     size_.store(0);
     if constexpr (THREADED) {
-        trie_version_.fetch_add(1);
         // Force reclaim all retired nodes for this trie
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         for (auto& rn : retired_) {
@@ -303,28 +319,22 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             T dummy;
             read_path path;
             
-            // Capture trie version before reading root
-            uint64_t tv = trie_version_.load();
             ptr_t root = root_.load();
+            if (!root) return false;
             
-            if (!root) {
-                TKTRIE_STATS_RECORD_SUCCESS(attempts);
-                return false;
-            }
+            // Sentinel and poisoned nodes both have FLAG_POISON
+            // is_poisoned() catches both cases
+            if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, dummy, path);
             
-            // Validate trie version unchanged (catches root replacement)
-            // and all node versions unchanged (catches in-place modifications)
-            if (trie_version_.load() == tv && validate_read_path(path)) {
-                TKTRIE_STATS_RECORD_SUCCESS(attempts);
+            // Validate all versions unchanged (also catches poison)
+            if (validate_read_path(path)) {
                 return found;
             }
-            // Version mismatch - concurrent modification, retry
-            TKTRIE_STATS_RECORD_VERSION_MISMATCH();
+            // Version mismatch or poison - concurrent modification, retry
         }
         // Too many retries - fall back to locked read (shouldn't happen normally)
-        TKTRIE_STATS_RECORD_SUCCESS(10);  // Record as fallback
         return contains_impl(root_.load(), kb);
     } else {
         return contains_impl(root_.load(), kb);
@@ -355,31 +365,24 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
             
-            // Capture trie version before reading root
-            uint64_t tv = trie_version_.load();
             ptr_t root = root_.load();
+            if (!root) return end();
             
-            if (!root) {
-                TKTRIE_STATS_RECORD_SUCCESS(attempts);
-                return end();
-            }
+            // Sentinel and poisoned nodes both have FLAG_POISON
+            if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic(root, kb, value, path);
             
-            // Validate trie version unchanged (catches root replacement)
-            // and all node versions unchanged (catches in-place modifications)
-            if (trie_version_.load() == tv && validate_read_path(path)) {
-                TKTRIE_STATS_RECORD_SUCCESS(attempts);
+            // Validate all versions unchanged (also catches poison)
+            if (validate_read_path(path)) {
                 if (found) {
                     return iterator(this, std::string(kb), value);
                 }
                 return end();
             }
-            // Version mismatch - concurrent modification, retry
-            TKTRIE_STATS_RECORD_VERSION_MISMATCH();
+            // Version mismatch or poison - concurrent modification, retry
         }
         // Too many retries - fall back to locked read
-        TKTRIE_STATS_RECORD_SUCCESS(10);  // Record as fallback
         if (read_impl(root_.load(), kb, value)) {
             return iterator(this, std::string(kb), value);
         }

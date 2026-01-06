@@ -20,109 +20,6 @@
 #endif
 
 // =============================================================================
-// READER RETRY INSTRUMENTATION
-// Define TKTRIE_STATS to enable retry histogram tracking
-// =============================================================================
-
-// #define TKTRIE_STATS  // Uncomment to enable instrumentation
-
-#ifdef TKTRIE_STATS
-#include <iostream>
-#include <iomanip>
-
-namespace gteitelbaum {
-
-struct tktrie_stats {
-    static constexpr int MAX_ATTEMPTS = 10;
-    
-    // Histogram: attempts[i] = count of reads that succeeded on attempt i+1
-    // attempts[MAX_ATTEMPTS] = count that fell back to locked read
-    std::atomic<uint64_t> attempts[MAX_ATTEMPTS + 1] = {};
-    
-    // Retry reason
-    std::atomic<uint64_t> retry_version_mismatch = {0};
-    
-    void record_success(int attempt_number) noexcept {
-        if (attempt_number >= 0 && attempt_number <= MAX_ATTEMPTS) {
-            attempts[attempt_number].fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    
-    void record_version_mismatch() noexcept {
-        retry_version_mismatch.fetch_add(1, std::memory_order_relaxed);
-    }
-    
-    void reset() noexcept {
-        for (int i = 0; i <= MAX_ATTEMPTS; ++i) {
-            attempts[i].store(0, std::memory_order_relaxed);
-        }
-        retry_version_mismatch.store(0, std::memory_order_relaxed);
-    }
-    
-    void report(std::ostream& os = std::cout) const {
-        uint64_t total = 0;
-        uint64_t total_retries = 0;
-        for (int i = 0; i <= MAX_ATTEMPTS; ++i) {
-            uint64_t count = attempts[i].load(std::memory_order_relaxed);
-            total += count;
-            if (i > 0) total_retries += count * i;
-            if (i == MAX_ATTEMPTS) total_retries += count;  // fallback counts as extra
-        }
-        
-        os << "\n=== TKTRIE READER RETRY HISTOGRAM ===\n";
-        os << "Total reads: " << total << "\n";
-        os << "Total retries: " << total_retries << "\n";
-        if (total > 0) {
-            os << "Avg retries/read: " << std::fixed << std::setprecision(4) 
-               << (double)total_retries / total << "\n";
-        }
-        os << "\nAttempt histogram:\n";
-        for (int i = 0; i <= MAX_ATTEMPTS; ++i) {
-            uint64_t count = attempts[i].load(std::memory_order_relaxed);
-            if (count > 0 || i == 0) {
-                if (i < MAX_ATTEMPTS) {
-                    os << "  Attempt " << std::setw(2) << (i + 1) << ": ";
-                } else {
-                    os << "  Fallback  : ";
-                }
-                os << std::setw(12) << count;
-                if (total > 0) {
-                    os << " (" << std::fixed << std::setprecision(2) 
-                       << (100.0 * count / total) << "%)";
-                }
-                os << "\n";
-            }
-        }
-        
-        os << "\nRetry reason:\n";
-        os << "  Version mismatch:  " << std::setw(12) 
-           << retry_version_mismatch.load(std::memory_order_relaxed) << "\n";
-        os << "=====================================\n";
-    }
-    
-    static tktrie_stats& instance() {
-        static tktrie_stats s;
-        return s;
-    }
-};
-
-}  // namespace gteitelbaum
-
-#define TKTRIE_STATS_RECORD_SUCCESS(n) gteitelbaum::tktrie_stats::instance().record_success(n)
-#define TKTRIE_STATS_RECORD_VERSION_MISMATCH() gteitelbaum::tktrie_stats::instance().record_version_mismatch()
-#define TKTRIE_STATS_RESET() gteitelbaum::tktrie_stats::instance().reset()
-#define TKTRIE_STATS_REPORT() gteitelbaum::tktrie_stats::instance().report()
-
-#else  // !TKTRIE_STATS
-
-#define TKTRIE_STATS_RECORD_SUCCESS(n) ((void)0)
-#define TKTRIE_STATS_RECORD_VERSION_MISMATCH() ((void)0)
-#define TKTRIE_STATS_RESET() ((void)0)
-#define TKTRIE_STATS_REPORT() ((void)0)
-
-#endif  // TKTRIE_STATS
-
-// =============================================================================
 // PLACEMENT NEW/DESTROY UTILITIES
 // C++20 compatible, uses std::construct_at/destroy_at if available (C++20+)
 // =============================================================================
@@ -202,17 +99,25 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][SKIP:1][LIST:1][VERSION:61]
+// Header: [LEAF:1][SKIP:1][LIST:1][POISON:1][VERSION:60]
 // SKIP: FLAG_SKIP set (always leaf)
 // LIST: FLAG_LIST set
 // FULL: neither SKIP nor LIST set
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
 static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
 static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior
-static constexpr uint64_t VERSION_MASK = (1ULL << 61) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST;
+static constexpr uint64_t FLAG_POISON = 1ULL << 60;
+static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POISON;
 
 static constexpr int LIST_MAX = 7;
+
+// Interior FULL node header with poison flag set - used for sentinel
+static constexpr uint64_t SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
+
+inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
+    return (h & FLAG_POISON) != 0;
+}
 
 inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, uint64_t version = 0) noexcept {
     return (is_leaf ? FLAG_LEAF : 0) | type_flag | (version & VERSION_MASK);
@@ -220,7 +125,7 @@ inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, uint64_t
 inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
 
-// Bump version preserving flags
+// Bump version preserving flags (including poison)
 inline constexpr uint64_t bump_version(uint64_t h) noexcept {
     uint64_t flags = h & FLAGS_MASK;
     uint64_t ver = (h & VERSION_MASK) + 1;
