@@ -30,16 +30,18 @@ template <typename T> requires std::is_integral_v<T>
 struct tktrie_traits<T> {
     static constexpr size_t FIXED_LEN = sizeof(T);  // Fixed length
     using unsigned_t = std::make_unsigned_t<T>;
-    static std::string to_bytes(T k) {
+    using bytes_t = std::array<char, sizeof(T)>;
+    
+    static bytes_t to_bytes(T k) noexcept {
         unsigned_t sortable;
         if constexpr (std::is_signed_v<T>)
             sortable = static_cast<unsigned_t>(k) ^ (unsigned_t{1} << (sizeof(T) * 8 - 1));
         else
             sortable = k;
         unsigned_t be = to_big_endian(sortable);
-        char buf[sizeof(T)];
-        std::memcpy(buf, &be, sizeof(T));
-        return std::string(buf, sizeof(T));
+        bytes_t result;
+        std::memcpy(result.data(), &be, sizeof(T));
+        return result;
     }
     static T from_bytes(std::string_view b) {
         unsigned_t be;

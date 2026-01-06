@@ -166,55 +166,40 @@ template <typename T>
 constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
 // =============================================================================
-// SMALL_LIST - packed list of up to 7 chars
+// SMALL_LIST - array of up to 7 chars with direct indexing
 // =============================================================================
 
 class small_list {
-    atomic_storage<uint64_t, true> data_;  // Always atomic for thread-safety
+    std::array<unsigned char, 7> chars_{};
+    uint8_t count_ = 0;
 public:
     constexpr small_list() noexcept = default;
     
-    small_list(const small_list& o) noexcept : data_(o.data_.load()) {}
-    small_list& operator=(const small_list& o) noexcept {
-        data_.store(o.data_.load());
-        return *this;
-    }
+    small_list(const small_list& o) noexcept = default;
+    small_list& operator=(const small_list& o) noexcept = default;
     
-    int count() const noexcept { 
-        return static_cast<int>((data_.load() >> 56) & 0xFF); 
-    }
-    unsigned char char_at(int i) const noexcept {
-        return static_cast<unsigned char>((data_.load() >> (i * 8)) & 0xFF);
-    }
+    int count() const noexcept { return count_; }
+    
+    unsigned char char_at(int i) const noexcept { return chars_[i]; }
     
     int find(unsigned char c) const noexcept {
-        uint64_t d = data_.load();
-        int n = static_cast<int>((d >> 56) & 0xFF);
-        for (int i = 0; i < n; ++i) {
-            if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
+        for (int i = 0; i < count_; ++i) {
+            if (chars_[i] == c) return i;
         }
         return -1;
     }
     
     int add(unsigned char c) noexcept {
-        uint64_t d = data_.load();
-        int n = static_cast<int>((d >> 56) & 0xFF);
-        d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
-            (static_cast<uint64_t>(n + 1) << 56);
-        data_.store(d);
-        return n;
+        int idx = count_;
+        chars_[count_++] = c;
+        return idx;
     }
+    
     void remove_at(int idx) noexcept {
-        uint64_t d = data_.load();
-        int n = static_cast<int>((d >> 56) & 0xFF);
-        for (int i = idx; i < n - 1; ++i) {
-            unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
-            d &= ~(0xFFULL << (i * 8));
-            d |= (static_cast<uint64_t>(next) << (i * 8));
+        for (int i = idx; i < count_ - 1; ++i) {
+            chars_[i] = chars_[i + 1];
         }
-        d = (d & ~(0xFFULL << ((n-1) * 8))) & ~(0xFFULL << 56);
-        d |= (static_cast<uint64_t>(n - 1) << 56);
-        data_.store(d);
+        --count_;
     }
 };
 

@@ -236,6 +236,7 @@ void TKTRIE_CLASS::clear() {
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
+    std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
         auto& slot = get_ebr_slot();
         auto guard = slot.get_guard();
@@ -248,30 +249,33 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             if (!root) return false;
             if (root->is_poisoned()) continue;
             
-            bool found = read_impl_optimistic(root, kb, dummy, path);
+            bool found = read_impl_optimistic(root, kbv, dummy, path);
             if (validate_read_path(path)) return found;
         }
-        return contains_impl(root_.load(), kb);
+        return contains_impl(root_.load(), kbv);
     } else {
-        return contains_impl(root_.load(), kb);
+        return contains_impl(root_.load(), kbv);
     }
 }
 
 TKTRIE_TEMPLATE
 std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert(const std::pair<const Key, T>& kv) {
     auto kb = traits::to_bytes(kv.first);
-    return insert_locked(kv.first, kb, kv.second);
+    std::string_view kbv(kb.data(), kb.size());
+    return insert_locked(kv.first, kbv, kv.second);
 }
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::erase(const Key& key) {
     auto kb = traits::to_bytes(key);
-    return erase_locked(kb);
+    std::string_view kbv(kb.data(), kb.size());
+    return erase_locked(kbv);
 }
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     auto kb = traits::to_bytes(key);
+    std::string_view kbv(kb.data(), kb.size());
     T value;
     if constexpr (THREADED) {
         auto& slot = get_ebr_slot();
@@ -284,18 +288,18 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             if (!root) return end();
             if (root->is_poisoned()) continue;
             
-            bool found = read_impl_optimistic(root, kb, value, path);
+            bool found = read_impl_optimistic(root, kbv, value, path);
             if (validate_read_path(path)) {
-                if (found) return iterator(this, std::string(kb), value);
+                if (found) return iterator(this, std::string(kbv), value);
                 return end();
             }
         }
-        if (read_impl(root_.load(), kb, value)) {
-            return iterator(this, std::string(kb), value);
+        if (read_impl(root_.load(), kbv, value)) {
+            return iterator(this, std::string(kbv), value);
         }
     } else {
-        if (read_impl(root_.load(), kb, value)) {
-            return iterator(this, std::string(kb), value);
+        if (read_impl(root_.load(), kbv, value)) {
+            return iterator(this, std::string(kbv), value);
         }
     }
     return end();
