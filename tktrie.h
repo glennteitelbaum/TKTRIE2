@@ -99,8 +99,8 @@ public:
     // -------------------------------------------------------------------------
     struct read_path {
         static constexpr int MAX_DEPTH = 64;
-        ptr_t nodes[MAX_DEPTH];
-        uint64_t versions[MAX_DEPTH];
+        std::array<ptr_t, MAX_DEPTH> nodes{};
+        std::array<uint64_t, MAX_DEPTH> versions{};
         int len = 0;
         
         void clear() noexcept { len = 0; }
@@ -125,7 +125,7 @@ public:
 
     struct speculative_info {
         static constexpr int MAX_PATH = 64;
-        path_entry path[MAX_PATH];
+        std::array<path_entry, MAX_PATH> path{};
         int path_len = 0;
         spec_op op = spec_op::EXISTS;
         ptr_t target = nullptr;
@@ -138,12 +138,17 @@ public:
     };
 
     struct pre_alloc {
-        ptr_t nodes[8] = {};
+        std::array<ptr_t, 8> nodes{};
         int count = 0;
         ptr_t root_replacement = nullptr;
         T* in_place_eos = nullptr;
         void add(ptr_t n) { if (n) nodes[count++] = n; }
-        void clear() { for (int i = 0; i < count; ++i) nodes[i] = nullptr; count = 0; root_replacement = nullptr; in_place_eos = nullptr; }
+        void clear() { 
+            for (int i = 0; i < count; ++i) nodes[i] = nullptr; 
+            count = 0; 
+            root_replacement = nullptr; 
+            in_place_eos = nullptr; 
+        }
     };
 
     // -------------------------------------------------------------------------
@@ -156,7 +161,7 @@ public:
 
     struct erase_spec_info {
         static constexpr int MAX_PATH = 64;
-        path_entry path[MAX_PATH];
+        std::array<path_entry, MAX_PATH> path{};
         int path_len = 0;
         erase_op op = erase_op::NOT_FOUND;
         ptr_t target = nullptr;
@@ -268,7 +273,7 @@ public:
     // -------------------------------------------------------------------------
     // Constructors / Destructor
     // -------------------------------------------------------------------------
-    tktrie() = default;
+    tktrie();
     ~tktrie();
     tktrie(const tktrie& other);
     tktrie& operator=(const tktrie& other);

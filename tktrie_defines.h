@@ -52,8 +52,8 @@ template <typename T, bool THREADED>
 class atomic_storage {
     std::conditional_t<THREADED, std::atomic<T>, T> value_;
 public:
-    atomic_storage() noexcept : value_{} {}
-    explicit atomic_storage(T v) noexcept : value_(v) {}
+    constexpr atomic_storage() noexcept : value_{} {}
+    constexpr explicit atomic_storage(T v) noexcept : value_(v) {}
     
     T load() const noexcept {
         if constexpr (THREADED) return value_.load(std::memory_order_acquire);
@@ -112,8 +112,11 @@ static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_
 
 static constexpr int LIST_MAX = 7;
 
-// Interior FULL node header with poison flag set - used for sentinel
-static constexpr uint64_t SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
+// Interior FULL node header with poison flag set - used for retry sentinel
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
+
+// Interior LIST node header - used for not_found sentinel
+static constexpr uint64_t NOT_FOUND_SENTINEL_HEADER = FLAG_LIST;  // LIST, not leaf, no poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
@@ -169,7 +172,7 @@ constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 class small_list {
     atomic_storage<uint64_t, true> data_;  // Always atomic for thread-safety
 public:
-    small_list() noexcept = default;
+    constexpr small_list() noexcept = default;
     
     small_list(const small_list& o) noexcept : data_(o.data_.load()) {}
     small_list& operator=(const small_list& o) noexcept {
@@ -222,7 +225,7 @@ public:
 class bitmap256 {
     uint64_t bits_[4] = {};
 public:
-    bitmap256() noexcept = default;
+    constexpr bitmap256() noexcept = default;
     bool test(unsigned char c) const noexcept { return (bits_[c >> 6] & (1ULL << (c & 63))) != 0; }
     void set(unsigned char c) noexcept { bits_[c >> 6] |= (1ULL << (c & 63)); }
     void clear(unsigned char c) noexcept { bits_[c >> 6] &= ~(1ULL << (c & 63)); }

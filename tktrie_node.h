@@ -18,8 +18,16 @@ template <typename T, bool THREADED, typename Allocator> struct list_node;
 template <typename T, bool THREADED, typename Allocator> struct full_node;
 template <typename T, bool THREADED, typename Allocator> class node_builder;
 
+// Forward declare sentinel getters
+template <typename T, bool THREADED, typename Allocator>
+node_base<T, THREADED, Allocator>* get_not_found_sentinel() noexcept;
+
+template <typename T, bool THREADED, typename Allocator>
+node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept;
+
 // =============================================================================
 // ATOMIC_NODE_PTR - uses atomic_storage internally
+// Defaults to NOT_FOUND sentinel - compiler optimizes array initialization
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator>
@@ -27,11 +35,18 @@ struct atomic_node_ptr {
     using base_t = node_base<T, THREADED, Allocator>;
     using ptr_t = base_t*;
     
-    atomic_storage<ptr_t, THREADED> ptr_;
+    std::atomic<ptr_t> ptr_;
     
-    ptr_t load() const noexcept { return ptr_.load(); }
-    void store(ptr_t p) noexcept { ptr_.store(p); }
-    ptr_t exchange(ptr_t p) noexcept { return ptr_.exchange(p); }
+    // Default constructor initializes to NOT_FOUND sentinel
+    // Compiler optimizes std::array<atomic_node_ptr, N> initialization
+    atomic_node_ptr() noexcept : ptr_(get_not_found_sentinel<T, THREADED, Allocator>()) {}
+    
+    // Explicit constructor for specific pointer
+    explicit atomic_node_ptr(ptr_t p) noexcept : ptr_(p) {}
+    
+    ptr_t load() const noexcept { return ptr_.load(std::memory_order_acquire); }
+    void store(ptr_t p) noexcept { ptr_.store(p, std::memory_order_release); }
+    ptr_t exchange(ptr_t p) noexcept { return ptr_.exchange(p, std::memory_order_acq_rel); }
 };
 
 // =============================================================================
@@ -45,6 +60,10 @@ struct node_base {
     using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator>;
     
     atomic_storage<uint64_t, THREADED> header_;
+    
+    // Constructors
+    constexpr node_base() noexcept = default;
+    constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     
     // Header access - simplified using atomic_storage
     uint64_t header() const noexcept { return header_.load(); }
@@ -278,16 +297,18 @@ struct full_node : node_base<T, THREADED, Allocator> {
     }
     
     // Helper to add a child (for interior nodes)
+    // IMPORTANT: Store child BEFORE setting bitmap (memory ordering)
     void add_child(unsigned char c, typename base_t::ptr_t child) {
-        valid.set(c);
         children[c].store(child);
+        valid.set(c);
     }
     
     // Helper to add a child atomically (for threaded interior nodes)
+    // IMPORTANT: Store child BEFORE setting bitmap (memory ordering)
     template <bool THR>
     void add_child_atomic(unsigned char c, typename base_t::ptr_t child) {
-        valid.template atomic_set<THR>(c);
         children[c].store(child);
+        valid.template atomic_set<THR>(c);
     }
     
     // Helper to remove a child
@@ -299,15 +320,15 @@ struct full_node : node_base<T, THREADED, Allocator> {
     
     // Helper to add a leaf value entry
     void add_leaf_entry(unsigned char c, const T& value) {
-        valid.set(c);
         construct_leaf_value(c, value);
+        valid.set(c);
     }
     
     // Helper to add a leaf value entry atomically
     template <bool THR>
     void add_leaf_entry_atomic(unsigned char c, const T& value) {
-        valid.template atomic_set<THR>(c);
         construct_leaf_value(c, value);
+        valid.template atomic_set<THR>(c);
     }
     
     // Helper to remove a leaf entry
@@ -327,8 +348,8 @@ struct full_node : node_base<T, THREADED, Allocator> {
     
     // Helper to move a child from this node to another (nulls out source)
     void move_child_to(unsigned char c, full_node* dest) {
-        dest->valid.set(c);
         dest->children[c].store(children[c].load());
+        dest->valid.set(c);
         children[c].store(nullptr);
     }
     
@@ -360,30 +381,55 @@ struct full_node : node_base<T, THREADED, Allocator> {
 };
 
 // =============================================================================
-// RETRY SENTINEL - self-referential poisoned FULL node
-// Safe to dereference - all children point back to itself, poison check catches it
+// SENTINEL STORAGE TYPES - constinit compatible
+// =============================================================================
+
+// Storage for NOT_FOUND sentinel - interior LIST with empty skip/chars
+// Layout compatible with list_node for reinterpret_cast
+template <typename T, bool THREADED, typename Allocator>
+struct not_found_list_storage : node_base<T, THREADED, Allocator> {
+    T* eos_ptr = nullptr;
+    std::string skip{};  // Empty - uses SSO, no allocation
+    small_list chars{};  // count=0 - find() always returns -1
+    std::array<void*, 7> dummy_children{};  // Never accessed (chars is empty)
+    
+    constexpr not_found_list_storage() noexcept 
+        : node_base<T, THREADED, Allocator>(NOT_FOUND_SENTINEL_HEADER) {}
+};
+
+// Storage for RETRY sentinel - interior FULL with poison flag
+// Layout compatible with full_node for reinterpret_cast
+template <typename T, bool THREADED, typename Allocator>
+struct retry_full_storage : node_base<T, THREADED, Allocator> {
+    T* eos_ptr = nullptr;
+    std::string skip{};  // Empty - uses SSO, no allocation
+    bitmap256 valid{};   // All zeros - no valid children
+    std::array<void*, 256> dummy_children{};  // All nullptr
+    
+    constexpr retry_full_storage() noexcept 
+        : node_base<T, THREADED, Allocator>(RETRY_SENTINEL_HEADER) {}
+};
+
+// =============================================================================
+// NOT_FOUND SENTINEL - returns nullptr from find_child naturally
+// Reader hits this → interior loop → chars.find() → -1 → return nullptr
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator>
+node_base<T, THREADED, Allocator>* get_not_found_sentinel() noexcept {
+    constinit static not_found_list_storage<T, THREADED, Allocator> storage{};
+    return reinterpret_cast<node_base<T, THREADED, Allocator>*>(&storage);
+}
+
+// =============================================================================
+// RETRY SENTINEL - poisoned FULL node, blocks concurrent readers
+// is_poisoned() check catches this and triggers retry
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator>
 node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept {
-    // Static sentinel per template instantiation
-    static full_node<T, THREADED, Allocator> sentinel;
-    static bool initialized = []() {
-        // Interior FULL with poisoned version
-        sentinel.set_header(SENTINEL_HEADER);
-        sentinel.eos_ptr = nullptr;
-        sentinel.skip.clear();
-        // All 256 children point back to sentinel - creates safe infinite loop
-        // that will eventually hit a poison check
-        auto* self = static_cast<node_base<T, THREADED, Allocator>*>(&sentinel);
-        for (int i = 0; i < 256; ++i) {
-            sentinel.children[i].store(self);
-            sentinel.valid.set(static_cast<unsigned char>(i));
-        }
-        return true;
-    }();
-    (void)initialized;
-    return &sentinel;
+    constinit static retry_full_storage<T, THREADED, Allocator> storage{};
+    return reinterpret_cast<node_base<T, THREADED, Allocator>*>(&storage);
 }
 
 // =============================================================================
@@ -399,9 +445,15 @@ public:
     using list_t = list_node<T, THREADED, Allocator>;
     using full_t = full_node<T, THREADED, Allocator>;
     
+    // Check if pointer is a sentinel (never delete sentinels)
+    static bool is_sentinel(ptr_t n) noexcept {
+        return n == get_not_found_sentinel<T, THREADED, Allocator>() ||
+               n == get_retry_sentinel<T, THREADED, Allocator>();
+    }
+    
     // Unified node deletion
     static void delete_node(ptr_t n) {
-        if (!n) return;
+        if (!n || is_sentinel(n)) return;
         if (n->is_skip()) delete n->as_skip();
         else if (n->is_list()) [[likely]] delete n->as_list();
         else delete n->as_full();
@@ -431,13 +483,12 @@ public:
     }
     
     // Interior builders - only LIST and FULL can be interior
+    // Note: children array auto-initializes to NOT_FOUND via atomic_node_ptr default ctor
     ptr_t make_interior_list(std::string_view sk) {
         auto* n = new list_t();
         n->set_header(make_header(false, FLAG_LIST));
         n->skip = std::string(sk);
-        for (int i = 0; i < list_t::MAX_CHILDREN; ++i) {
-            n->children[i].store(nullptr);
-        }
+        // children[] default-constructed to NOT_FOUND sentinel
         return n;
     }
     
@@ -445,15 +496,13 @@ public:
         auto* n = new full_t();
         n->set_header(make_header(false, 0));  // FULL = no type flags
         n->skip = std::string(sk);
-        for (int i = 0; i < 256; ++i) {
-            n->children[i].store(nullptr);
-        }
+        // children[] default-constructed to NOT_FOUND sentinel (compiler optimizes)
         return n;
     }
     
     // Recursive deallocation
     void dealloc_node(ptr_t n) {
-        if (!n) return;
+        if (!n || is_sentinel(n)) return;
         
         if (!n->is_leaf()) {
             // Interior nodes are only LIST or FULL
@@ -477,7 +526,7 @@ public:
     
     // Deep copy
     ptr_t deep_copy(ptr_t src) {
-        if (!src) return nullptr;
+        if (!src || is_sentinel(src)) return nullptr;
         
         if (src->is_leaf()) {
             if (src->is_skip()) {

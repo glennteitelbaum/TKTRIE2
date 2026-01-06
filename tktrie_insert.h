@@ -17,7 +17,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_impl(
     atomic_ptr* slot, ptr_t n, std::string_view key, const T& value) {
     insert_result res;
 
-    if (!n || n->is_poisoned()) {
+    if (!n || n->is_poisoned() || builder_t::is_sentinel(n)) {
         res.new_node = create_leaf_for_key(key, value);
         res.inserted = true;
         return res;
@@ -72,7 +72,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
     key.remove_prefix(1);
 
     ptr_t child = find_child(n, c);
-    if (child) {
+    // Check if child is NOT_FOUND sentinel (treat as no child)
+    if (child && !builder_t::is_sentinel(child)) {
         atomic_ptr* child_slot = get_child_slot(n, c);
         auto child_res = insert_impl(child_slot, child, key, value);
         if (child_res.new_node && child_res.new_node != child) {
@@ -263,11 +264,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
         ptr_t full = builder_.make_leaf_full(leaf->as_list()->skip);
         for (int i = 0; i < leaf->as_list()->chars.count(); ++i) {
             unsigned char ch = leaf->as_list()->chars.char_at(i);
-            full->as_full()->valid.set(ch);
-            full->as_full()->construct_leaf_value(ch, leaf->as_list()->leaf_values[i]);
+            full->as_full()->add_leaf_entry(ch, leaf->as_list()->leaf_values[i]);
         }
-        full->as_full()->valid.set(c);
-        full->as_full()->construct_leaf_value(c, value);
+        full->as_full()->add_leaf_entry(c, value);
 
         res.new_node = full;
         res.old_nodes.push_back(leaf);

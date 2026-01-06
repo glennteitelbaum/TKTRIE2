@@ -80,12 +80,12 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
     speculative_info info;
     info.remaining_key = std::string(key);
 
-    if (!n) {
+    if (!n || builder_t::is_sentinel(n)) {
         info.op = spec_op::EMPTY_TREE;
         return info;
     }
 
-    // Check if poisoned (includes sentinel)
+    // Check if poisoned (includes retry sentinel)
     if (n->is_poisoned()) {
         info.op = spec_op::EXISTS;  // Signal retry needed
         return info;
@@ -131,7 +131,8 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         unsigned char c = static_cast<unsigned char>(key[0]);
         ptr_t child = find_child(n, c);
 
-        if (!child) {
+        // Check if child is NOT_FOUND sentinel (treat as no child)
+        if (!child || builder_t::is_sentinel(child)) {
             info.target = n;
             info.target_version = n->version();
             info.target_skip = std::string(skip);
@@ -247,8 +248,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     }
     case spec_op::LIST_TO_FULL_LEAF: {
         ptr_t full = builder_.make_leaf_full(std::string(skip));
-        full->as_full()->valid.set(info.c);
-        full->as_full()->construct_leaf_value(info.c, value);
+        full->as_full()->add_leaf_entry(info.c, value);
 
         alloc.root_replacement = full;
         alloc.add(full);
@@ -331,7 +331,7 @@ bool TKTRIE_CLASS::commit_speculative(
     speculative_info& info, pre_alloc& alloc, const T& value) {
     switch (info.op) {
     case spec_op::EMPTY_TREE:
-        if (root_.load() != nullptr) return false;
+        if (root_.load() != nullptr && !builder_t::is_sentinel(root_.load())) return false;
         root_.store(alloc.root_replacement);
         return true;
 
@@ -375,8 +375,7 @@ bool TKTRIE_CLASS::commit_speculative(
         auto* list = info.target->as_list();
         for (int i = 0; i < list->chars.count(); ++i) {
             unsigned char ch = list->chars.char_at(i);
-            alloc.root_replacement->as_full()->valid.set(ch);
-            alloc.root_replacement->as_full()->construct_leaf_value(ch, list->leaf_values[i]);
+            alloc.root_replacement->as_full()->add_leaf_entry(ch, list->leaf_values[i]);
         }
         commit_to_slot(slot, alloc.root_replacement, info);
         return true;
@@ -386,7 +385,7 @@ bool TKTRIE_CLASS::commit_speculative(
         unsigned char c = info.c;
         if (n->version() != info.target_version) return false;
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (!slot | (slot->load() != n)) return false;
+        if (!slot || slot->load() != n) return false;
 
         if (n->is_list()) [[likely]] {
             if (n->as_list()->chars.find(c) >= 0) return false;
@@ -402,8 +401,7 @@ bool TKTRIE_CLASS::commit_speculative(
         // FULL
         if (n->as_full()->valid.template atomic_test<THREADED>(c)) return false;
         n->bump_version();
-        n->as_full()->valid.template atomic_set<THREADED>(c);
-        n->as_full()->construct_leaf_value(c, value);
+        n->as_full()->template add_leaf_entry_atomic<THREADED>(c, value);
         return true;
     }
     case spec_op::IN_PLACE_INTERIOR: {
@@ -413,7 +411,7 @@ bool TKTRIE_CLASS::commit_speculative(
             return false;
         }
         atomic_ptr* slot = (info.path_len <= 1) ? &root_ : find_slot_for_commit(info);
-        if (!slot | (slot->load() != n)) {
+        if (!slot || slot->load() != n) {
             if (alloc.in_place_eos) { delete alloc.in_place_eos; alloc.in_place_eos = nullptr; }
             return false;
         }
@@ -525,8 +523,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 } else {
                     if (n->as_full()->valid.template atomic_test<THREADED>(c)) continue;  // Now exists
                     n->bump_version();
-                    n->as_full()->valid.template atomic_set<THREADED>(c);
-                    n->as_full()->construct_leaf_value(c, value);
+                    n->as_full()->template add_leaf_entry_atomic<THREADED>(c, value);
                 }
                 size_.fetch_add(1);
                 return {iterator(this, std::string(kb), value), true};
@@ -567,8 +564,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     } else if (n->is_full()) {
                         if (n->as_full()->valid.template atomic_test<THREADED>(c)) { builder_.dealloc_node(child); continue; }
                         n->bump_version();
-                        n->as_full()->valid.template atomic_set<THREADED>(c);
-                        n->as_full()->children[c].store(child);
+                        n->as_full()->template add_child_atomic<THREADED>(c, child);
                     } else {
                         builder_.dealloc_node(child);
                         goto slow_path;

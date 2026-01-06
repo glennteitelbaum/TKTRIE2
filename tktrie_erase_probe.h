@@ -60,7 +60,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
     erase_spec_info info;
 
     // Check for null or poisoned (includes sentinel)
-    if (!n || n->is_poisoned()) {
+    if (!n || n->is_poisoned() || builder_t::is_sentinel(n)) {
         info.op = erase_op::NOT_FOUND;
         return info;
     }
@@ -79,7 +79,12 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         ptr_t child = find_child(n, c);
-        if (!child) { info.op = erase_op::NOT_FOUND; return info; }
+        
+        // Check if child is NOT_FOUND sentinel (treat as no child)
+        if (!child || builder_t::is_sentinel(child)) { 
+            info.op = erase_op::NOT_FOUND; 
+            return info; 
+        }
 
         key.remove_prefix(1);
         n = child;

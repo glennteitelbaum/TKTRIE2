@@ -71,7 +71,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_impl(
     atomic_ptr*, ptr_t n, std::string_view key) {
     erase_result res;
-    if (!n || n->is_poisoned()) return res;
+    if (!n || n->is_poisoned() || builder_t::is_sentinel(n)) return res;
     if (n->is_leaf()) return erase_from_leaf(n, key);
     return erase_from_interior(n, key);
 }
@@ -144,7 +144,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
 
     unsigned char c = static_cast<unsigned char>(key[0]);
     ptr_t child = find_child(n, c);
-    if (!child) return res;
+    
+    // Check if child is NOT_FOUND sentinel (treat as no child)
+    if (!child || builder_t::is_sentinel(child)) return res;
 
     auto child_res = erase_impl(get_child_slot(n, c), child, key.substr(1));
     if (!child_res.erased) return res;
@@ -191,7 +193,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
         c = n->as_full()->valid.first();
         child = n->as_full()->children[c].load();
     }
-    if (!child) return res;
+    if (!child || builder_t::is_sentinel(child)) return res;
 
     return collapse_single_child(n, c, child, res);
 }
@@ -237,13 +239,13 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     if (n->is_list() && n->as_list()->chars.count() == 1 && !eos) {
         c = n->as_list()->chars.char_at(0);
         child = n->as_list()->children[0].load();
-        can_collapse = (child != nullptr);
+        can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
     } else if (n->is_full() && !eos) {
         int cnt = n->as_full()->valid.count();
         if (cnt == 1) {
             c = n->as_full()->valid.first();
             child = n->as_full()->children[c].load();
-            can_collapse = (child != nullptr);
+            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
     }
 

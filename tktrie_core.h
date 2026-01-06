@@ -16,8 +16,8 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
     if (!ptr) return;
     auto* n = static_cast<ptr_t>(ptr);
-    // Never delete the static sentinel node
-    if (n == get_retry_sentinel<T, THREADED, Allocator>()) return;
+    // Never delete sentinel nodes
+    if (builder_t::is_sentinel(n)) return;
     builder_t::delete_node(n);
 }
 
@@ -49,8 +49,8 @@ void TKTRIE_CLASS::set_eos_ptr(ptr_t n, T* p) noexcept {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n) return;
-    // Never retire the static sentinel node
-    if (n == get_retry_sentinel<T, THREADED, Allocator>()) return;
+    // Never retire sentinel nodes
+    if (builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
         n->poison();  // Mark as dead BEFORE adding to retire list
         uint64_t epoch = ebr_slot::global_epoch().load(std::memory_order_acquire);
@@ -104,7 +104,9 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
         int idx = n->as_list()->chars.find(c);
         return idx >= 0 ? n->as_list()->children[idx].load() : nullptr;
     }
-    if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
+    // FULL: No bitmap check needed - children default to NOT_FOUND sentinel
+    // Either returns real child or NOT_FOUND (which reader handles naturally)
+    if (n->is_full()) {
         return n->as_full()->children[c].load();
     }
     return nullptr;
@@ -116,6 +118,7 @@ typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::get_child_slot(ptr_t n, unsigne
         int idx = n->as_list()->chars.find(c);
         return idx >= 0 ? &n->as_list()->children[idx] : nullptr;
     }
+    // FULL: Return slot directly (bitmap still used for iteration/counting)
     if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
         return &n->as_full()->children[c];
     }
@@ -181,7 +184,7 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
         out = leaf->as_list()->leaf_values[idx];
         return true;
     }
-    // FULL
+    // FULL leaf - still need bitmap check (leaf values, not children)
     if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return false;
     out = leaf->as_full()->leaf_values[c];
     return true;
@@ -250,12 +253,17 @@ bool TKTRIE_CLASS::contains_impl(ptr_t n, std::string_view key) const noexcept {
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
+TKTRIE_CLASS::tktrie() : root_(nullptr) {}
+
+TKTRIE_TEMPLATE
 TKTRIE_CLASS::~tktrie() { clear(); }
 
 TKTRIE_TEMPLATE
-TKTRIE_CLASS::tktrie(const tktrie& other) {
+TKTRIE_CLASS::tktrie(const tktrie& other) : root_(nullptr) {
     ptr_t other_root = other.root_.load();
-    if (other_root) root_.store(builder_.deep_copy(other_root));
+    if (other_root && !builder_t::is_sentinel(other_root)) {
+        root_.store(builder_.deep_copy(other_root));
+    }
     size_.store(other.size_.load());
 }
 
@@ -264,14 +272,16 @@ TKTRIE_CLASS& TKTRIE_CLASS::operator=(const tktrie& other) {
     if (this != &other) {
         clear();
         ptr_t other_root = other.root_.load();
-        if (other_root) root_.store(builder_.deep_copy(other_root));
+        if (other_root && !builder_t::is_sentinel(other_root)) {
+            root_.store(builder_.deep_copy(other_root));
+        }
         size_.store(other.size_.load());
     }
     return *this;
 }
 
 TKTRIE_TEMPLATE
-TKTRIE_CLASS::tktrie(tktrie&& other) noexcept {
+TKTRIE_CLASS::tktrie(tktrie&& other) noexcept : root_(nullptr) {
     root_.store(other.root_.load());
     other.root_.store(nullptr);
     size_.store(other.size_.exchange(0));
@@ -292,8 +302,8 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
     root_.store(nullptr);
-    // Never dealloc the static sentinel node
-    if (r && r != get_retry_sentinel<T, THREADED, Allocator>()) {
+    // Never dealloc sentinel nodes
+    if (r && !builder_t::is_sentinel(r)) {
         builder_.dealloc_node(r);
     }
     size_.store(0);
