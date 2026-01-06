@@ -493,11 +493,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, std::string(kb), value), true};
     } else {
-        // Batch try_reclaim - only every 1024 operations per thread
-        thread_local uint32_t reclaim_counter = 0;
-        if ((++reclaim_counter & 0x3FF) == 0) {
-            ebr_try_reclaim();
-        }
+        maybe_reclaim();
         
         auto& slot = get_ebr_slot();
         

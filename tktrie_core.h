@@ -62,6 +62,16 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
 }
 
 TKTRIE_TEMPLATE
+void TKTRIE_CLASS::maybe_reclaim() noexcept {
+    if constexpr (THREADED) {
+        thread_local uint32_t reclaim_counter = 0;
+        if ((++reclaim_counter & 0x3FF) == 0) {
+            ebr_try_reclaim();
+        }
+    }
+}
+
+TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
@@ -98,34 +108,6 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::find_child(ptr_t n, unsigned char c) 
         return n->as_full()->children[c].load();
     }
     return nullptr;
-}
-
-// Check child and return with poison detection
-// Returns (child_ptr, hit_poison) - if hit_poison, caller should reset path
-TKTRIE_TEMPLATE
-std::pair<typename TKTRIE_CLASS::ptr_t, bool> TKTRIE_CLASS::find_child_wait(
-    ptr_t n, unsigned char c) const noexcept {
-    // Check if parent node is poisoned - must retry from root
-    if (n->is_poisoned()) {
-        return {nullptr, true};
-    }
-    
-    ptr_t child = nullptr;
-    if (n->is_list()) [[likely]] {
-        int idx = n->as_list()->chars.find(c);
-        child = (idx >= 0) ? n->as_list()->children[idx].load() : nullptr;
-    } else if (n->is_full() && n->as_full()->valid.template atomic_test<THREADED>(c)) {
-        child = n->as_full()->children[c].load();
-    }
-    
-    if (!child) return {nullptr, false};
-    
-    // Child is poisoned (either sentinel or retired node) - signal retry
-    if (child->is_poisoned()) {
-        return {nullptr, true};
-    }
-    
-    return {child, false};
 }
 
 TKTRIE_TEMPLATE
@@ -174,6 +156,10 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexce
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) const noexcept {
+    if constexpr (THREADED) {
+        if (leaf->is_poisoned()) return false;
+    }
+    
     std::string_view skip = get_skip(leaf);
     size_t m = match_skip_impl(skip, key);
     if (m < skip.size()) return false;
@@ -203,15 +189,12 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T& out) cons
 
 // -----------------------------------------------------------------------------
 // Optimistic read operations (lock-free fast path for THREADED mode)
-// Uses sentinel wait + version validation for safe lock-free reads
+// Uses poison detection + version validation for safe lock-free reads
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept {
-    if (!n) return false;
-    
-    // Check if root is poisoned - must retry
-    if (n->is_poisoned()) return false;
+    if (!n || n->is_poisoned()) return false;
     
     // Record root in path
     if (!path.push(n)) return false;
@@ -232,62 +215,14 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, r
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        // Use wait-load - blocks on mutex if sentinel hit
-        auto [child, hit_sentinel] = find_child_wait(n, c);
-        if (!child) {
-            // hit_sentinel true means poisoned node - signal retry
-            // hit_sentinel false means child doesn't exist
-            return false;
-        }
+        n = find_child(n, c);
+        if (!n || n->is_poisoned()) return false;
         
-        if (hit_sentinel) {
-            // We synchronized with writer via mutex lock/unlock
-            // Clear old path - it's stale but we've synced
-            path.clear();
-        }
-        
-        // Record this node in path
-        n = child;
         if (!path.push(n)) return false;
-        
-        // Double-check node isn't poisoned after push
-        if (n->is_poisoned()) return false;
     }
     
-    // n is now a leaf
-    return read_from_leaf_optimistic(n, key, out, path);
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T& out, read_path& /*path*/) const noexcept {
-    // Check if leaf is poisoned
-    if (leaf->is_poisoned()) return false;
-    
-    std::string_view skip = get_skip(leaf);
-    size_t m = match_skip_impl(skip, key);
-    if (m < skip.size()) return false;
-    key.remove_prefix(m);
-
-    if (leaf->is_skip()) {
-        if (!key.empty()) return false;
-        out = leaf->as_skip()->leaf_value;
-        return true;
-    }
-    
-    // LIST or FULL leaf
-    if (key.size() != 1) return false;
-    unsigned char c = static_cast<unsigned char>(key[0]);
-    
-    if (leaf->is_list()) [[likely]] {
-        int idx = leaf->as_list()->chars.find(c);
-        if (idx < 0) return false;
-        out = leaf->as_list()->leaf_values[idx];
-        return true;
-    }
-    // FULL - must use atomic test to avoid data race with concurrent writers
-    if (!leaf->as_full()->valid.template atomic_test<THREADED>(c)) return false;
-    out = leaf->as_full()->leaf_values[c];
-    return true;
+    // n is now a leaf - read_from_leaf handles poison check via if constexpr (THREADED)
+    return read_from_leaf(n, key, out);
 }
 
 TKTRIE_TEMPLATE

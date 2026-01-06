@@ -10,50 +10,33 @@ namespace gteitelbaum {
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
-    if constexpr (!THREADED) {
-        std::lock_guard<mutex_t> lock(mutex_);
-
-        ptr_t root = root_.load();
-        auto res = erase_impl(&root_, root, kb);
-
+    // Helper to apply erase result (used by both THREADED and non-THREADED paths)
+    auto apply_erase_result = [this](erase_result& res) -> bool {
         if (!res.erased) return false;
-
-        if (res.deleted_subtree) root_.store(nullptr);
-        else if (res.new_node) root_.store(res.new_node);
-
+        if (res.deleted_subtree) {
+            if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator>());
+            root_.store(nullptr);
+        } else if (res.new_node) {
+            if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator>());
+            root_.store(res.new_node);
+        }
         for (auto* old : res.old_nodes) retire_node(old);
         size_.fetch_sub(1);
         return true;
+    };
+    
+    if constexpr (!THREADED) {
+        std::lock_guard<mutex_t> lock(mutex_);
+        auto res = erase_impl(&root_, root_.load(), kb);
+        return apply_erase_result(res);
     } else {
-        // Batch try_reclaim - only every 1024 operations per thread
-        thread_local uint32_t reclaim_counter = 0;
-        if ((++reclaim_counter & 0x3FF) == 0) {
-            ebr_try_reclaim();
-        }
+        maybe_reclaim();
         
         auto& ebr_slot_ref = get_ebr_slot();
         
         while (true) {
             auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
-
-            if (info.op == erase_op::NOT_FOUND) {
-                // Re-check under lock to confirm
-                std::lock_guard<mutex_t> lock(mutex_);
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) {
-                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
-                    root_.store(nullptr);
-                } else if (res.new_node) {
-                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
-                    root_.store(res.new_node);
-                }
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_sub(1);
-                return true;
-            }
 
             // Fast path: IN_PLACE operations - direct modification
             if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
@@ -74,22 +57,11 @@ bool TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 continue;
             }
 
-            // Slow path: structural changes needed
+            // Slow path: NOT_FOUND or structural changes needed
             {
                 std::lock_guard<mutex_t> lock(mutex_);
-                ptr_t root = root_.load();
-                auto res = erase_impl(&root_, root, kb);
-                if (!res.erased) return false;
-                if (res.deleted_subtree) {
-                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
-                    root_.store(nullptr);
-                } else if (res.new_node) {
-                    root_.store(get_retry_sentinel<T, THREADED, Allocator>());
-                    root_.store(res.new_node);
-                }
-                for (auto* old : res.old_nodes) retire_node(old);
-                size_.fetch_sub(1);
-                return true;
+                auto res = erase_impl(&root_, root_.load(), kb);
+                return apply_erase_result(res);
             }
         }
     }

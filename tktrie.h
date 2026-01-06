@@ -198,8 +198,8 @@ private:
     // Instance helpers
     // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
+    void maybe_reclaim() noexcept;  // Batched reclaim (every 1024 ops)
     ptr_t find_child(ptr_t n, unsigned char c) const noexcept;
-    std::pair<ptr_t, bool> find_child_wait(ptr_t n, unsigned char c) const noexcept;
     atomic_ptr* get_child_slot(ptr_t n, unsigned char c) noexcept;
 
     // -------------------------------------------------------------------------
@@ -211,7 +211,6 @@ private:
     
     // Optimistic read operations (lock-free fast path)
     bool read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept;
-    bool read_from_leaf_optimistic(ptr_t leaf, std::string_view key, T& out, read_path& path) const noexcept;
     bool validate_read_path(const read_path& path) const noexcept;
 
     // -------------------------------------------------------------------------
