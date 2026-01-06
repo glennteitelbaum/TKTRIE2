@@ -99,31 +99,30 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][TYPE:2][POISON:1][VERSION:60]
-// TYPE: 00=SKIP (always leaf), 01=LIST, 10=FULL
+// Header: [LEAF:1][SKIP:1][LIST:1][POISON:1][VERSION:60]
+// SKIP: FLAG_SKIP set (always leaf)
+// LIST: FLAG_LIST set
+// FULL: neither SKIP nor LIST set
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
-static constexpr uint64_t TYPE_SKIP   = 0ULL << 61;  // always leaf
-static constexpr uint64_t TYPE_LIST   = 1ULL << 61;  // leaf or interior
-static constexpr uint64_t TYPE_FULL   = 2ULL << 61;  // leaf or interior
-static constexpr uint64_t TYPE_MASK   = 3ULL << 61;
+static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
+static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior
 static constexpr uint64_t FLAG_POISON = 1ULL << 60;
 static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | TYPE_MASK | FLAG_POISON;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POISON;
 
 static constexpr int LIST_MAX = 7;
 
 // Interior FULL node header with poison flag set - used for sentinel
-static constexpr uint64_t SENTINEL_HEADER = TYPE_FULL | FLAG_POISON;
+static constexpr uint64_t SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
 }
 
-inline constexpr uint64_t make_header(bool is_leaf, uint64_t type, uint64_t version = 0) noexcept {
-    return (is_leaf ? FLAG_LEAF : 0) | type | (version & VERSION_MASK);
+inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, uint64_t version = 0) noexcept {
+    return (is_leaf ? FLAG_LEAF : 0) | type_flag | (version & VERSION_MASK);
 }
 inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0; }
-inline constexpr uint64_t get_type(uint64_t h) noexcept { return h & TYPE_MASK; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
 
 // Bump version preserving flags (including poison)

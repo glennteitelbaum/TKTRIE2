@@ -52,7 +52,6 @@ struct node_base {
     
     // Type queries
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
-    uint64_t type() const noexcept { return get_type(header()); }
     uint64_t version() const noexcept { return get_version(header()); }
     
     void bump_version() noexcept {
@@ -68,9 +67,9 @@ struct node_base {
         return is_poisoned_header(header());
     }
     
-    bool is_skip() const noexcept { return type() == TYPE_SKIP; }
-    bool is_list() const noexcept { return type() == TYPE_LIST; }
-    bool is_full() const noexcept { return type() == TYPE_FULL; }
+    bool is_skip() const noexcept { return header() & FLAG_SKIP; }
+    bool is_list() const noexcept { return header() & FLAG_LIST; }
+    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST)); }
     
     // Downcasts
     skip_node<T, THREADED, Allocator>* as_skip() noexcept {
@@ -411,7 +410,7 @@ public:
     // Leaf builder - SKIP is always leaf
     ptr_t make_leaf_skip(std::string_view sk, const T& value) {
         auto* n = new skip_t();
-        n->set_header(make_header(true, TYPE_SKIP));
+        n->set_header(make_header(true, FLAG_SKIP));
         n->skip = std::string(sk);
         new (&n->leaf_value) T(value);
         return n;
@@ -419,14 +418,14 @@ public:
     
     ptr_t make_leaf_list(std::string_view sk) {
         auto* n = new list_t();
-        n->set_header(make_header(true, TYPE_LIST));
+        n->set_header(make_header(true, FLAG_LIST));
         n->skip = std::string(sk);
         return n;
     }
     
     ptr_t make_leaf_full(std::string_view sk) {
         auto* n = new full_t();
-        n->set_header(make_header(true, TYPE_FULL));
+        n->set_header(make_header(true, 0));  // FULL = no type flags
         n->skip = std::string(sk);
         return n;
     }
@@ -434,7 +433,7 @@ public:
     // Interior builders - only LIST and FULL can be interior
     ptr_t make_interior_list(std::string_view sk) {
         auto* n = new list_t();
-        n->set_header(make_header(false, TYPE_LIST));
+        n->set_header(make_header(false, FLAG_LIST));
         n->skip = std::string(sk);
         for (int i = 0; i < list_t::MAX_CHILDREN; ++i) {
             n->children[i].store(nullptr);
@@ -444,7 +443,7 @@ public:
     
     ptr_t make_interior_full(std::string_view sk) {
         auto* n = new full_t();
-        n->set_header(make_header(false, TYPE_FULL));
+        n->set_header(make_header(false, 0));  // FULL = no type flags
         n->skip = std::string(sk);
         for (int i = 0; i < 256; ++i) {
             n->children[i].store(nullptr);
