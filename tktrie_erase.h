@@ -34,39 +34,75 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         maybe_reclaim();
         
         auto& ebr_slot_ref = get_ebr_slot();
+        static constexpr int MAX_RETRIES = 7;
         
-        while (true) {
+        for (int retry = 0; retry <= MAX_RETRIES; ++retry) {
             auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
 
-            // In-place operations don't retire nodes
+            if (info.op == erase_op::NOT_FOUND) {
+                return {false, false};
+            }
+
+            // In-place operations - no allocation needed
             if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
                 std::lock_guard<mutex_t> lock(mutex_);
+                if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
-                    return {true, false};  // erased=true, retired_any=false
+                    return {true, false};
                 }
                 continue;
             }
             
             if (info.op == erase_op::IN_PLACE_LEAF_FULL) {
                 std::lock_guard<mutex_t> lock(mutex_);
+                if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
-                    return {true, false};  // erased=true, retired_any=false
+                    return {true, false};
                 }
                 continue;
             }
 
-            // Slow path: NOT_FOUND or structural changes needed
+            // Speculative path: allocate outside lock, brief lock for commit
+            erase_pre_alloc alloc = allocate_erase_speculative(info);
+            
             {
                 std::lock_guard<mutex_t> lock(mutex_);
-                auto res = erase_impl(&root_, root_.load(), kb);
-                return apply_erase_result(res);
+                if (!validate_erase_path(info)) {
+                    dealloc_erase_speculation(alloc);
+                    continue;
+                }
+                
+                if (commit_erase_speculative(info, alloc)) {
+                    // Retire old nodes
+                    bool retired_any = false;
+                    if (info.target) {
+                        retire_node(info.target);
+                        retired_any = true;
+                    }
+                    if (info.collapse_child) {
+                        retire_node(info.collapse_child);
+                        retired_any = true;
+                    }
+                    size_.fetch_sub(1);
+                    return {true, retired_any};
+                }
+                dealloc_erase_speculation(alloc);
+                continue;
             }
+        }
+        
+        // Fallback after MAX_RETRIES
+        {
+            std::lock_guard<mutex_t> lock(mutex_);
+            auto res = erase_impl(&root_, root_.load(), kb);
+            return apply_erase_result(res);
         }
     }
 }
+
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_impl(

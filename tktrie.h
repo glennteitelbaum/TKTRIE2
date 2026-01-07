@@ -190,7 +190,14 @@ public:
     // -------------------------------------------------------------------------
     enum class erase_op {
         NOT_FOUND,
+        // In-place operations (no structural change)
         IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL,
+        // Structural operations
+        DELETE_SKIP_LEAF,           // Delete entire SKIP leaf
+        DELETE_LAST_LEAF_ENTRY,     // Delete last entry from LIST/FULL leaf  
+        DELETE_EOS_INTERIOR,        // Remove EOS from interior (may collapse)
+        DELETE_CHILD_COLLAPSE,      // Remove child and collapse to merged node
+        DELETE_CHILD_NO_COLLAPSE,   // Remove child, no collapse needed
     };
 
     struct erase_spec_info {
@@ -201,6 +208,19 @@ public:
         ptr_t target = nullptr;
         uint64_t target_version = 0;
         unsigned char c = 0;
+        bool is_eos = false;
+        // For collapse operations
+        ptr_t collapse_child = nullptr;
+        unsigned char collapse_char = 0;
+        std::string target_skip;
+        std::string child_skip;
+    };
+
+    struct erase_pre_alloc {
+        ptr_t nodes[4];
+        int count = 0;
+        ptr_t replacement = nullptr;
+        void add(ptr_t n) { nodes[count++] = n; }
     };
 
     // -------------------------------------------------------------------------
@@ -296,8 +316,13 @@ private:
     // -------------------------------------------------------------------------
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
+    erase_spec_info probe_interior_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     bool do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
+    erase_pre_alloc allocate_erase_speculative(const erase_spec_info& info);
+    bool validate_erase_path(const erase_spec_info& info) const noexcept;
+    bool commit_erase_speculative(erase_spec_info& info, erase_pre_alloc& alloc);
+    void dealloc_erase_speculation(erase_pre_alloc& alloc);
     std::pair<bool, bool> erase_locked(std::string_view kb);  // Returns (erased, retired_any)
     erase_result erase_impl(atomic_ptr* slot, ptr_t n, std::string_view key);
     erase_result erase_from_leaf(ptr_t leaf, std::string_view key);
