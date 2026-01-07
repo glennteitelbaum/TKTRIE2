@@ -253,10 +253,10 @@ inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexc
 
 }  
 namespace gteitelbaum {
-
-template <typename T, bool THREADED, typename Allocator>
+template <typename T, bool THREADED, typename Allocator, bool OPTIONAL = false>
 class dataptr {
-    static constexpr bool INLINE = sizeof(T) <= sizeof(T*) && std::is_trivially_copyable_v<T>;
+    
+    static constexpr bool INLINE = !OPTIONAL && sizeof(T) <= sizeof(T*) && std::is_trivially_copyable_v<T>;
     
     using alloc_traits = std::allocator_traits<Allocator>;
     using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
@@ -586,7 +586,8 @@ struct node_base {
     using self_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
     using ptr_t = self_t*;
     using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator, FIXED_LEN>;
-    using data_t = dataptr<T, THREADED, Allocator>;
+    using data_t = dataptr<T, THREADED, Allocator, false>;      
+    using eos_data_t = dataptr<T, THREADED, Allocator, true>;   
     using skip_t = skip_string<FIXED_LEN>;
     
     atomic_storage<uint64_t, THREADED> header_;
@@ -874,10 +875,11 @@ struct list_node<T, THREADED, Allocator, 0, false>
     using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
     using data_t = typename base_t::data_t;
+    using eos_data_t = typename base_t::eos_data_t;
     
     static constexpr int MAX_CHILDREN = 7;
     
-    data_t eos;
+    eos_data_t eos;
     small_list chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
@@ -1064,8 +1066,9 @@ struct full_node<T, THREADED, Allocator, 0, false>
     using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
     using data_t = typename base_t::data_t;
+    using eos_data_t = typename base_t::eos_data_t;
     
-    data_t eos;
+    eos_data_t eos;
     bitmap256 valid;
     std::array<atomic_ptr, 256> children;
     

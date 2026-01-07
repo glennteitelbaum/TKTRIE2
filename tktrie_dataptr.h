@@ -13,11 +13,13 @@ namespace gteitelbaum {
 // DATAPTR - value storage with inline optimization
 // sizeof(T) <= sizeof(T*): store T inline (atomic if THREADED)
 // sizeof(T) > sizeof(T*): store T* pointer (atomic swap for updates)
+// OPTIONAL=true forces pointer mode so has_data() can distinguish empty from zero
 // =============================================================================
 
-template <typename T, bool THREADED, typename Allocator>
+template <typename T, bool THREADED, typename Allocator, bool OPTIONAL = false>
 class dataptr {
-    static constexpr bool INLINE = sizeof(T) <= sizeof(T*) && std::is_trivially_copyable_v<T>;
+    // For optional values, always use pointer mode so nullptr means "not set"
+    static constexpr bool INLINE = !OPTIONAL && sizeof(T) <= sizeof(T*) && std::is_trivially_copyable_v<T>;
     
     using alloc_traits = std::allocator_traits<Allocator>;
     using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
