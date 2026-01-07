@@ -156,94 +156,59 @@ struct node_base {
     // DISPATCHERS - is_leaf param allows compiler to eliminate dead branches
     // =========================================================================
     
-    // Child access (interior nodes)
-    ptr_t get_child(bool is_leaf, unsigned char c) const noexcept {
-        if (is_leaf) [[unlikely]] {
-            return nullptr;
-        }
+    // Child access (interior nodes only)
+    ptr_t get_child(unsigned char c) const noexcept {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
         }
         return as_full<false>()->get_child(c);
     }
     
-    atomic_ptr* get_child_slot(bool is_leaf, unsigned char c) noexcept {
-        if (is_leaf) [[unlikely]] {
-            return nullptr;
-        }
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child_slot(c);
         }
         return as_full<false>()->get_child_slot(c);
     }
     
-    int entry_count(bool is_leaf) const noexcept {
-        if (is_leaf) [[unlikely]] {
-            if (is_skip()) return 1;
-            if (is_list()) [[likely]] return as_list<true>()->count();
-            return as_full<true>()->count();
-        }
+    int child_count() const noexcept {
         if (is_list()) [[likely]] return as_list<false>()->count();
         return as_full<false>()->count();
     }
     
-    // Value access (leaf nodes) - handles SKIP/LIST/FULL
-    bool try_read_value(bool is_leaf, unsigned char c, T& out) const noexcept {
-        if (!is_leaf) [[unlikely]] return false;
-        if (is_skip()) {
-            return as_skip()->value.try_read(out);
-        }
-        if (is_list()) [[likely]] {
-            return as_list<true>()->get_value(c, out);
-        }
-        return as_full<true>()->get_value(c, out);
-    }
-    
-    bool has_value(bool is_leaf, unsigned char c) const noexcept {
-        if (!is_leaf) [[unlikely]] return false;
-        if (is_skip()) return as_skip()->value.has_data();
-        if (is_list()) [[likely]] return as_list<true>()->has(c);
-        return as_full<true>()->has(c);
-    }
-    
-    // EOS access (interior nodes, FIXED_LEN==0 only)
-    bool has_eos(bool is_leaf) const noexcept {
+    // EOS access (interior nodes only, FIXED_LEN==0 only)
+    bool has_eos() const noexcept {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf;
             return false;
         } else {
-            if (is_leaf) [[unlikely]] return false;
             if (is_list()) [[likely]] return as_list<false>()->eos.has_data();
             return as_full<false>()->eos.has_data();
         }
     }
     
-    bool try_read_eos(bool is_leaf, T& out) const noexcept {
+    bool try_read_eos(T& out) const noexcept {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf; (void)out;
+            (void)out;
             return false;
         } else {
-            if (is_leaf) [[unlikely]] return false;
             if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
             return as_full<false>()->eos.try_read(out);
         }
     }
     
-    void set_eos(bool is_leaf, const T& value) {
+    void set_eos(const T& value) {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf; (void)value;
+            (void)value;
         } else {
-            if (is_leaf) [[unlikely]] return;
             if (is_list()) [[likely]] as_list<false>()->eos.set(value);
             else as_full<false>()->eos.set(value);
         }
     }
     
-    void clear_eos(bool is_leaf) {
+    void clear_eos() {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf;
+            // No EOS for fixed-length keys
         } else {
-            if (is_leaf) [[unlikely]] return;
             if (is_list()) [[likely]] as_list<false>()->eos.clear();
             else as_full<false>()->eos.clear();
         }

@@ -650,93 +650,58 @@ struct node_base {
     
     
     
-    ptr_t get_child(bool is_leaf, unsigned char c) const noexcept {
-        if (is_leaf) [[unlikely]] {
-            return nullptr;
-        }
+    ptr_t get_child(unsigned char c) const noexcept {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
         }
         return as_full<false>()->get_child(c);
     }
     
-    atomic_ptr* get_child_slot(bool is_leaf, unsigned char c) noexcept {
-        if (is_leaf) [[unlikely]] {
-            return nullptr;
-        }
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child_slot(c);
         }
         return as_full<false>()->get_child_slot(c);
     }
     
-    int entry_count(bool is_leaf) const noexcept {
-        if (is_leaf) [[unlikely]] {
-            if (is_skip()) return 1;
-            if (is_list()) [[likely]] return as_list<true>()->count();
-            return as_full<true>()->count();
-        }
+    int child_count() const noexcept {
         if (is_list()) [[likely]] return as_list<false>()->count();
         return as_full<false>()->count();
     }
     
     
-    bool try_read_value(bool is_leaf, unsigned char c, T& out) const noexcept {
-        if (!is_leaf) [[unlikely]] return false;
-        if (is_skip()) {
-            return as_skip()->value.try_read(out);
-        }
-        if (is_list()) [[likely]] {
-            return as_list<true>()->get_value(c, out);
-        }
-        return as_full<true>()->get_value(c, out);
-    }
-    
-    bool has_value(bool is_leaf, unsigned char c) const noexcept {
-        if (!is_leaf) [[unlikely]] return false;
-        if (is_skip()) return as_skip()->value.has_data();
-        if (is_list()) [[likely]] return as_list<true>()->has(c);
-        return as_full<true>()->has(c);
-    }
-    
-    
-    bool has_eos(bool is_leaf) const noexcept {
+    bool has_eos() const noexcept {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf;
             return false;
         } else {
-            if (is_leaf) [[unlikely]] return false;
             if (is_list()) [[likely]] return as_list<false>()->eos.has_data();
             return as_full<false>()->eos.has_data();
         }
     }
     
-    bool try_read_eos(bool is_leaf, T& out) const noexcept {
+    bool try_read_eos(T& out) const noexcept {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf; (void)out;
+            (void)out;
             return false;
         } else {
-            if (is_leaf) [[unlikely]] return false;
             if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
             return as_full<false>()->eos.try_read(out);
         }
     }
     
-    void set_eos(bool is_leaf, const T& value) {
+    void set_eos(const T& value) {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf; (void)value;
+            (void)value;
         } else {
-            if (is_leaf) [[unlikely]] return;
             if (is_list()) [[likely]] as_list<false>()->eos.set(value);
             else as_full<false>()->eos.set(value);
         }
     }
     
-    void clear_eos(bool is_leaf) {
+    void clear_eos() {
         if constexpr (FIXED_LEN > 0) {
-            (void)is_leaf;
+            
         } else {
-            if (is_leaf) [[unlikely]] return;
             if (is_list()) [[likely]] as_list<false>()->eos.clear();
             else as_full<false>()->eos.clear();
         }
@@ -1651,21 +1616,12 @@ private:
     
     
     static void node_deleter(void* ptr);
-    static std::string_view get_skip(ptr_t n) noexcept;
-    
-    
-    static bool has_eos(ptr_t n) noexcept;
-    static bool try_read_eos(ptr_t n, T& out) noexcept;
-    static void set_eos(ptr_t n, const T& value);
-    static void clear_eos(ptr_t n);
 
     
     
     
     void retire_node(ptr_t n);
     void maybe_reclaim() noexcept;
-    ptr_t find_child(ptr_t n, unsigned char c) const noexcept;
-    atomic_ptr* get_child_slot(ptr_t n, unsigned char c) noexcept;
 
     
     
@@ -1927,18 +1883,16 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (!out) return n->has_eos(false);
-            return n->try_read_eos(false, *out);
+            if (!out) return n->has_eos();
+            return n->try_read_eos(*out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = n->get_child(false, c);
-        
-        
+        n = n->get_child(c);
         if constexpr (THREADED) {
-            if (!n || builder_t::is_sentinel(n)) return false;
+            if (!n || n->is_poisoned()) return false;
         } else {
             if (!n) return false;
         }
@@ -1960,14 +1914,22 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T* out) cons
 
     if (leaf->is_skip()) {
         if (!key.empty()) return false;
-        if (!out) return true;  
+        if (!out) return true;
         return leaf->as_skip()->value.try_read(*out);
     }
     
+    
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
-    if (!out) return leaf->has_value(true, c);  
-    return leaf->try_read_value(true, c, *out);
+    
+    if (leaf->is_list()) [[likely]] {
+        auto* ln = leaf->template as_list<true>();
+        if (!out) return ln->has(c);
+        return ln->get_value(c, *out);
+    }
+    auto* fn = leaf->template as_full<true>();
+    if (!out) return fn->has(c);
+    return fn->get_value(c, *out);
 }
 
 TKTRIE_TEMPLATE
@@ -1983,15 +1945,15 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, r
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (!out) return n->has_eos(false);
-            return n->try_read_eos(false, *out);
+            if (!out) return n->has_eos();
+            return n->try_read_eos(*out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = n->get_child(false, c);
-        if (!n || n->is_poisoned() || builder_t::is_sentinel(n)) return false;
+        n = n->get_child(c);
+        if (!n || n->is_poisoned()) return false;
         
         if (!path.push(n)) return false;
     }
@@ -2091,8 +2053,7 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             read_path path;
             
             ptr_t root = root_.load();
-            if (!root) return false;
-            if (root->is_poisoned()) continue;
+            if (root->is_poisoned()) continue;  
             
             bool found = read_impl_optimistic(root, kbv, nullptr, path);
             if (validate_read_path(path)) return found;
@@ -2244,9 +2205,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
     unsigned char c = static_cast<unsigned char>(key[0]);
     key.remove_prefix(1);
 
-    ptr_t child = n->get_child(false, c);
+    ptr_t child = n->get_child(c);
     if (child && !builder_t::is_sentinel(child)) {
-        atomic_ptr* child_slot = n->get_child_slot(false, c);
+        atomic_ptr* child_slot = n->get_child_slot(c);
         auto child_res = insert_impl(child_slot, child, key, value);
         if (child_res.new_node && child_res.new_node != child) {
             if constexpr (THREADED) {
@@ -2299,7 +2260,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
 
     ptr_t interior = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        interior->set_eos(false, value);
+        interior->set_eos(value);
     }
 
     T old_value;
@@ -2323,7 +2284,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     if constexpr (FIXED_LEN == 0) {
         T old_value;
         leaf->as_skip()->value.try_read(old_value);
-        interior->set_eos(false, old_value);
+        interior->set_eos(old_value);
     }
 
     ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
@@ -2364,7 +2325,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_list(
 
     ptr_t interior = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        interior->set_eos(false, value);
+        interior->set_eos(value);
     }
 
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
@@ -2400,7 +2361,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         if (leaf->is_list()) [[likely]] {
             auto* src = leaf->template as_list<true>();
             ptr_t interior = builder_.make_interior_list(leaf_skip);
-            interior->set_eos(false, value);
+            interior->set_eos(value);
             int cnt = src->count();
             for (int i = 0; i < cnt; ++i) {
                 unsigned char c = src->chars.char_at(i);
@@ -2413,7 +2374,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         } else {
             auto* src = leaf->template as_full<true>();
             ptr_t interior = builder_.make_interior_full(leaf_skip);
-            interior->set_eos(false, value);
+            interior->set_eos(value);
             src->valid.for_each_set([this, src, interior](unsigned char c) {
                 T val;
                 src->values[c].try_read(val);
@@ -2590,7 +2551,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
 
     ptr_t new_int = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        new_int->set_eos(false, value);
+        new_int->set_eos(value);
     }
 
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
@@ -2609,8 +2570,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::set_interior_eos(ptr_t n, con
     if constexpr (FIXED_LEN > 0) {
         return res;
     } else {
-        if (n->has_eos(false)) return res;
-        n->set_eos(false, value);
+        if (n->has_eos()) return res;
+        n->set_eos(value);
         res.in_place = true;
         res.inserted = true;
         return res;
@@ -2770,7 +2731,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (n->has_eos(false)) { info.op = spec_op::EXISTS; return info; }
+            if (n->has_eos()) { info.op = spec_op::EXISTS; return info; }
             info.op = spec_op::IN_PLACE_INTERIOR;
             info.target = n;
             info.target_version = n->version();
@@ -2779,7 +2740,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = n->get_child(false, c);
+        ptr_t child = n->get_child(c);
 
         if (!child || builder_t::is_sentinel(child)) {
             info.target = n;
@@ -2861,7 +2822,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t interior = builder_.make_interior_list(std::string(key));
         if constexpr (FIXED_LEN == 0) {
-            interior->set_eos(false, value);
+            interior->set_eos(value);
         }
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), old_value);
         interior->template as_list<false>()->add_child(old_c, child);
@@ -2882,7 +2843,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t interior = builder_.make_interior_list(std::string(skip));
         if constexpr (FIXED_LEN == 0) {
-            interior->set_eos(false, old_value);
+            interior->set_eos(old_value);
         }
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
         interior->template as_list<false>()->add_child(new_c, child);
@@ -2927,7 +2888,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t interior = builder_.make_interior_list(std::string(key));
         if constexpr (FIXED_LEN == 0) {
-            interior->set_eos(false, value);
+            interior->set_eos(value);
         }
         ptr_t old_child;
         if (info.target->is_list()) {
@@ -2998,7 +2959,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t new_int = builder_.make_interior_list(std::string(key));
         if constexpr (FIXED_LEN == 0) {
-            new_int->set_eos(false, value);
+            new_int->set_eos(value);
         }
         ptr_t old_child;
         
@@ -3065,7 +3026,7 @@ typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::find_slot_for_commit(
     if (info.path_len <= 1) return &root_;
     ptr_t parent = info.path[info.path_len - 2].node;
     unsigned char edge = info.path[info.path_len - 1].edge;
-    return parent->get_child_slot(false, edge);
+    return parent->get_child_slot(edge);
 }
 
 TKTRIE_TEMPLATE
@@ -3223,10 +3184,10 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         if (!validate_path(spec)) continue;
                         
                         ptr_t n = spec.target;
-                        if (n->has_eos(false)) continue;
+                        if (n->has_eos()) continue;
                         
                         n->bump_version();
-                        n->set_eos(false, value);
+                        n->set_eos(value);
                         size_.fetch_add(1);
                         stat_success(retry);
                         return {iterator(this, kb, value), true};
@@ -3393,12 +3354,12 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
             info.op = erase_op::NOT_FOUND;
             return info;
         }
-        if (!n->has_eos(false)) {
+        if (!n->has_eos()) {
             info.op = erase_op::NOT_FOUND;
             return info;
         }
         
-        int child_cnt = n->entry_count(false);
+        int child_cnt = n->child_count();
         if (child_cnt == 0) {
             info.op = erase_op::NOT_FOUND;  
             return info;
@@ -3453,7 +3414,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = n->get_child(false, c);
+        ptr_t child = n->get_child(c);
         
         if (!child || builder_t::is_sentinel(child)) { 
             info.op = erase_op::NOT_FOUND; 
@@ -3563,7 +3524,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     } else {
         ptr_t parent = info.path[info.path_len - 2].node;
         unsigned char edge = info.path[info.path_len - 1].edge;
-        slot = parent->get_child_slot(false, edge);
+        slot = parent->get_child_slot(edge);
     }
     
     switch (info.op) {
@@ -3611,7 +3572,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
             slot->store(alloc.replacement);
         } else {
             target->bump_version();
-            target->clear_eos(false);
+            target->clear_eos();
         }
         return true;
     }
@@ -3845,20 +3806,20 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
         if constexpr (FIXED_LEN > 0) {
             return res;
         } else {
-            if (!n->has_eos(false)) return res;
+            if (!n->has_eos()) return res;
             n->bump_version();
-            n->clear_eos(false);
+            n->clear_eos();
             res.erased = true;
             return try_collapse_interior(n);
         }
     }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
-    ptr_t child = n->get_child(false, c);
+    ptr_t child = n->get_child(c);
     
     if (!child || builder_t::is_sentinel(child)) return res;
 
-    auto child_res = erase_impl(n->get_child_slot(false, c), child, key.substr(1));
+    auto child_res = erase_impl(n->get_child_slot(c), child, key.substr(1));
     if (!child_res.erased) return res;
 
     if (child_res.deleted_subtree) {
@@ -3868,9 +3829,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     if (child_res.new_node) {
         n->bump_version();
         if constexpr (THREADED) {
-            n->get_child_slot(false, c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
+            n->get_child_slot(c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
         }
-        n->get_child_slot(false, c)->store(child_res.new_node);
+        n->get_child_slot(c)->store(child_res.new_node);
     }
     res.erased = true;
     res.old_nodes = std::move(child_res.old_nodes);
@@ -3882,10 +3843,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
     erase_result res;
     res.erased = true;
 
-    bool eos_exists = n->has_eos(false);
+    bool eos_exists = n->has_eos();
     if (eos_exists) return res;
 
-    int child_cnt = n->entry_count(false);
+    int child_cnt = n->child_count();
     if (child_cnt == 0) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
@@ -3916,8 +3877,8 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     res.old_nodes = std::move(child_res.old_nodes);
     res.erased = true;
 
-    bool eos_exists = n->has_eos(false);
-    int remaining = n->entry_count(false);
+    bool eos_exists = n->has_eos();
+    int remaining = n->child_count();
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();

@@ -77,12 +77,12 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
             info.op = erase_op::NOT_FOUND;
             return info;
         }
-        if (!n->has_eos(false)) {
+        if (!n->has_eos()) {
             info.op = erase_op::NOT_FOUND;
             return info;
         }
         
-        int child_cnt = n->entry_count(false);
+        int child_cnt = n->child_count();
         if (child_cnt == 0) {
             info.op = erase_op::NOT_FOUND;  // Use slow path
             return info;
@@ -141,7 +141,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = n->get_child(false, c);
+        ptr_t child = n->get_child(c);
         
         if (!child || builder_t::is_sentinel(child)) { 
             info.op = erase_op::NOT_FOUND; 
@@ -263,7 +263,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     } else {
         ptr_t parent = info.path[info.path_len - 2].node;
         unsigned char edge = info.path[info.path_len - 1].edge;
-        slot = parent->get_child_slot(false, edge);
+        slot = parent->get_child_slot(edge);
     }
     
     switch (info.op) {
@@ -311,7 +311,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
             slot->store(alloc.replacement);
         } else {
             target->bump_version();
-            target->clear_eos(false);
+            target->clear_eos();
         }
         return true;
     }

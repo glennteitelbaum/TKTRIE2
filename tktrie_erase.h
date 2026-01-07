@@ -171,20 +171,20 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
         if constexpr (FIXED_LEN > 0) {
             return res;
         } else {
-            if (!n->has_eos(false)) return res;
+            if (!n->has_eos()) return res;
             n->bump_version();
-            n->clear_eos(false);
+            n->clear_eos();
             res.erased = true;
             return try_collapse_interior(n);
         }
     }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
-    ptr_t child = n->get_child(false, c);
+    ptr_t child = n->get_child(c);
     
     if (!child || builder_t::is_sentinel(child)) return res;
 
-    auto child_res = erase_impl(n->get_child_slot(false, c), child, key.substr(1));
+    auto child_res = erase_impl(n->get_child_slot(c), child, key.substr(1));
     if (!child_res.erased) return res;
 
     if (child_res.deleted_subtree) {
@@ -194,9 +194,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_interior(
     if (child_res.new_node) {
         n->bump_version();
         if constexpr (THREADED) {
-            n->get_child_slot(false, c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
+            n->get_child_slot(c)->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
         }
-        n->get_child_slot(false, c)->store(child_res.new_node);
+        n->get_child_slot(c)->store(child_res.new_node);
     }
     res.erased = true;
     res.old_nodes = std::move(child_res.old_nodes);
@@ -208,10 +208,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
     erase_result res;
     res.erased = true;
 
-    bool eos_exists = n->has_eos(false);
+    bool eos_exists = n->has_eos();
     if (eos_exists) return res;
 
-    int child_cnt = n->entry_count(false);
+    int child_cnt = n->child_count();
     if (child_cnt == 0) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
@@ -242,8 +242,8 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     res.old_nodes = std::move(child_res.old_nodes);
     res.erased = true;
 
-    bool eos_exists = n->has_eos(false);
-    int remaining = n->entry_count(false);
+    bool eos_exists = n->has_eos();
+    int remaining = n->child_count();
 
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();

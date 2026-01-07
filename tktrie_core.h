@@ -114,18 +114,16 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (!out) return n->has_eos(false);
-            return n->try_read_eos(false, *out);
+            if (!out) return n->has_eos();
+            return n->try_read_eos(*out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = n->get_child(false, c);
-        // Non-threaded: not_found_sentinel is nullptr, so !n covers it
-        // Threaded: need to check both sentinels
+        n = n->get_child(c);
         if constexpr (THREADED) {
-            if (!n || builder_t::is_sentinel(n)) return false;
+            if (!n || n->is_poisoned()) return false;
         } else {
             if (!n) return false;
         }
@@ -147,14 +145,22 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T* out) cons
 
     if (leaf->is_skip()) {
         if (!key.empty()) return false;
-        if (!out) return true;  // exists check only
+        if (!out) return true;
         return leaf->as_skip()->value.try_read(*out);
     }
     
+    // LIST or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
-    if (!out) return leaf->has_value(true, c);  // exists check only
-    return leaf->try_read_value(true, c, *out);
+    
+    if (leaf->is_list()) [[likely]] {
+        auto* ln = leaf->template as_list<true>();
+        if (!out) return ln->has(c);
+        return ln->get_value(c, *out);
+    }
+    auto* fn = leaf->template as_full<true>();
+    if (!out) return fn->has(c);
+    return fn->get_value(c, *out);
 }
 
 TKTRIE_TEMPLATE
@@ -170,15 +176,15 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, r
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (!out) return n->has_eos(false);
-            return n->try_read_eos(false, *out);
+            if (!out) return n->has_eos();
+            return n->try_read_eos(*out);
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
 
-        n = n->get_child(false, c);
-        if (!n || n->is_poisoned() || builder_t::is_sentinel(n)) return false;
+        n = n->get_child(c);
+        if (!n || n->is_poisoned()) return false;
         
         if (!path.push(n)) return false;
     }
@@ -282,8 +288,7 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             read_path path;
             
             ptr_t root = root_.load();
-            if (!root) return false;
-            if (root->is_poisoned()) continue;
+            if (root->is_poisoned()) continue;  // Write in progress, retry
             
             bool found = read_impl_optimistic(root, kbv, nullptr, path);
             if (validate_read_path(path)) return found;

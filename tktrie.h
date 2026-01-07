@@ -249,21 +249,12 @@ private:
     // Static helpers
     // -------------------------------------------------------------------------
     static void node_deleter(void* ptr);
-    static std::string_view get_skip(ptr_t n) noexcept;
-    
-    // EOS access - only available when FIXED_LEN == 0
-    static bool has_eos(ptr_t n) noexcept;
-    static bool try_read_eos(ptr_t n, T& out) noexcept;
-    static void set_eos(ptr_t n, const T& value);
-    static void clear_eos(ptr_t n);
 
     // -------------------------------------------------------------------------
     // Instance helpers
     // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
     void maybe_reclaim() noexcept;
-    ptr_t find_child(ptr_t n, unsigned char c) const noexcept;
-    atomic_ptr* get_child_slot(ptr_t n, unsigned char c) noexcept;
 
     // -------------------------------------------------------------------------
     // Read operations

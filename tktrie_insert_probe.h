@@ -112,7 +112,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         key.remove_prefix(m);
 
         if (key.empty()) {
-            if (n->has_eos(false)) { info.op = spec_op::EXISTS; return info; }
+            if (n->has_eos()) { info.op = spec_op::EXISTS; return info; }
             info.op = spec_op::IN_PLACE_INTERIOR;
             info.target = n;
             info.target_version = n->version();
@@ -121,7 +121,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         }
 
         unsigned char c = static_cast<unsigned char>(key[0]);
-        ptr_t child = n->get_child(false, c);
+        ptr_t child = n->get_child(c);
 
         if (!child || builder_t::is_sentinel(child)) {
             info.target = n;
@@ -203,7 +203,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t interior = builder_.make_interior_list(std::string(key));
         if constexpr (FIXED_LEN == 0) {
-            interior->set_eos(false, value);
+            interior->set_eos(value);
         }
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), old_value);
         interior->template as_list<false>()->add_child(old_c, child);
@@ -224,7 +224,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t interior = builder_.make_interior_list(std::string(skip));
         if constexpr (FIXED_LEN == 0) {
-            interior->set_eos(false, old_value);
+            interior->set_eos(old_value);
         }
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
         interior->template as_list<false>()->add_child(new_c, child);
@@ -269,7 +269,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t interior = builder_.make_interior_list(std::string(key));
         if constexpr (FIXED_LEN == 0) {
-            interior->set_eos(false, value);
+            interior->set_eos(value);
         }
         ptr_t old_child;
         if (info.target->is_list()) {
@@ -340,7 +340,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         
         ptr_t new_int = builder_.make_interior_list(std::string(key));
         if constexpr (FIXED_LEN == 0) {
-            new_int->set_eos(false, value);
+            new_int->set_eos(value);
         }
         ptr_t old_child;
         // Copy interior with borrowed children (poison prevents recursive delete)
@@ -407,7 +407,7 @@ typename TKTRIE_CLASS::atomic_ptr* TKTRIE_CLASS::find_slot_for_commit(
     if (info.path_len <= 1) return &root_;
     ptr_t parent = info.path[info.path_len - 2].node;
     unsigned char edge = info.path[info.path_len - 1].edge;
-    return parent->get_child_slot(false, edge);
+    return parent->get_child_slot(edge);
 }
 
 TKTRIE_TEMPLATE
@@ -565,10 +565,10 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         if (!validate_path(spec)) continue;
                         
                         ptr_t n = spec.target;
-                        if (n->has_eos(false)) continue;
+                        if (n->has_eos()) continue;
                         
                         n->bump_version();
-                        n->set_eos(false, value);
+                        n->set_eos(value);
                         size_.fetch_add(1);
                         stat_success(retry);
                         return {iterator(this, kb, value), true};

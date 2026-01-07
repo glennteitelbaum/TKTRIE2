@@ -70,9 +70,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_interior(
     unsigned char c = static_cast<unsigned char>(key[0]);
     key.remove_prefix(1);
 
-    ptr_t child = n->get_child(false, c);
+    ptr_t child = n->get_child(c);
     if (child && !builder_t::is_sentinel(child)) {
-        atomic_ptr* child_slot = n->get_child_slot(false, c);
+        atomic_ptr* child_slot = n->get_child_slot(c);
         auto child_res = insert_impl(child_slot, child, key, value);
         if (child_res.new_node && child_res.new_node != child) {
             if constexpr (THREADED) {
@@ -125,7 +125,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
 
     ptr_t interior = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        interior->set_eos(false, value);
+        interior->set_eos(value);
     }
 
     T old_value;
@@ -149,7 +149,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     if constexpr (FIXED_LEN == 0) {
         T old_value;
         leaf->as_skip()->value.try_read(old_value);
-        interior->set_eos(false, old_value);
+        interior->set_eos(old_value);
     }
 
     ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
@@ -190,7 +190,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_list(
 
     ptr_t interior = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        interior->set_eos(false, value);
+        interior->set_eos(value);
     }
 
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
@@ -226,7 +226,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         if (leaf->is_list()) [[likely]] {
             auto* src = leaf->template as_list<true>();
             ptr_t interior = builder_.make_interior_list(leaf_skip);
-            interior->set_eos(false, value);
+            interior->set_eos(value);
             int cnt = src->count();
             for (int i = 0; i < cnt; ++i) {
                 unsigned char c = src->chars.char_at(i);
@@ -239,7 +239,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
         } else {
             auto* src = leaf->template as_full<true>();
             ptr_t interior = builder_.make_interior_full(leaf_skip);
-            interior->set_eos(false, value);
+            interior->set_eos(value);
             src->valid.for_each_set([this, src, interior](unsigned char c) {
                 T val;
                 src->values[c].try_read(val);
@@ -416,7 +416,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
 
     ptr_t new_int = builder_.make_interior_list(std::string(key));
     if constexpr (FIXED_LEN == 0) {
-        new_int->set_eos(false, value);
+        new_int->set_eos(value);
     }
 
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
@@ -435,8 +435,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::set_interior_eos(ptr_t n, con
     if constexpr (FIXED_LEN > 0) {
         return res;
     } else {
-        if (n->has_eos(false)) return res;
-        n->set_eos(false, value);
+        if (n->has_eos()) return res;
+        n->set_eos(value);
         res.in_place = true;
         res.inserted = true;
         return res;
