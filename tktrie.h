@@ -229,8 +229,9 @@ public:
     struct retired_node {
         ptr_t ptr;
         uint64_t epoch;
-        retired_node* next;
     };
+    
+    static constexpr uint64_t EBR_CLEANUP_THRESHOLD = 100;
 
 private:
     atomic_ptr root_;
@@ -238,12 +239,15 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
-    // Lock-free retired list (MPSC - multiple producers, single consumer)
-    std::conditional_t<THREADED, std::atomic<retired_node*>, retired_node*> retired_head_{nullptr};
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for reclaim
+    // Simple retired list protected by ebr_mutex_
+    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_list_{};
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
     
-    void ebr_retire_node(ptr_t n, uint64_t epoch);  // Lock-free push
-    void ebr_try_reclaim();
+    // EBR helpers
+    void ebr_retire(ptr_t n, uint64_t epoch);      // Add to retired list (under ebr_mutex_)
+    void ebr_cleanup();                             // Free reclaimable nodes (under ebr_mutex_)
+    bool ebr_should_cleanup() const;                // Check threshold (no lock)
+    void ebr_maybe_cleanup();                       // Check + cleanup if needed (grabs ebr_mutex_)
 
     // -------------------------------------------------------------------------
     // Static helpers
@@ -254,14 +258,26 @@ private:
     // Instance helpers
     // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
-    void maybe_reclaim() noexcept;
 
     // -------------------------------------------------------------------------
     // Read operations
     // -------------------------------------------------------------------------
-    bool read_impl(ptr_t n, std::string_view key, T* out, bool need_value) const noexcept;
+    template <bool NEED_VALUE>
+    bool read_impl(ptr_t n, std::string_view key, T& out) const noexcept
+        requires NEED_VALUE;
     
-    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, bool need_value, read_path& path) const noexcept;
+    template <bool NEED_VALUE>
+    bool read_impl(ptr_t n, std::string_view key) const noexcept
+        requires (!NEED_VALUE);
+    
+    template <bool NEED_VALUE>
+    bool read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept
+        requires NEED_VALUE;
+    
+    template <bool NEED_VALUE>
+    bool read_impl_optimistic(ptr_t n, std::string_view key, read_path& path) const noexcept
+        requires (!NEED_VALUE);
+    
     bool validate_read_path(const read_path& path) const noexcept;
 
     // -------------------------------------------------------------------------

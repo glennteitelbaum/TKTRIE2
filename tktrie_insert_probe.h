@@ -510,13 +510,16 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, kb, value), true};
     } else {
-        maybe_reclaim();
+        // Check cleanup BEFORE enter so our epoch doesn't block our own cleanup
+        ebr_maybe_cleanup();
         
         auto& slot = get_ebr_slot();
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        slot.enter(epoch);
+        
         constexpr int MAX_RETRIES = 7;
         
         for (int retry = 0; retry <= MAX_RETRIES; ++retry) {
-            auto guard = slot.get_guard();
             speculative_info spec = probe_speculative(root_.load(), kb);
             
             stat_attempt();

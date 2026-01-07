@@ -1,66 +1,55 @@
 #pragma once
 
 #include <atomic>
-#include <functional>
 #include <mutex>
 #include <vector>
-#include <thread>
 #include <algorithm>
 
 namespace gteitelbaum {
 
-// Forward declaration
-class ebr_global;
-
 // =============================================================================
-// EBR_SLOT - per-thread epoch tracking
+// EBR_SLOT - per-thread epoch tracking (single-field design)
+// 0 = inactive, non-zero = epoch when reader entered
 // =============================================================================
 
 class ebr_slot {
-    std::atomic<uint64_t> epoch_{0};
-    std::atomic<bool> active_{false};
+    std::atomic<uint64_t> active_epoch_{0};
     std::atomic<bool> valid_{true};
     
 public:
-    class guard {
-        ebr_slot* slot_;
-    public:
-        explicit guard(ebr_slot* s) : slot_(s) { slot_->enter(); }
-        ~guard() { if (slot_) slot_->exit(); }
-        guard(const guard&) = delete;
-        guard& operator=(const guard&) = delete;
-        guard(guard&& o) noexcept : slot_(o.slot_) { o.slot_ = nullptr; }
-        guard& operator=(guard&&) = delete;
-    };
-    
     ebr_slot();
     ~ebr_slot();
     
-    void enter() noexcept {
-        epoch_.store(global_epoch().load(std::memory_order_acquire), std::memory_order_release);
-        active_.store(true, std::memory_order_release);
+    void enter(uint64_t epoch) noexcept {
+        active_epoch_.store(epoch, std::memory_order_release);
     }
     
-    void exit() noexcept { active_.store(false, std::memory_order_release); }
-    bool is_active() const noexcept { return active_.load(std::memory_order_acquire); }
-    bool is_valid() const noexcept { return valid_.load(std::memory_order_acquire); }
-    uint64_t epoch() const noexcept { return epoch_.load(std::memory_order_acquire); }
-    guard get_guard() { return guard(this); }
+    // No-op exit - stale epochs handled by cleanup threshold
+    void exit() noexcept {}
     
-    static std::atomic<uint64_t>& global_epoch() {
-        static std::atomic<uint64_t> e{0};
-        return e;
+    // Returns 0 if inactive, epoch otherwise
+    uint64_t epoch() const noexcept { 
+        return active_epoch_.load(std::memory_order_acquire); 
+    }
+    
+    bool is_valid() const noexcept { 
+        return valid_.load(std::memory_order_acquire); 
+    }
+    
+    void invalidate() noexcept {
+        valid_.store(false, std::memory_order_release);
     }
 };
 
 // =============================================================================
-// EBR_GLOBAL - global slot management only (retired lists are per-trie)
+// EBR_GLOBAL - global epoch and slot management
 // =============================================================================
 
 class ebr_global {
 private:
     std::mutex slots_mutex_;
     std::vector<ebr_slot*> slots_;
+    std::atomic<uint64_t> global_epoch_{1};  // Start at 1, 0 = inactive sentinel
     
     ebr_global() = default;
     
@@ -88,22 +77,29 @@ public:
         return slot;
     }
     
-    void advance_epoch() {
-        ebr_slot::global_epoch().fetch_add(1, std::memory_order_acq_rel);
+    uint64_t current_epoch() const noexcept {
+        return global_epoch_.load(std::memory_order_acquire);
     }
     
-    // Compute safe epoch - oldest epoch any active reader holds
-    uint64_t compute_safe_epoch() {
-        uint64_t ge = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        uint64_t safe = ge;
+    uint64_t advance_epoch() noexcept {
+        return global_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    
+    // Compute min epoch across all slots (0s ignored as inactive)
+    // Returns current global epoch if no active readers
+    uint64_t compute_min_epoch() {
+        uint64_t ge = current_epoch();
+        uint64_t min_e = ge;
         std::lock_guard<std::mutex> lock(slots_mutex_);
         for (auto* slot : slots_) {
-            if (slot->is_valid() && slot->is_active()) {
-                uint64_t se = slot->epoch();
-                if (se < safe) safe = se;
+            if (slot->is_valid()) {
+                uint64_t e = slot->epoch();
+                if (e != 0 && e < min_e) {
+                    min_e = e;
+                }
             }
         }
-        return safe;
+        return min_e;
     }
 };
 
@@ -111,10 +107,12 @@ inline ebr_slot& get_ebr_slot() {
     return ebr_global::instance().get_slot();
 }
 
-// Out-of-line definitions for ebr_slot
-inline ebr_slot::ebr_slot() { ebr_global::instance().register_slot(this); }
+inline ebr_slot::ebr_slot() { 
+    ebr_global::instance().register_slot(this); 
+}
+
 inline ebr_slot::~ebr_slot() {
-    valid_.store(false, std::memory_order_release);
+    invalidate();
     ebr_global::instance().unregister_slot(this);
 }
 

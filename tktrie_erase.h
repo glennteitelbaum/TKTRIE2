@@ -31,13 +31,16 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        maybe_reclaim();
+        // Check cleanup BEFORE enter so our epoch doesn't block our own cleanup
+        ebr_maybe_cleanup();
         
         auto& ebr_slot_ref = get_ebr_slot();
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        ebr_slot_ref.enter(epoch);
+        
         static constexpr int MAX_RETRIES = 7;
         
         for (int retry = 0; retry <= MAX_RETRIES; ++retry) {
-            auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
 
             if (info.op == erase_op::NOT_FOUND) {

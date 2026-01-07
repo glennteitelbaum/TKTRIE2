@@ -477,7 +477,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     }
     
     void copy_interior_to(list_node* dest) const {
-        dest->eos = eos;
+        dest->eos.deep_copy_from(eos);
         copy_children_to(dest);
     }
     
@@ -655,7 +655,7 @@ struct full_node<T, THREADED, Allocator, 0, false>
     }
     
     void copy_interior_to(full_node* dest) const {
-        dest->eos = eos;
+        dest->eos.deep_copy_from(eos);
         dest->valid = valid;
         valid.for_each_set([this, dest](unsigned char c) {
             dest->children[c].store(children[c].load());
@@ -704,7 +704,7 @@ void list_node<T, THREADED, Allocator, FIXED_LEN, false>::copy_interior_to_full(
 template <typename T, bool THREADED, typename Allocator>
 void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, 0, false>* dest) const {
-    dest->eos = eos;
+    dest->eos.deep_copy_from(eos);
     int cnt = chars.count();
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
