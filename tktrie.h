@@ -259,10 +259,9 @@ private:
     // -------------------------------------------------------------------------
     // Read operations
     // -------------------------------------------------------------------------
-    bool read_impl(ptr_t n, std::string_view key, T* out) const noexcept;
-    bool contains_impl(ptr_t n, std::string_view key) const noexcept;
+    bool read_impl(ptr_t n, std::string_view key, T* out, bool need_value) const noexcept;
     
-    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, read_path& path) const noexcept;
+    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, bool need_value, read_path& path) const noexcept;
     bool validate_read_path(const read_path& path) const noexcept;
 
     // -------------------------------------------------------------------------

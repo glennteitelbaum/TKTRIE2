@@ -1621,10 +1621,9 @@ private:
     
     
     
-    bool read_impl(ptr_t n, std::string_view key, T* out) const noexcept;
-    bool contains_impl(ptr_t n, std::string_view key) const noexcept;
+    bool read_impl(ptr_t n, std::string_view key, T* out, bool need_value) const noexcept;
     
-    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, read_path& path) const noexcept;
+    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, bool need_value, read_path& path) const noexcept;
     bool validate_read_path(const read_path& path) const noexcept;
 
     
@@ -1867,7 +1866,7 @@ void TKTRIE_CLASS::ebr_try_reclaim() {
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexcept {
+bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out, bool need_value) const noexcept {
     if constexpr (THREADED) {
         if (!n || n->is_poisoned()) return false;
     } else {
@@ -1881,7 +1880,13 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         if (n->is_leaf()) break;
         
         
-        if (key.empty()) return out ? n->try_read_eos(*out) : n->has_eos();
+        if (key.empty()) {
+            if (need_value) {
+                return n->try_read_eos(*out);
+            } else {
+                return n->has_eos();
+            }
+        }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
@@ -1897,7 +1902,11 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
     
     if (n->is_skip()) {
         if (!key.empty()) return false;
-        return !out || n->as_skip()->value.try_read(*out);
+        if (need_value) {
+            return n->as_skip()->value.try_read(*out);
+        } else {
+            return true;
+        }
     }
     
     
@@ -1908,15 +1917,23 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
-        return !out || ln->read_value(idx, *out);
+        if (need_value) {
+            return ln->read_value(idx, *out);
+        } else {
+            return true;
+        }
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
-    return !out || fn->read_value(c, *out);
+    if (need_value) {
+        return fn->read_value(c, *out);
+    } else {
+        return true;
+    }
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, read_path& path) const noexcept {
+bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, bool need_value, read_path& path) const noexcept {
     if (!n || n->is_poisoned()) return false;
     
     if (!path.push(n)) return false;
@@ -1928,7 +1945,13 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, r
         if (n->is_leaf()) break;
         
         
-        if (key.empty()) return out ? n->try_read_eos(*out) : n->has_eos();
+        if (key.empty()) {
+            if (need_value) {
+                return n->try_read_eos(*out);
+            } else {
+                return n->has_eos();
+            }
+        }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
@@ -1941,7 +1964,11 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, r
     
     if (n->is_skip()) {
         if (!key.empty()) return false;
-        return !out || n->as_skip()->value.try_read(*out);
+        if (need_value) {
+            return n->as_skip()->value.try_read(*out);
+        } else {
+            return true;
+        }
     }
     
     
@@ -1952,11 +1979,19 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, r
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
-        return !out || ln->read_value(idx, *out);
+        if (need_value) {
+            return ln->read_value(idx, *out);
+        } else {
+            return true;
+        }
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
-    return !out || fn->read_value(c, *out);
+    if (need_value) {
+        return fn->read_value(c, *out);
+    } else {
+        return true;
+    }
 }
 
 TKTRIE_TEMPLATE
@@ -1966,11 +2001,6 @@ bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
         if (path.nodes[i]->version() != path.versions[i]) return false;
     }
     return true;
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::contains_impl(ptr_t n, std::string_view key) const noexcept {
-    return read_impl(n, key, nullptr);  
 }
 
 TKTRIE_TEMPLATE
@@ -2051,14 +2081,15 @@ bool TKTRIE_CLASS::contains(const Key& key) const {
             read_path path;
             
             ptr_t root = root_.load();
+            if (!root) return false;
             if (root->is_poisoned()) continue;  
             
-            bool found = read_impl_optimistic(root, kbv, nullptr, path);
+            bool found = read_impl_optimistic(root, kbv, nullptr, false, path);
             if (validate_read_path(path)) return found;
         }
-        return contains_impl(root_.load(), kbv);
+        return read_impl(root_.load(), kbv, nullptr, false);
     } else {
-        return contains_impl(root_.load(), kbv);
+        return read_impl(root_.load(), kbv, nullptr, false);
     }
 }
 
@@ -2105,17 +2136,17 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             if (!root) return end();
             if (root->is_poisoned()) continue;
             
-            bool found = read_impl_optimistic(root, kbv, &value, path);
+            bool found = read_impl_optimistic(root, kbv, &value, true, path);
             if (validate_read_path(path)) {
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
         }
-        if (read_impl(root_.load(), kbv, &value)) {
+        if (read_impl(root_.load(), kbv, &value, true)) {
             return iterator(this, kbv, value);
         }
     } else {
-        if (read_impl(root_.load(), kbv, &value)) {
+        if (read_impl(root_.load(), kbv, &value, true)) {
             return iterator(this, kbv, value);
         }
     }
