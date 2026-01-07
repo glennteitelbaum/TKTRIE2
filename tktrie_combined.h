@@ -2,7 +2,7 @@
 // =============================================================================
 // TKTRIE - Combined Single-Header File (C++23)
 // A high-performance concurrent trie for integer and string keys
-// Fully per-trie EBR - no global state
+// Fully per-trie EBR with cache-line padded reader slots
 // =============================================================================
 
 #include <algorithm>
@@ -181,32 +181,33 @@ template <typename T>
 constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
 // =============================================================================
-// SMALL_LIST - packed list of up to 7 chars in single atomic uint64
+// SMALL_LIST - packed list of up to 7 chars in single uint64
 // Layout: [count:8][char6:8][char5:8][char4:8][char3:8][char2:8][char1:8][char0:8]
+// Templated on THREADED to avoid atomic overhead when not needed
 // =============================================================================
 
+template <bool THREADED>
 class small_list {
-    std::atomic<uint64_t> data_{0};
+    atomic_storage<uint64_t, THREADED> data_{0};
 public:
     constexpr small_list() noexcept = default;
     
-    small_list(const small_list& o) noexcept 
-        : data_(o.data_.load(std::memory_order_relaxed)) {}
+    small_list(const small_list& o) noexcept : data_(o.data_.load()) {}
     small_list& operator=(const small_list& o) noexcept {
-        data_.store(o.data_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        data_.store(o.data_.load());
         return *this;
     }
     
     int count() const noexcept { 
-        return static_cast<int>((data_.load(std::memory_order_acquire) >> 56) & 0xFF); 
+        return static_cast<int>((data_.load() >> 56) & 0xFF); 
     }
     
     unsigned char char_at(int i) const noexcept {
-        return static_cast<unsigned char>((data_.load(std::memory_order_acquire) >> (i * 8)) & 0xFF);
+        return static_cast<unsigned char>((data_.load() >> (i * 8)) & 0xFF);
     }
     
     int find(unsigned char c) const noexcept {
-        uint64_t d = data_.load(std::memory_order_acquire);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         [[assume(n >= 0 && n < 8)]];
         for (int i = 0; i < n; ++i) {
@@ -216,31 +217,28 @@ public:
     }
     
     int add(unsigned char c) noexcept {
-        uint64_t d = data_.load(std::memory_order_relaxed);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         [[assume(n >= 0 && n < 7)]];  // Must have room to add
-        // Clear count, set new char at position n, set new count
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
             (static_cast<uint64_t>(n + 1) << 56);
-        data_.store(d, std::memory_order_release);
+        data_.store(d);
         return n;
     }
     
     void remove_at(int idx) noexcept {
-        uint64_t d = data_.load(std::memory_order_relaxed);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         [[assume(n >= 0 && n < 8)]];
         [[assume(idx >= 0 && idx < n)]];
-        // Shift chars down
         for (int i = idx; i < n - 1; ++i) {
             unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
             d &= ~(0xFFULL << (i * 8));
             d |= (static_cast<uint64_t>(next) << (i * 8));
         }
-        // Clear last slot and decrement count
         d &= ~(0xFFULL << ((n - 1) * 8));
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(n - 1) << 56);
-        data_.store(d, std::memory_order_release);
+        data_.store(d);
     }
 };
 
@@ -805,7 +803,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     static constexpr int MAX_CHILDREN = 7;
     
-    small_list chars;
+    small_list<THREADED> chars;
     std::array<data_t, MAX_CHILDREN> values;
     
     list_node() = default;
@@ -873,7 +871,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     static constexpr int MAX_CHILDREN = 7;
     
-    small_list chars;
+    small_list<THREADED> chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     list_node() = default;
@@ -964,7 +962,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     static constexpr int MAX_CHILDREN = 7;
     
     eos_data_t eos;
-    small_list chars;
+    small_list<THREADED> chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     list_node() = default;
@@ -1279,7 +1277,7 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
-    small_list chars{};
+    small_list<THREADED> chars{};
     std::array<void*, 7> dummy_children{};
     
     constexpr not_found_storage() noexcept 
@@ -1740,7 +1738,6 @@ public:
     // No global state - each trie manages its own readers and retired nodes
     // -------------------------------------------------------------------------
     static constexpr size_t EBR_MIN_RETIRED = 64;      // Writers cleanup at this threshold
-    static constexpr size_t EBR_MAX_READER_SLOTS = 64; // Reader epoch slots (hash by thread)
 
 private:
     atomic_ptr root_;
@@ -1749,12 +1746,19 @@ private:
     builder_t builder_;
     
     // Epoch counter: bumped on writes, used for read validation AND EBR
-    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
+    alignas(64) std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
     
-    // Per-trie reader tracking: reader_epochs_[slot] = epoch when reader entered (0 = inactive)
-    // Slot collisions are safe: we see older epoch, delay reclamation conservatively
+    // Per-trie reader tracking with cache-line padding to prevent false sharing
+    // Each slot is 64 bytes to ensure no two threads share a cache line
+    // Using 16 slots = 1KB per trie (reasonable memory, good coverage)
+    static constexpr size_t EBR_PADDED_SLOTS = 16;
+    
+    struct alignas(64) PaddedReaderSlot {
+        std::atomic<uint64_t> epoch{0};  // 0 = inactive
+    };
+    
     std::conditional_t<THREADED, 
-        std::array<std::atomic<uint64_t>, EBR_MAX_READER_SLOTS>,
+        std::array<PaddedReaderSlot, EBR_PADDED_SLOTS>,
         std::array<uint64_t, 1>> reader_epochs_{};
     
     // Lock-free retired list using embedded fields in nodes (MPSC)
@@ -2018,19 +2022,19 @@ void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reader_enter() const noexcept {
     if constexpr (THREADED) {
-        size_t slot = thread_slot_hash(EBR_MAX_READER_SLOTS);
+        size_t slot = thread_slot_hash(EBR_PADDED_SLOTS);
         uint64_t epoch = epoch_.load(std::memory_order_acquire);
-        const_cast<std::atomic<uint64_t>&>(reader_epochs_[slot])
-            .store(epoch, std::memory_order_release);
+        const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
+            .epoch.store(epoch, std::memory_order_release);
     }
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reader_exit() const noexcept {
     if constexpr (THREADED) {
-        size_t slot = thread_slot_hash(EBR_MAX_READER_SLOTS);
-        const_cast<std::atomic<uint64_t>&>(reader_epochs_[slot])
-            .store(0, std::memory_order_release);
+        size_t slot = thread_slot_hash(EBR_PADDED_SLOTS);
+        const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
+            .epoch.store(0, std::memory_order_release);
     }
 }
 
@@ -2039,8 +2043,8 @@ uint64_t TKTRIE_CLASS::min_reader_epoch() const noexcept {
     if constexpr (THREADED) {
         uint64_t current = epoch_.load(std::memory_order_acquire);
         uint64_t min_e = current;
-        for (size_t i = 0; i < EBR_MAX_READER_SLOTS; ++i) {
-            uint64_t e = reader_epochs_[i].load(std::memory_order_acquire);
+        for (size_t i = 0; i < EBR_PADDED_SLOTS; ++i) {
+            uint64_t e = reader_epochs_[i].epoch.load(std::memory_order_acquire);
             if (e != 0 && e < min_e) {
                 min_e = e;
             }

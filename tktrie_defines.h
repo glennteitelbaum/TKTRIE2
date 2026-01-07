@@ -166,32 +166,33 @@ template <typename T>
 constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
 // =============================================================================
-// SMALL_LIST - packed list of up to 7 chars in single atomic uint64
+// SMALL_LIST - packed list of up to 7 chars in single uint64
 // Layout: [count:8][char6:8][char5:8][char4:8][char3:8][char2:8][char1:8][char0:8]
+// Templated on THREADED to avoid atomic overhead when not needed
 // =============================================================================
 
+template <bool THREADED>
 class small_list {
-    std::atomic<uint64_t> data_{0};
+    atomic_storage<uint64_t, THREADED> data_{0};
 public:
     constexpr small_list() noexcept = default;
     
-    small_list(const small_list& o) noexcept 
-        : data_(o.data_.load(std::memory_order_relaxed)) {}
+    small_list(const small_list& o) noexcept : data_(o.data_.load()) {}
     small_list& operator=(const small_list& o) noexcept {
-        data_.store(o.data_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        data_.store(o.data_.load());
         return *this;
     }
     
     int count() const noexcept { 
-        return static_cast<int>((data_.load(std::memory_order_acquire) >> 56) & 0xFF); 
+        return static_cast<int>((data_.load() >> 56) & 0xFF); 
     }
     
     unsigned char char_at(int i) const noexcept {
-        return static_cast<unsigned char>((data_.load(std::memory_order_acquire) >> (i * 8)) & 0xFF);
+        return static_cast<unsigned char>((data_.load() >> (i * 8)) & 0xFF);
     }
     
     int find(unsigned char c) const noexcept {
-        uint64_t d = data_.load(std::memory_order_acquire);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         [[assume(n >= 0 && n < 8)]];
         for (int i = 0; i < n; ++i) {
@@ -201,31 +202,28 @@ public:
     }
     
     int add(unsigned char c) noexcept {
-        uint64_t d = data_.load(std::memory_order_relaxed);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         [[assume(n >= 0 && n < 7)]];  // Must have room to add
-        // Clear count, set new char at position n, set new count
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
             (static_cast<uint64_t>(n + 1) << 56);
-        data_.store(d, std::memory_order_release);
+        data_.store(d);
         return n;
     }
     
     void remove_at(int idx) noexcept {
-        uint64_t d = data_.load(std::memory_order_relaxed);
+        uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
         [[assume(n >= 0 && n < 8)]];
         [[assume(idx >= 0 && idx < n)]];
-        // Shift chars down
         for (int i = idx; i < n - 1; ++i) {
             unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
             d &= ~(0xFFULL << (i * 8));
             d |= (static_cast<uint64_t>(next) << (i * 8));
         }
-        // Clear last slot and decrement count
         d &= ~(0xFFULL << ((n - 1) * 8));
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(n - 1) << 56);
-        data_.store(d, std::memory_order_release);
+        data_.store(d);
     }
 };
 

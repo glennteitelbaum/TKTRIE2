@@ -242,7 +242,6 @@ public:
     // No global state - each trie manages its own readers and retired nodes
     // -------------------------------------------------------------------------
     static constexpr size_t EBR_MIN_RETIRED = 64;      // Writers cleanup at this threshold
-    static constexpr size_t EBR_MAX_READER_SLOTS = 64; // Reader epoch slots (hash by thread)
 
 private:
     atomic_ptr root_;
@@ -251,12 +250,19 @@ private:
     builder_t builder_;
     
     // Epoch counter: bumped on writes, used for read validation AND EBR
-    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
+    alignas(64) std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
     
-    // Per-trie reader tracking: reader_epochs_[slot] = epoch when reader entered (0 = inactive)
-    // Slot collisions are safe: we see older epoch, delay reclamation conservatively
+    // Per-trie reader tracking with cache-line padding to prevent false sharing
+    // Each slot is 64 bytes to ensure no two threads share a cache line
+    // Using 16 slots = 1KB per trie (reasonable memory, good coverage)
+    static constexpr size_t EBR_PADDED_SLOTS = 16;
+    
+    struct alignas(64) PaddedReaderSlot {
+        std::atomic<uint64_t> epoch{0};  // 0 = inactive
+    };
+    
     std::conditional_t<THREADED, 
-        std::array<std::atomic<uint64_t>, EBR_MAX_READER_SLOTS>,
+        std::array<PaddedReaderSlot, EBR_PADDED_SLOTS>,
         std::array<uint64_t, 1>> reader_epochs_{};
     
     // Lock-free retired list using embedded fields in nodes (MPSC)

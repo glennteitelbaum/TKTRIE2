@@ -262,7 +262,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     static constexpr int MAX_CHILDREN = 7;
     
-    small_list chars;
+    small_list<THREADED> chars;
     std::array<data_t, MAX_CHILDREN> values;
     
     list_node() = default;
@@ -330,7 +330,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     static constexpr int MAX_CHILDREN = 7;
     
-    small_list chars;
+    small_list<THREADED> chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     list_node() = default;
@@ -421,7 +421,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     static constexpr int MAX_CHILDREN = 7;
     
     eos_data_t eos;
-    small_list chars;
+    small_list<THREADED> chars;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     list_node() = default;
@@ -736,7 +736,7 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
-    small_list chars{};
+    small_list<THREADED> chars{};
     std::array<void*, 7> dummy_children{};
     
     constexpr not_found_storage() noexcept 

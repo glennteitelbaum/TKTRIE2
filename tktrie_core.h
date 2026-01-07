@@ -53,19 +53,19 @@ void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reader_enter() const noexcept {
     if constexpr (THREADED) {
-        size_t slot = thread_slot_hash(EBR_MAX_READER_SLOTS);
+        size_t slot = thread_slot_hash(EBR_PADDED_SLOTS);
         uint64_t epoch = epoch_.load(std::memory_order_acquire);
-        const_cast<std::atomic<uint64_t>&>(reader_epochs_[slot])
-            .store(epoch, std::memory_order_release);
+        const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
+            .epoch.store(epoch, std::memory_order_release);
     }
 }
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reader_exit() const noexcept {
     if constexpr (THREADED) {
-        size_t slot = thread_slot_hash(EBR_MAX_READER_SLOTS);
-        const_cast<std::atomic<uint64_t>&>(reader_epochs_[slot])
-            .store(0, std::memory_order_release);
+        size_t slot = thread_slot_hash(EBR_PADDED_SLOTS);
+        const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
+            .epoch.store(0, std::memory_order_release);
     }
 }
 
@@ -74,8 +74,8 @@ uint64_t TKTRIE_CLASS::min_reader_epoch() const noexcept {
     if constexpr (THREADED) {
         uint64_t current = epoch_.load(std::memory_order_acquire);
         uint64_t min_e = current;
-        for (size_t i = 0; i < EBR_MAX_READER_SLOTS; ++i) {
-            uint64_t e = reader_epochs_[i].load(std::memory_order_acquire);
+        for (size_t i = 0; i < EBR_PADDED_SLOTS; ++i) {
+            uint64_t e = reader_epochs_[i].epoch.load(std::memory_order_acquire);
             if (e != 0 && e < min_e) {
                 min_e = e;
             }
