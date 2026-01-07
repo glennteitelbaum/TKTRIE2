@@ -122,10 +122,23 @@ public:
         int len = 0;
         
         void clear() noexcept { len = 0; }
+        
+        // Original push (for non-THREADED or when poison already checked)
         bool push(ptr_t n) noexcept {
             if (len >= MAX_DEPTH) return false;
             nodes[len] = n;
             versions[len] = n->version();
+            ++len;
+            return true;
+        }
+        
+        // Combined push + poison check (single header load)
+        bool push_checked(ptr_t n) noexcept {
+            if (len >= MAX_DEPTH) return false;
+            uint64_t h = n->header();  // Single atomic load
+            if (is_poisoned_header(h)) return false;
+            nodes[len] = n;
+            versions[len] = get_version(h);
             ++len;
             return true;
         }
@@ -135,7 +148,8 @@ public:
     // Speculative insert types
     // -------------------------------------------------------------------------
     enum class spec_op {
-        EXISTS, IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
+        EXISTS, RETRY,  // RETRY = need to re-probe (concurrent write detected)
+        IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
         SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
         SPLIT_LEAF_LIST, PREFIX_LEAF_LIST, ADD_EOS_LEAF_LIST, LIST_TO_FULL_LEAF,
         DEMOTE_LEAF_LIST, SPLIT_INTERIOR, PREFIX_INTERIOR, ADD_CHILD_CONVERT,
@@ -234,6 +248,10 @@ private:
     atomic_counter<THREADED> size_;
     mutable mutex_t mutex_;
     builder_t builder_;
+    
+    // Write sequence counter: bumped on any structural change
+    // Readers snapshot at start, check unchanged at end for fast validation
+    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> write_seq_{0};
     
     // Lock-free retired list using embedded fields in nodes (MPSC)
     std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};

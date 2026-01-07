@@ -13,6 +13,9 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
     // Returns (erased, retired_any)
     auto apply_erase_result = [this](erase_result& res) -> std::pair<bool, bool> {
         if (!res.erased) return {false, false};
+        if constexpr (THREADED) {
+            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+        }
         if (res.deleted_subtree) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             root_.store(nullptr);
@@ -53,6 +56,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
                     ebr_slot_ref.exit();
                     return {true, false};
@@ -64,6 +68,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
                     ebr_slot_ref.exit();
                     return {true, false};
@@ -82,6 +87,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 }
                 
                 if (commit_erase_speculative(info, alloc)) {
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     // Retire old nodes
                     bool retired_any = false;
                     if (info.target) {

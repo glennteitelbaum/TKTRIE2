@@ -223,9 +223,8 @@ TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept
     requires NEED_VALUE {
-    if (!n || n->is_poisoned()) return false;
-    
-    if (!path.push(n)) return false;
+    if (!n) return false;
+    if (!path.push_checked(n)) return false;  // Single header load for poison + version
     
     // Unified loop: consume skip for every node
     while (true) {
@@ -242,11 +241,11 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
         key.remove_prefix(1);
         n = n->get_child(c);
         
-        if (!n || n->is_poisoned()) return false;
-        if (!path.push(n)) return false;
+        if (!n) return false;
+        if (!path.push_checked(n)) return false;  // Single header load
     }
     
-    // Leaf node: skip already consumed, poison already checked in loop
+    // Leaf node: skip already consumed, poison already checked in push_checked
     if (n->is_skip()) {
         if (!key.empty()) return false;
         return n->as_skip()->value.try_read(out);
@@ -271,9 +270,8 @@ TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, read_path& path) const noexcept
     requires (!NEED_VALUE) {
-    if (!n || n->is_poisoned()) return false;
-    
-    if (!path.push(n)) return false;
+    if (!n) return false;
+    if (!path.push_checked(n)) return false;  // Single header load for poison + version
     
     // Unified loop: consume skip for every node
     while (true) {
@@ -290,11 +288,11 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
         key.remove_prefix(1);
         n = n->get_child(c);
         
-        if (!n || n->is_poisoned()) return false;
-        if (!path.push(n)) return false;
+        if (!n) return false;
+        if (!path.push_checked(n)) return false;  // Single header load
     }
     
-    // Leaf node: skip already consumed, poison already checked in loop
+    // Leaf node: skip already consumed, poison already checked in push_checked
     if (n->is_skip()) {
         return key.empty();
     }
@@ -312,8 +310,11 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
 TKTRIE_TEMPLATE
 inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     for (int i = 0; i < path.len; ++i) {
-        if (path.nodes[i]->is_poisoned()) return false;
-        if (path.nodes[i]->version() != path.versions[i]) return false;
+        // Single atomic load: poison and version are both in header
+        uint64_t h = path.nodes[i]->header();
+        if (is_poisoned_header(h) || get_version(h) != path.versions[i]) {
+            return false;
+        }
     }
     return true;
 }
@@ -404,21 +405,30 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
         slot.enter(epoch);
         
         for (int attempts = 0; attempts < 10; ++attempts) {
-            read_path path;
+            // Fast path: check write_seq before and after traversal
+            uint64_t seq_before = write_seq_.load(std::memory_order_acquire);
             
             ptr_t root = root_.load();
             if (!root) {
                 slot.exit();
                 return false;
             }
-            if (root->is_poisoned()) continue;  // Write in progress, retry
             
-            bool found = read_impl_optimistic<false>(root, kbv, path);
-            if (validate_read_path(path)) {
+            // Must check poison on root to catch sentinel (infinite loop otherwise)
+            if (root->is_poisoned()) continue;
+            
+            // Simple traversal without path recording
+            bool found = read_impl<false>(root, kbv);
+            
+            // Validate: if write_seq unchanged, result is valid
+            uint64_t seq_after = write_seq_.load(std::memory_order_acquire);
+            if (seq_before == seq_after) {
                 slot.exit();
                 return found;
             }
+            // Write happened during traversal, retry
         }
+        // Fallback: too many retries, use locked read
         bool result = read_impl<false>(root_.load(), kbv);
         slot.exit();
         return result;

@@ -12,7 +12,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     ptr_t n, std::string_view key, speculative_info& info) const noexcept {
     if (n->is_poisoned()) {
-        info.op = spec_op::EXISTS;
+        info.op = spec_op::RETRY;  // Signal retry, not EXISTS
         return info;
     }
     
@@ -81,7 +81,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
     }
 
     if (n->is_poisoned()) {
-        info.op = spec_op::EXISTS;
+        info.op = spec_op::RETRY;  // Signal retry, not EXISTS
         return info;
     }
 
@@ -143,7 +143,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         n = child;
         
         if (n->is_poisoned()) {
-            info.op = spec_op::EXISTS;
+            info.op = spec_op::RETRY;  // Signal retry, not EXISTS
             return info;
         }
         
@@ -524,6 +524,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             
             stat_attempt();
 
+            // RETRY means concurrent write detected - try again
+            if (spec.op == spec_op::RETRY) {
+                continue;
+            }
+
             if (spec.op == spec_op::EXISTS) {
                 stat_success(retry);
                 slot.exit();
@@ -545,11 +550,13 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         // Need LIST_TO_FULL - re-probe will get it
                         continue;
                     }
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     ln->add_value(c, value);
                 } else {
                     auto* fn = n->template as_full<true>();
                     if (fn->has(c)) continue;
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     fn->add_value_atomic(c, value);
                 }
@@ -572,6 +579,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         ptr_t n = spec.target;
                         if (n->has_eos()) continue;
                         
+                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         n->set_eos(value);
                         size_.fetch_add(1);
@@ -595,11 +603,13 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                             builder_.dealloc_node(child);
                             continue;  // Re-probe will get ADD_CHILD_CONVERT
                         }
+                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         ln->add_child(c, child);
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
                         if (fn->has(c)) { builder_.dealloc_node(child); continue; }
+                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         fn->add_child_atomic(c, child);
                     } else {
@@ -632,6 +642,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 
                 if (commit_speculative(spec, alloc, value)) {
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     // Retire old node
                     if (spec.target) {
                         retire_node(spec.target);
@@ -662,6 +673,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, kb, value), false};
             }
             
+            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
             if (res.new_node) {
                 root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
                 root_.store(res.new_node);
