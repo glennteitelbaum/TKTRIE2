@@ -1,11 +1,27 @@
 #pragma once
+// =============================================================================
+// TKTRIE - Combined Single-Header File
+// A high-performance concurrent trie for integer and string keys
+// =============================================================================
+//
+// Usage:
+//   #include "tktrie_combined.h"
+//   using namespace gteitelbaum;
+//   
+//   // Non-threaded trie
+//   int64_trie<int> trie;
+//   trie.insert({42, 100});
+//   
+//   // Thread-safe trie
+//   concurrent_int64_trie<int> ctrie;
+//   ctrie.insert({42, 100});
+//
+// =============================================================================
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cassert>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -19,11 +35,23 @@
 #include <utility>
 #include <vector>
 
+
+// =============================================================================
+// SECTION: tktrie_defines.h
+// =============================================================================
+
+
 #ifdef NDEBUG
 #define KTRIE_DEBUG_ASSERT(cond) ((void)0)
 #else
 #define KTRIE_DEBUG_ASSERT(cond) assert(cond)
 #endif
+
+// =============================================================================
+// PLACEMENT NEW/DESTROY UTILITIES
+// C++20 compatible, uses std::construct_at/destroy_at if available (C++20+)
+// =============================================================================
+
 template <typename T, typename... Args>
 constexpr T* ktrie_construct_at(T* p, Args&&... args) {
 #if __cplusplus >= 202002L && defined(__cpp_lib_constexpr_dynamic_alloc)
@@ -43,6 +71,10 @@ constexpr void ktrie_destroy_at(T* p) {
 }
 
 namespace gteitelbaum {
+
+// =============================================================================
+// ATOMIC STORAGE HELPERS - eliminates repeated if constexpr (THREADED) patterns
+// =============================================================================
 
 template <typename T, bool THREADED>
 class atomic_storage {
@@ -86,19 +118,33 @@ public:
         else { T old = value_; value_ &= v; return old; }
     }
 };
+
+// Convenience alias for size counters
 template <bool THREADED>
 using atomic_counter = atomic_storage<size_t, THREADED>;
 
+// =============================================================================
+// HEADER FLAGS AND CONSTANTS
+// =============================================================================
+
+// Header: [LEAF:1][SKIP:1][LIST:1][POISON:1][VERSION:60]
+// SKIP: FLAG_SKIP set (always leaf)
+// LIST: FLAG_LIST set
+// FULL: neither SKIP nor LIST set
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
-static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  
-static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  
+static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
+static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior
 static constexpr uint64_t FLAG_POISON = 1ULL << 60;
 static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
 static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POISON;
 
 static constexpr int LIST_MAX = 7;
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  
-static constexpr uint64_t NOT_FOUND_SENTINEL_HEADER = FLAG_LIST;  
+
+// Interior FULL node header with poison flag set - used for retry sentinel
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
+
+// Interior LIST node header - used for not_found sentinel
+static constexpr uint64_t NOT_FOUND_SENTINEL_HEADER = FLAG_LIST;  // LIST, not leaf, no poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
@@ -109,6 +155,8 @@ inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, uint64_t
 }
 inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
+
+// Bump version preserving flags (including poison)
 inline constexpr uint64_t bump_version(uint64_t h) noexcept {
     uint64_t flags = h & FLAGS_MASK;
     uint64_t ver = (h & VERSION_MASK) + 1;
@@ -145,39 +193,69 @@ constexpr T to_big_endian(T value) noexcept {
 template <typename T>
 constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
+// =============================================================================
+// SMALL_LIST - packed list of up to 7 chars in single atomic uint64
+// Layout: [count:8][char6:8][char5:8][char4:8][char3:8][char2:8][char1:8][char0:8]
+// =============================================================================
+
 class small_list {
-    std::array<unsigned char, 7> chars_{};
-    uint8_t count_ = 0;
+    std::atomic<uint64_t> data_{0};
 public:
     constexpr small_list() noexcept = default;
     
-    small_list(const small_list& o) noexcept = default;
-    small_list& operator=(const small_list& o) noexcept = default;
+    small_list(const small_list& o) noexcept 
+        : data_(o.data_.load(std::memory_order_relaxed)) {}
+    small_list& operator=(const small_list& o) noexcept {
+        data_.store(o.data_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
     
-    int count() const noexcept { return count_; }
+    int count() const noexcept { 
+        return static_cast<int>((data_.load(std::memory_order_acquire) >> 56) & 0xFF); 
+    }
     
-    unsigned char char_at(int i) const noexcept { return chars_[i]; }
+    unsigned char char_at(int i) const noexcept {
+        return static_cast<unsigned char>((data_.load(std::memory_order_acquire) >> (i * 8)) & 0xFF);
+    }
     
     int find(unsigned char c) const noexcept {
-        for (int i = 0; i < count_; ++i) {
-            if (chars_[i] == c) return i;
+        uint64_t d = data_.load(std::memory_order_acquire);
+        int n = static_cast<int>((d >> 56) & 0xFF);
+        for (int i = 0; i < n; ++i) {
+            if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
         }
         return -1;
     }
     
     int add(unsigned char c) noexcept {
-        int idx = count_;
-        chars_[count_++] = c;
-        return idx;
+        uint64_t d = data_.load(std::memory_order_relaxed);
+        int n = static_cast<int>((d >> 56) & 0xFF);
+        // Clear count, set new char at position n, set new count
+        d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
+            (static_cast<uint64_t>(n + 1) << 56);
+        data_.store(d, std::memory_order_release);
+        return n;
     }
     
     void remove_at(int idx) noexcept {
-        for (int i = idx; i < count_ - 1; ++i) {
-            chars_[i] = chars_[i + 1];
+        uint64_t d = data_.load(std::memory_order_relaxed);
+        int n = static_cast<int>((d >> 56) & 0xFF);
+        // Shift chars down
+        for (int i = idx; i < n - 1; ++i) {
+            unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
+            d &= ~(0xFFULL << (i * 8));
+            d |= (static_cast<uint64_t>(next) << (i * 8));
         }
-        --count_;
+        // Clear last slot and decrement count
+        d &= ~(0xFFULL << ((n - 1) * 8));
+        d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(n - 1) << 56);
+        data_.store(d, std::memory_order_release);
     }
 };
+
+// =============================================================================
+// BITMAP256 - 256-bit bitmap for FULL nodes
+// =============================================================================
 
 class bitmap256 {
     uint64_t bits_[4] = {};
@@ -196,7 +274,7 @@ public:
         return 0;
     }
     
-    
+    // Kernighan's method iteration - O(k) where k = popcount
     template <typename Fn>
     void for_each_set(Fn&& fn) const noexcept {
         for (int w = 0; w < 4; ++w) {
@@ -233,16 +311,28 @@ public:
     }
 };
 
+// =============================================================================
+// EMPTY_MUTEX - no-op mutex for non-threaded mode
+// =============================================================================
+
 struct empty_mutex {
     void lock() noexcept {}
     void unlock() noexcept {}
 };
+
+// =============================================================================
+// SKIP MATCHING
+// =============================================================================
+
+// Reader version - check if key starts with skip and consume it if so
 inline bool consume_prefix(std::string_view& key, std::string_view skip) noexcept {
     size_t sz = skip.size();
     if (sz > key.size() || std::memcmp(skip.data(), key.data(), sz) != 0) return false;
     key.remove_prefix(sz);
     return true;
 }
+
+// Insert version - returns mismatch position (needed for split operations)
 inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexcept {
     size_t min_len = skip.size() < key.size() ? skip.size() : key.size();
     if (std::memcmp(skip.data(), key.data(), min_len) == 0) return min_len;
@@ -251,19 +341,34 @@ inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexc
     return i;
 }
 
-}  
+}  // namespace gteitelbaum
+
+// =============================================================================
+// SECTION: tktrie_dataptr.h
+// =============================================================================
+
+
+
 namespace gteitelbaum {
+
+// =============================================================================
+// DATAPTR - value storage with inline optimization
+// sizeof(T) <= sizeof(T*): store T inline (atomic if THREADED)
+// sizeof(T) > sizeof(T*): store T* pointer (atomic swap for updates)
+// OPTIONAL=true forces pointer mode so has_data() can distinguish empty from zero
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, bool OPTIONAL = false>
 class dataptr {
-    
+    // For optional values, always use pointer mode so nullptr means "not set"
     static constexpr bool INLINE = !OPTIONAL && sizeof(T) <= sizeof(T*) && std::is_trivially_copyable_v<T>;
     
     using alloc_traits = std::allocator_traits<Allocator>;
     using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
     using value_alloc_traits = std::allocator_traits<value_alloc_t>;
 
-    
-    
+    // Inline: store T directly (atomic<T> if threaded)
+    // Pointer: store T* (atomic<T*> if threaded)
     std::conditional_t<INLINE,
         std::conditional_t<THREADED, std::atomic<T>, T>,
         std::conditional_t<THREADED, std::atomic<T*>, T*>
@@ -311,7 +416,7 @@ public:
     }
 
     bool has_data() const noexcept {
-        if constexpr (INLINE) return true;  
+        if constexpr (INLINE) return true;  // Inline always "has" data
         else return load_ptr() != nullptr;
     }
 
@@ -386,7 +491,7 @@ public:
     }
 
 private:
-    
+    // Inline accessors
     T load_inline() const noexcept {
         if constexpr (THREADED) return storage_.load(std::memory_order_acquire);
         else return storage_;
@@ -396,7 +501,7 @@ private:
         else storage_ = v;
     }
     
-    
+    // Pointer accessors (only used when !INLINE)
     T* load_ptr() const noexcept {
         if constexpr (THREADED) return storage_.load(std::memory_order_acquire);
         else return storage_;
@@ -411,9 +516,20 @@ private:
     }
 };
 
-}  
+}  // namespace gteitelbaum
+
+// =============================================================================
+// SECTION: tktrie_ebr.h
+// =============================================================================
+
 
 namespace gteitelbaum {
+
+// =============================================================================
+// EBR_SLOT - per-thread epoch tracking (single-field design)
+// 0 = inactive, non-zero = epoch when reader entered
+// =============================================================================
+
 class ebr_slot {
     std::atomic<uint64_t> active_epoch_{0};
     std::atomic<bool> valid_{true};
@@ -426,12 +542,12 @@ public:
         active_epoch_.store(epoch, std::memory_order_release);
     }
     
-    
+    // Exit - mark slot as inactive
     void exit() noexcept {
         active_epoch_.store(0, std::memory_order_release);
     }
     
-    
+    // Returns 0 if inactive, epoch otherwise
     uint64_t epoch() const noexcept { 
         return active_epoch_.load(std::memory_order_acquire); 
     }
@@ -445,11 +561,15 @@ public:
     }
 };
 
+// =============================================================================
+// EBR_GLOBAL - global epoch and slot management
+// =============================================================================
+
 class ebr_global {
 private:
     std::mutex slots_mutex_;
     std::vector<ebr_slot*> slots_;
-    std::atomic<uint64_t> global_epoch_{1};  
+    std::atomic<uint64_t> global_epoch_{1};  // Start at 1, 0 = inactive sentinel
     
     ebr_global() = default;
     
@@ -485,8 +605,8 @@ public:
         return global_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
     
-    
-    
+    // Compute min epoch across all slots (0s ignored as inactive)
+    // Returns current global epoch if no active readers
     uint64_t compute_min_epoch() {
         uint64_t ge = current_epoch();
         uint64_t min_e = ge;
@@ -516,9 +636,18 @@ inline ebr_slot::~ebr_slot() {
     ebr_global::instance().unregister_slot(this);
 }
 
-}  
+}  // namespace gteitelbaum
+
+// =============================================================================
+// SECTION: tktrie_node.h
+// =============================================================================
+
 
 namespace gteitelbaum {
+
+// =============================================================================
+// FORWARD DECLARATIONS
+// =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_base;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_with_skip;
@@ -526,11 +655,17 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struc
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
+
+// Forward declare sentinel getters
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept;
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept;
+
+// =============================================================================
+// SKIP_STRING - fixed or variable length skip storage
+// =============================================================================
 
 template <size_t FIXED_LEN>
 struct skip_string {
@@ -570,6 +705,10 @@ struct skip_string<0> {
     void clear() { data.clear(); }
 };
 
+// =============================================================================
+// ATOMIC_NODE_PTR - defaults to NOT_FOUND sentinel
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct atomic_node_ptr {
     using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
@@ -585,42 +724,46 @@ struct atomic_node_ptr {
     ptr_t exchange(ptr_t p) noexcept { return ptr_.exchange(p, std::memory_order_acq_rel); }
 };
 
+// =============================================================================
+// NODE_BASE - header only, type queries and dispatchers
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct node_base {
     using self_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
     using ptr_t = self_t*;
     using atomic_ptr = atomic_node_ptr<T, THREADED, Allocator, FIXED_LEN>;
-    using data_t = dataptr<T, THREADED, Allocator, false>;      
-    using eos_data_t = dataptr<T, THREADED, Allocator, true>;   
+    using data_t = dataptr<T, THREADED, Allocator, false>;      // Required values
+    using eos_data_t = dataptr<T, THREADED, Allocator, true>;   // Optional EOS values
     using skip_t = skip_string<FIXED_LEN>;
     
     atomic_storage<uint64_t, THREADED> header_;
     
-    
+    // EBR retire fields - only used when node is poisoned/retired
     uint64_t retire_epoch_ = 0;
     self_t* retire_next_ = nullptr;
     
     constexpr node_base() noexcept = default;
     constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     
-    
+    // Header access
     uint64_t header() const noexcept { return header_.load(); }
     void set_header(uint64_t h) noexcept { header_.store(h); }
     
-    
+    // Version and poison
     uint64_t version() const noexcept { return get_version(header()); }
     void bump_version() noexcept { header_.store(gteitelbaum::bump_version(header_.load())); }
     void poison() noexcept { header_.store(header_.load() | FLAG_POISON); }
     void unpoison() noexcept { header_.store(header_.load() & ~FLAG_POISON); }
     bool is_poisoned() const noexcept { return is_poisoned_header(header()); }
     
-    
+    // Type queries
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
     bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST)); }
     
-    
+    // Downcasts
     skip_node<T, THREADED, Allocator, FIXED_LEN>* as_skip() noexcept {
         return static_cast<skip_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
@@ -645,16 +788,16 @@ struct node_base {
         return static_cast<const full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
     
-    
+    // Skip access - all node types have skip via node_with_skip
     std::string_view skip_str() const noexcept {
         return static_cast<const node_with_skip<T, THREADED, Allocator, FIXED_LEN>*>(this)->skip.view();
     }
     
+    // =========================================================================
+    // DISPATCHERS - is_leaf param allows compiler to eliminate dead branches
+    // =========================================================================
     
-    
-    
-    
-    
+    // Child access (interior nodes only)
     ptr_t get_child(unsigned char c) const noexcept {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
@@ -674,7 +817,7 @@ struct node_base {
         return as_full<false>()->count();
     }
     
-    
+    // EOS access (interior nodes only, FIXED_LEN==0 only)
     bool has_eos() const noexcept {
         if constexpr (FIXED_LEN > 0) {
             return false;
@@ -705,13 +848,17 @@ struct node_base {
     
     void clear_eos() {
         if constexpr (FIXED_LEN > 0) {
-            
+            // No EOS for fixed-length keys
         } else {
             if (is_list()) [[likely]] as_list<false>()->eos.clear();
             else as_full<false>()->eos.clear();
         }
     }
 };
+
+// =============================================================================
+// NODE_WITH_SKIP - intermediate base with skip field first
+// =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct node_with_skip : node_base<T, THREADED, Allocator, FIXED_LEN> {
@@ -724,6 +871,10 @@ struct node_with_skip : node_base<T, THREADED, Allocator, FIXED_LEN> {
     constexpr explicit node_with_skip(uint64_t h) noexcept : base_t(h) {}
 };
 
+// =============================================================================
+// SKIP_NODE - skip string + single value (always leaf)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct skip_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
@@ -734,6 +885,10 @@ struct skip_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     skip_node() = default;
     ~skip_node() = default;
 };
+
+// =============================================================================
+// LIST_NODE - LEAF specialization (stores values)
+// =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct list_node<T, THREADED, Allocator, FIXED_LEN, true> 
@@ -749,12 +904,12 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     list_node() = default;
     ~list_node() = default;
     
-    
+    // Unified interface
     int count() const noexcept { return chars.count(); }
     int find(unsigned char c) const noexcept { return chars.find(c); }
     bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
     
-    
+    // Caller must verify find(c) >= 0 first
     bool read_value(int idx, T& out) const noexcept {
         return values[idx].try_read(out);
     }
@@ -795,6 +950,10 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     }
 };
 
+// =============================================================================
+// LIST_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct list_node<T, THREADED, Allocator, FIXED_LEN, false> 
     : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
@@ -810,7 +969,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     list_node() = default;
     ~list_node() = default;
     
-    
+    // Unified interface
     int count() const noexcept { return chars.count(); }
     bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
     
@@ -876,6 +1035,10 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     void copy_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const;
 };
 
+// =============================================================================
+// LIST_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator>
 struct list_node<T, THREADED, Allocator, 0, false> 
     : node_with_skip<T, THREADED, Allocator, 0> {
@@ -894,7 +1057,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     list_node() = default;
     ~list_node() = default;
     
-    
+    // Unified interface
     int count() const noexcept { return chars.count(); }
     bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
     
@@ -962,6 +1125,10 @@ struct list_node<T, THREADED, Allocator, 0, false>
     void copy_interior_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) const;
 };
 
+// =============================================================================
+// FULL_NODE - LEAF specialization (stores values)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct full_node<T, THREADED, Allocator, FIXED_LEN, true> 
     : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
@@ -974,11 +1141,11 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true>
     full_node() = default;
     ~full_node() = default;
     
-    
+    // Unified interface
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.test(c); }  
+    bool has(unsigned char c) const noexcept { return valid.test(c); }  // Non-atomic read
     
-    
+    // Caller must verify has(c) first
     bool read_value(unsigned char c, T& out) const noexcept {
         return values[c].try_read(out);
     }
@@ -1011,6 +1178,10 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true>
     }
 };
 
+// =============================================================================
+// FULL_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct full_node<T, THREADED, Allocator, FIXED_LEN, false> 
     : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
@@ -1024,7 +1195,7 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
     full_node() = default;
     ~full_node() = default;
     
-    
+    // Unified interface
     int count() const noexcept { return valid.count(); }
     bool has(unsigned char c) const noexcept { return valid.test(c); }
     
@@ -1067,6 +1238,10 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
     }
 };
 
+// =============================================================================
+// FULL_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator>
 struct full_node<T, THREADED, Allocator, 0, false> 
     : node_with_skip<T, THREADED, Allocator, 0> {
@@ -1083,7 +1258,7 @@ struct full_node<T, THREADED, Allocator, 0, false>
     full_node() = default;
     ~full_node() = default;
     
-    
+    // Unified interface
     int count() const noexcept { return valid.count(); }
     bool has(unsigned char c) const noexcept { return valid.test(c); }
     
@@ -1127,6 +1302,8 @@ struct full_node<T, THREADED, Allocator, 0, false>
         });
     }
 };
+
+// Out-of-line definitions for move_interior_to_full
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 void list_node<T, THREADED, Allocator, FIXED_LEN, false>::move_interior_to_full(
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
@@ -1151,6 +1328,8 @@ void list_node<T, THREADED, Allocator, 0, false>::move_interior_to_full(
         children[i].store(nullptr);
     }
 }
+
+// Out-of-line definitions for copy_interior_to_full
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 void list_node<T, THREADED, Allocator, FIXED_LEN, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
@@ -1173,6 +1352,10 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
         dest->children[ch].store(children[i].load());
     }
 }
+
+// =============================================================================
+// SENTINEL STORAGE TYPES - constinit compatible
+// =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
@@ -1222,6 +1405,10 @@ node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept {
         &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::retry);
 }
 
+// =============================================================================
+// NODE_BUILDER - allocation and type-safe construction
+// =============================================================================
+
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 class node_builder {
 public:
@@ -1233,11 +1420,11 @@ public:
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
-    
-    
+    // not_found_sentinel: nullptr for non-threaded, actual sentinel for threaded
+    // retry_sentinel: threaded-only
     static constexpr bool is_not_found_sentinel(ptr_t n) noexcept {
         if constexpr (!THREADED) {
-            return n == nullptr;  
+            return n == nullptr;  // not_found IS nullptr for non-threaded
         } else {
             return n == get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>();
         }
@@ -1254,7 +1441,7 @@ public:
     
     static constexpr bool is_sentinel(ptr_t n) noexcept {
         if constexpr (!THREADED) {
-            return n == nullptr;  
+            return n == nullptr;  // Only not_found (which is nullptr)
         } else {
             return is_not_found_sentinel(n) || is_retry_sentinel(n);
         }
@@ -1312,7 +1499,7 @@ public:
     void dealloc_node(ptr_t n) {
         if (!n || is_sentinel(n)) return;
         
-        
+        // If poisoned, this is a speculative node with borrowed children - don't recurse
         if (n->is_poisoned()) {
             delete_node(n);
             return;
@@ -1363,7 +1550,7 @@ public:
             return d;
         }
         
-        
+        // Interior
         if (src->is_list()) [[likely]] {
             auto* s = src->template as_list<false>();
             auto* d = new interior_list_t();
@@ -1394,21 +1581,32 @@ public:
     }
 };
 
-}  
+}  // namespace gteitelbaum
+
+// =============================================================================
+// SECTION: tktrie.h
+// =============================================================================
+
+
+
 namespace gteitelbaum {
+
+// =============================================================================
+// KEY TRAITS - provides to_bytes, from_bytes, and FIXED_LEN
+// =============================================================================
 
 template <typename Key> struct tktrie_traits;
 
 template <>
 struct tktrie_traits<std::string> {
-    static constexpr size_t FIXED_LEN = 0;  
+    static constexpr size_t FIXED_LEN = 0;  // Variable length
     static std::string_view to_bytes(const std::string& k) noexcept { return k; }
     static std::string from_bytes(std::string_view b) { return std::string(b); }
 };
 
 template <typename T> requires std::is_integral_v<T>
 struct tktrie_traits<T> {
-    static constexpr size_t FIXED_LEN = sizeof(T);  
+    static constexpr size_t FIXED_LEN = sizeof(T);  // Fixed length
     using unsigned_t = std::make_unsigned_t<T>;
     using bytes_t = std::array<char, sizeof(T)>;
     
@@ -1433,8 +1631,14 @@ struct tktrie_traits<T> {
             return static_cast<T>(sortable);
     }
 };
+
+// Forward declarations
 template <typename Key, typename T, bool THREADED, typename Allocator>
 class tktrie_iterator;
+
+// =============================================================================
+// TKTRIE CLASS DECLARATION
+// =============================================================================
 
 template <typename Key, typename T, bool THREADED = false, typename Allocator = std::allocator<uint64_t>>
 class tktrie {
@@ -1450,14 +1654,14 @@ public:
     using iterator = tktrie_iterator<Key, T, THREADED, Allocator>;
     using mutex_t = std::conditional_t<THREADED, std::mutex, empty_mutex>;
 
+    // -------------------------------------------------------------------------
+    // Result types
+    // -------------------------------------------------------------------------
     
-    
-    
-    
-    
-    
+    // Small fixed-capacity list for retired nodes (avoids heap allocation)
+    // Max 4: typical is 1-2, worst case split/collapse is 3
     struct retired_list {
-        ptr_t nodes[4];  
+        ptr_t nodes[4];  // Not initialized - only count elements are valid
         uint8_t count = 0;
         
         void push_back(ptr_t n) noexcept { nodes[count++] = n; }
@@ -1486,9 +1690,9 @@ public:
         unsigned char edge;
     };
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Optimistic read types (for lock-free reads)
+    // -------------------------------------------------------------------------
     struct read_path {
         static constexpr int MAX_DEPTH = 64;
         std::array<ptr_t, MAX_DEPTH> nodes{};
@@ -1496,6 +1700,8 @@ public:
         int len = 0;
         
         void clear() noexcept { len = 0; }
+        
+        // Original push (for non-THREADED or when poison already checked)
         bool push(ptr_t n) noexcept {
             if (len >= MAX_DEPTH) return false;
             nodes[len] = n;
@@ -1503,13 +1709,25 @@ public:
             ++len;
             return true;
         }
+        
+        // Combined push + poison check (single header load)
+        bool push_checked(ptr_t n) noexcept {
+            if (len >= MAX_DEPTH) return false;
+            uint64_t h = n->header();  // Single atomic load
+            if (is_poisoned_header(h)) return false;
+            nodes[len] = n;
+            versions[len] = get_version(h);
+            ++len;
+            return true;
+        }
     };
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Speculative insert types
+    // -------------------------------------------------------------------------
     enum class spec_op {
-        EXISTS, IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
+        EXISTS, RETRY,  // RETRY = need to re-probe (concurrent write detected)
+        IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
         SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
         SPLIT_LEAF_LIST, PREFIX_LEAF_LIST, ADD_EOS_LEAF_LIST, LIST_TO_FULL_LEAF,
         DEMOTE_LEAF_LIST, SPLIT_INTERIOR, PREFIX_INTERIOR, ADD_CHILD_CONVERT,
@@ -1530,7 +1748,7 @@ public:
     };
 
     struct pre_alloc {
-        ptr_t nodes[8];  
+        ptr_t nodes[8];  // Not initialized
         int count = 0;
         ptr_t root_replacement = nullptr;
         void add(ptr_t n) { nodes[count++] = n; }
@@ -1540,8 +1758,8 @@ public:
     struct retry_stats {
         std::atomic<uint64_t> speculative_attempts{0};
         std::atomic<uint64_t> speculative_successes{0};
-        std::atomic<uint64_t> retries[8]{};  
-        std::atomic<uint64_t> fallbacks{0};  
+        std::atomic<uint64_t> retries[8]{};  // retries[i] = count that needed i retries
+        std::atomic<uint64_t> fallbacks{0};  // exceeded max retries
     };
     static retry_stats& get_retry_stats() {
         static retry_stats stats;
@@ -1559,19 +1777,19 @@ public:
     static void stat_fallback() {}
 #endif
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Speculative erase types
+    // -------------------------------------------------------------------------
     enum class erase_op {
         NOT_FOUND,
-        
+        // In-place operations (no structural change)
         IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL,
-        
-        DELETE_SKIP_LEAF,           
-        DELETE_LAST_LEAF_ENTRY,     
-        DELETE_EOS_INTERIOR,        
-        DELETE_CHILD_COLLAPSE,      
-        DELETE_CHILD_NO_COLLAPSE,   
+        // Structural operations
+        DELETE_SKIP_LEAF,           // Delete entire SKIP leaf
+        DELETE_LAST_LEAF_ENTRY,     // Delete last entry from LIST/FULL leaf  
+        DELETE_EOS_INTERIOR,        // Remove EOS from interior (may collapse)
+        DELETE_CHILD_COLLAPSE,      // Remove child and collapse to merged node
+        DELETE_CHILD_NO_COLLAPSE,   // Remove child, no collapse needed
     };
 
     struct erase_spec_info {
@@ -1583,7 +1801,7 @@ public:
         uint64_t target_version = 0;
         unsigned char c = 0;
         bool is_eos = false;
-        
+        // For collapse operations
         ptr_t collapse_child = nullptr;
         unsigned char collapse_char = 0;
         std::string target_skip;
@@ -1597,11 +1815,11 @@ public:
         void add(ptr_t n) { nodes[count++] = n; }
     };
 
-    
-    
-    
-    
-    static constexpr size_t EBR_MIN_RETIRED = 64;  
+    // -------------------------------------------------------------------------
+    // Per-trie EBR retired node tracking (lock-free MPSC linked list)
+    // Uses retire_epoch_ and retire_next_ embedded in node_base
+    // -------------------------------------------------------------------------
+    static constexpr size_t EBR_MIN_RETIRED = 64;  // Cleanup when retired count reaches this
 
 private:
     atomic_ptr root_;
@@ -1609,30 +1827,34 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
+    // Write sequence counter: bumped on any structural change
+    // Readers snapshot at start, check unchanged at end for fast validation
+    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> write_seq_{0};
     
+    // Lock-free retired list using embedded fields in nodes (MPSC)
     std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
     std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for cleanup
     
-    
-    void ebr_retire(ptr_t n, uint64_t epoch);      
-    void ebr_cleanup();                             
-    bool ebr_should_cleanup() const;                
-    void ebr_maybe_cleanup();                       
+    // EBR helpers
+    void ebr_retire(ptr_t n, uint64_t epoch);      // Lock-free push
+    void ebr_cleanup();                             // Free reclaimable nodes (grabs ebr_mutex_)
+    bool ebr_should_cleanup() const;                // Check threshold (no lock)
+    void ebr_maybe_cleanup();                       // Check + cleanup if needed
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Static helpers
+    // -------------------------------------------------------------------------
     static void node_deleter(void* ptr);
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Instance helpers
+    // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Read operations
+    // -------------------------------------------------------------------------
     template <bool NEED_VALUE>
     bool read_impl(ptr_t n, std::string_view key, T& out) const noexcept
         requires NEED_VALUE;
@@ -1651,9 +1873,9 @@ private:
     
     bool validate_read_path(const read_path& path) const noexcept;
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Insert operations
+    // -------------------------------------------------------------------------
     insert_result insert_impl(atomic_ptr* slot, ptr_t n, std::string_view key, const T& value);
     insert_result insert_into_leaf(atomic_ptr* slot, ptr_t leaf, std::string_view key, const T& value);
     insert_result insert_into_interior(atomic_ptr* slot, ptr_t n, std::string_view key, const T& value);
@@ -1673,9 +1895,9 @@ private:
     insert_result set_interior_eos(ptr_t n, const T& value);
     insert_result add_child_to_interior(ptr_t n, unsigned char c, std::string_view remaining, const T& value);
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Speculative insert operations
+    // -------------------------------------------------------------------------
     speculative_info probe_speculative(ptr_t n, std::string_view key) const noexcept;
     speculative_info probe_leaf_speculative(ptr_t n, std::string_view key, speculative_info& info) const noexcept;
     pre_alloc allocate_speculative(const speculative_info& info, const T& value);
@@ -1687,9 +1909,9 @@ private:
     void dealloc_speculation(pre_alloc& alloc);
     std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value, bool* retired_any);
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Erase operations
+    // -------------------------------------------------------------------------
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     erase_spec_info probe_interior_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
@@ -1699,7 +1921,7 @@ private:
     bool validate_erase_path(const erase_spec_info& info) const noexcept;
     bool commit_erase_speculative(erase_spec_info& info, erase_pre_alloc& alloc);
     void dealloc_erase_speculation(erase_pre_alloc& alloc);
-    std::pair<bool, bool> erase_locked(std::string_view kb);  
+    std::pair<bool, bool> erase_locked(std::string_view kb);  // Returns (erased, retired_any)
     erase_result erase_impl(atomic_ptr* slot, ptr_t n, std::string_view key);
     erase_result erase_from_leaf(ptr_t leaf, std::string_view key);
     erase_result erase_from_interior(ptr_t n, std::string_view key);
@@ -1708,9 +1930,9 @@ private:
     erase_result collapse_single_child(ptr_t n, unsigned char c, ptr_t child, erase_result& res);
 
 public:
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Constructors / Destructor
+    // -------------------------------------------------------------------------
     tktrie();
     ~tktrie();
     tktrie(const tktrie& other);
@@ -1718,9 +1940,9 @@ public:
     tktrie(tktrie&& other) noexcept;
     tktrie& operator=(tktrie&& other) noexcept;
 
-    
-    
-    
+    // -------------------------------------------------------------------------
+    // Public interface
+    // -------------------------------------------------------------------------
     void clear();
     size_t size() const noexcept { return size_.load(); }
     bool empty() const noexcept { return size() == 0; }
@@ -1732,6 +1954,10 @@ public:
     void reclaim_retired() noexcept;
 };
 
+// =============================================================================
+// TKTRIE_ITERATOR CLASS
+// =============================================================================
+
 template <typename Key, typename T, bool THREADED, typename Allocator>
 class tktrie_iterator {
 public:
@@ -1739,8 +1965,8 @@ public:
     using traits = tktrie_traits<Key>;
     static constexpr size_t FIXED_LEN = traits::FIXED_LEN;
     
-    
-    
+    // Store bytes: array for fixed-length, string for variable-length
+    // We already converted for lookup - just keep them
     using key_storage_t = std::conditional_t<(FIXED_LEN > 0),
         std::array<char, FIXED_LEN>,
         std::string>;
@@ -1754,7 +1980,7 @@ private:
 public:
     tktrie_iterator() = default;
     
-    
+    // Constructor from string_view - stores the already-converted bytes
     tktrie_iterator(const trie_t* t, std::string_view kb, const T& v)
         : trie_(t), value_(v), valid_(true) {
         if constexpr (FIXED_LEN > 0) {
@@ -1764,7 +1990,7 @@ public:
         }
     }
 
-    
+    // Convert bytes back to Key only when requested
     Key key() const { 
         if constexpr (FIXED_LEN > 0) {
             return traits::from_bytes(std::string_view(key_bytes_.data(), FIXED_LEN));
@@ -1782,6 +2008,10 @@ public:
     }
     bool operator!=(const tktrie_iterator& o) const { return !(*this == o); }
 };
+
+// =============================================================================
+// TYPE ALIASES
+// =============================================================================
 
 template <typename T, typename Allocator = std::allocator<uint64_t>>
 using string_trie = tktrie<std::string, T, false, Allocator>;
@@ -1801,11 +2031,24 @@ using int64_trie = tktrie<int64_t, T, false, Allocator>;
 template <typename T, typename Allocator = std::allocator<uint64_t>>
 using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator>;
 
-}  
+}  // namespace gteitelbaum
+
+
+// =============================================================================
+// SECTION: tktrie_core.h
+// =============================================================================
+
+// This file contains implementation details for tktrie
+// It should only be included from tktrie.h
+
 namespace gteitelbaum {
 
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
+
+// -----------------------------------------------------------------------------
+// Static helpers
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
@@ -1815,13 +2058,17 @@ void TKTRIE_CLASS::node_deleter(void* ptr) {
     builder_t::delete_node(n);
 }
 
+// -----------------------------------------------------------------------------
+// Instance helpers
+// -----------------------------------------------------------------------------
+
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n || builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
         n->poison();
         uint64_t epoch = ebr_global::instance().current_epoch();
-        ebr_retire(n, epoch);  
+        ebr_retire(n, epoch);  // Lock-free
     } else {
         node_deleter(n);
     }
@@ -1829,7 +2076,7 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
-    
+    // Lock-free push using embedded fields in node
     if constexpr (THREADED) {
         n->retire_epoch_ = epoch;
         ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
@@ -1843,18 +2090,18 @@ void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_cleanup() {
-    
+    // Grab mutex, atomically take list, process, push back unreclaimable
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         
-        
+        // Atomically take ownership of entire retired list
         ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
         if (!list) return;
         
         uint64_t min_epoch = ebr_global::instance().compute_min_epoch();
         
-        
+        // Partition into freeable and still-retired
         ptr_t still_head = nullptr;
         size_t still_count = 0;
         
@@ -1863,19 +2110,19 @@ void TKTRIE_CLASS::ebr_cleanup() {
             list = list->retire_next_;
             
             if (curr->retire_epoch_ + 2 <= min_epoch) {
-                
+                // Safe to delete
                 node_deleter(curr);
             } else {
-                
+                // Still needs protection - prepend to still list
                 curr->retire_next_ = still_head;
                 still_head = curr;
                 ++still_count;
             }
         }
         
-        
+        // Push still-retired back (other threads may have added more)
         if (still_head) {
-            
+            // Find tail of still list
             ptr_t still_tail = still_head;
             while (still_tail->retire_next_) still_tail = still_tail->retire_next_;
             
@@ -1906,6 +2153,10 @@ void TKTRIE_CLASS::ebr_maybe_cleanup() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Read operations
+// -----------------------------------------------------------------------------
+
 TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexcept
@@ -1916,13 +2167,13 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
         if (!n) return false;
     }
     
-    
+    // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
         if (!consume_prefix(key, n->skip_str())) return false;
         
         if (n->is_leaf()) break;
         
-        
+        // Interior node: check EOS or descend
         if (key.empty()) {
             return n->try_read_eos(out);
         }
@@ -1938,13 +2189,13 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
         }
     }
     
-    
+    // Leaf node: skip already consumed, poison already checked
     if (n->is_skip()) {
         if (!key.empty()) return false;
         return n->as_skip()->value.try_read(out);
     }
     
-    
+    // LIST or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
@@ -1969,13 +2220,13 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
         if (!n) return false;
     }
     
-    
+    // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
         if (!consume_prefix(key, n->skip_str())) return false;
         
         if (n->is_leaf()) break;
         
-        
+        // Interior node: check EOS or descend
         if (key.empty()) {
             return n->has_eos();
         }
@@ -1991,12 +2242,12 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
         }
     }
     
-    
+    // Leaf node: skip already consumed, poison already checked
     if (n->is_skip()) {
         return key.empty();
     }
     
-    
+    // LIST or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
@@ -2010,17 +2261,16 @@ TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept
     requires NEED_VALUE {
-    if (!n || n->is_poisoned()) return false;
+    if (!n) return false;
+    if (!path.push_checked(n)) return false;  // Single header load for poison + version
     
-    if (!path.push(n)) return false;
-    
-    
+    // Unified loop: consume skip for every node
     while (true) {
         if (!consume_prefix(key, n->skip_str())) return false;
         
         if (n->is_leaf()) break;
         
-        
+        // Interior node: check EOS or descend
         if (key.empty()) {
             return n->try_read_eos(out);
         }
@@ -2029,17 +2279,17 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
         key.remove_prefix(1);
         n = n->get_child(c);
         
-        if (!n || n->is_poisoned()) return false;
-        if (!path.push(n)) return false;
+        if (!n) return false;
+        if (!path.push_checked(n)) return false;  // Single header load
     }
     
-    
+    // Leaf node: skip already consumed, poison already checked in push_checked
     if (n->is_skip()) {
         if (!key.empty()) return false;
         return n->as_skip()->value.try_read(out);
     }
     
-    
+    // LIST or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
@@ -2058,17 +2308,16 @@ TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, read_path& path) const noexcept
     requires (!NEED_VALUE) {
-    if (!n || n->is_poisoned()) return false;
+    if (!n) return false;
+    if (!path.push_checked(n)) return false;  // Single header load for poison + version
     
-    if (!path.push(n)) return false;
-    
-    
+    // Unified loop: consume skip for every node
     while (true) {
         if (!consume_prefix(key, n->skip_str())) return false;
         
         if (n->is_leaf()) break;
         
-        
+        // Interior node: check EOS or descend
         if (key.empty()) {
             return n->has_eos();
         }
@@ -2077,16 +2326,16 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
         key.remove_prefix(1);
         n = n->get_child(c);
         
-        if (!n || n->is_poisoned()) return false;
-        if (!path.push(n)) return false;
+        if (!n) return false;
+        if (!path.push_checked(n)) return false;  // Single header load
     }
     
-    
+    // Leaf node: skip already consumed, poison already checked in push_checked
     if (n->is_skip()) {
         return key.empty();
     }
     
-    
+    // LIST or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
@@ -2099,11 +2348,18 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
 TKTRIE_TEMPLATE
 inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     for (int i = 0; i < path.len; ++i) {
-        if (path.nodes[i]->is_poisoned()) return false;
-        if (path.nodes[i]->version() != path.versions[i]) return false;
+        // Single atomic load: poison and version are both in header
+        uint64_t h = path.nodes[i]->header();
+        if (is_poisoned_header(h) || get_version(h) != path.versions[i]) {
+            return false;
+        }
     }
     return true;
 }
+
+// -----------------------------------------------------------------------------
+// Public interface
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 TKTRIE_CLASS::tktrie() : root_(nullptr) {}
@@ -2160,7 +2416,7 @@ void TKTRIE_CLASS::clear() {
     }
     size_.store(0);
     if constexpr (THREADED) {
-        
+        // Drain and delete entire retired list
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
@@ -2177,7 +2433,7 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
-        
+        // Readers rarely cleanup - only if list gets very large (2x threshold)
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
@@ -2187,21 +2443,30 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
         slot.enter(epoch);
         
         for (int attempts = 0; attempts < 10; ++attempts) {
-            read_path path;
+            // Fast path: check write_seq before and after traversal
+            uint64_t seq_before = write_seq_.load(std::memory_order_acquire);
             
             ptr_t root = root_.load();
             if (!root) {
                 slot.exit();
                 return false;
             }
-            if (root->is_poisoned()) continue;  
             
-            bool found = read_impl_optimistic<false>(root, kbv, path);
-            if (validate_read_path(path)) {
+            // Must check poison on root to catch sentinel (infinite loop otherwise)
+            if (root->is_poisoned()) continue;
+            
+            // Simple traversal without path recording
+            bool found = read_impl<false>(root, kbv);
+            
+            // Validate: if write_seq unchanged, result is valid
+            uint64_t seq_after = write_seq_.load(std::memory_order_acquire);
+            if (seq_before == seq_after) {
                 slot.exit();
                 return found;
             }
+            // Write happened during traversal, retry
         }
+        // Fallback: too many retries, use locked read
         bool result = read_impl<false>(root_.load(), kbv);
         slot.exit();
         return result;
@@ -2218,8 +2483,8 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert(const std:
     auto result = insert_locked(kv.first, kbv, kv.second, &retired_any);
     if constexpr (THREADED) {
         if (retired_any) {
-            ebr_global::instance().advance_epoch();  
-            ebr_maybe_cleanup();  
+            ebr_global::instance().advance_epoch();  // Atomic, no lock
+            ebr_maybe_cleanup();  // Grabs lock only if needed
         }
     }
     return result;
@@ -2232,8 +2497,8 @@ bool TKTRIE_CLASS::erase(const Key& key) {
     auto [erased, retired_any] = erase_locked(kbv);
     if constexpr (THREADED) {
         if (retired_any) {
-            ebr_global::instance().advance_epoch();  
-            ebr_maybe_cleanup();  
+            ebr_global::instance().advance_epoch();  // Atomic, no lock
+            ebr_maybe_cleanup();  // Grabs lock only if needed
         }
     }
     return erased;
@@ -2245,7 +2510,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     std::string_view kbv(kb.data(), kb.size());
     T value;
     if constexpr (THREADED) {
-        
+        // Readers rarely cleanup - only if list gets very large (2x threshold)
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
@@ -2286,10 +2551,10 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
-        
+        // Take ownership of entire list
         ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
-        
+        // Free everything
         while (list) {
             ptr_t curr = list;
             list = list->retire_next_;
@@ -2301,11 +2566,24 @@ void TKTRIE_CLASS::reclaim_retired() noexcept {
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
-}  
+}  // namespace gteitelbaum
+
+
+// =============================================================================
+// SECTION: tktrie_insert.h
+// =============================================================================
+
+// This file contains implementation details for tktrie (insert operations)
+// It should only be included from tktrie_core.h
+
 namespace gteitelbaum {
 
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
+
+// -----------------------------------------------------------------------------
+// Insert operations
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_impl(
@@ -2781,7 +3059,16 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
-}  
+}  // namespace gteitelbaum
+
+
+// =============================================================================
+// SECTION: tktrie_insert_probe.h
+// =============================================================================
+
+// This file contains speculative insert probing for concurrent operations
+// It should only be included from tktrie_insert.h
+
 namespace gteitelbaum {
 
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
@@ -2791,7 +3078,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     ptr_t n, std::string_view key, speculative_info& info) const noexcept {
     if (n->is_poisoned()) {
-        info.op = spec_op::EXISTS;
+        info.op = spec_op::RETRY;  // Signal retry, not EXISTS
         return info;
     }
     
@@ -2860,7 +3147,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
     }
 
     if (n->is_poisoned()) {
-        info.op = spec_op::EXISTS;
+        info.op = spec_op::RETRY;  // Signal retry, not EXISTS
         return info;
     }
 
@@ -2922,7 +3209,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         n = child;
         
         if (n->is_poisoned()) {
-            info.op = spec_op::EXISTS;
+            info.op = spec_op::RETRY;  // Signal retry, not EXISTS
             return info;
         }
         
@@ -2942,8 +3229,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     std::string_view skip = info.target_skip;
     size_t m = info.match_pos;
 
-    
-    
+    // Allocate AND fill data outside lock - speculative reads are validated later
+    // All new nodes are poisoned so dealloc_node won't recurse into borrowed children
     switch (info.op) {
     case spec_op::EMPTY_TREE: {
         alloc.root_replacement = create_leaf_for_key(key, value);
@@ -3093,7 +3380,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 
         ptr_t new_int = builder_.make_interior_list(common);
         ptr_t old_child;
-        
+        // Copy interior with borrowed children (poison prevents recursive delete)
         if (info.target->is_list()) {
             old_child = builder_.make_interior_list(skip.substr(m + 1));
             info.target->template as_list<false>()->copy_interior_to(old_child->template as_list<false>());
@@ -3122,7 +3409,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             new_int->set_eos(value);
         }
         ptr_t old_child;
-        
+        // Copy interior with borrowed children (poison prevents recursive delete)
         if (info.target->is_list()) {
             old_child = builder_.make_interior_list(skip.substr(m + 1));
             info.target->template as_list<false>()->copy_interior_to(old_child->template as_list<false>());
@@ -3141,7 +3428,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         break;
     }
     case spec_op::ADD_CHILD_CONVERT: {
-        
+        // LIST interior full, convert to FULL - copy children (poison prevents recursive delete)
         ptr_t full = builder_.make_interior_full(std::string(skip));
         info.target->template as_list<false>()->copy_interior_to_full(full->template as_full<false>());
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
@@ -3155,7 +3442,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         alloc.add(child);
         break;
     }
-    
+    // These are handled differently (in-place or complex)
     case spec_op::EXISTS:
     case spec_op::IN_PLACE_LEAF:
     case spec_op::IN_PLACE_INTERIOR:
@@ -3210,12 +3497,12 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_speculative(
     speculative_info& info, pre_alloc& alloc, [[maybe_unused]] const T& value) {
     
-    
-    
+    // All data already filled in allocate_speculative - just validate and swap
+    // On success, unpoison all nodes so they become live
     switch (info.op) {
     case spec_op::EMPTY_TREE:
         if (root_.load() != nullptr) return false;
-        
+        // Unpoison before making visible
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
         }
@@ -3233,7 +3520,7 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::ADD_CHILD_CONVERT: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
-        
+        // Unpoison before making visible
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
         }
@@ -3241,7 +3528,7 @@ bool TKTRIE_CLASS::commit_speculative(
         return true;
     }
 
-    
+    // These should not reach commit_speculative
     case spec_op::EXISTS:
     case spec_op::IN_PLACE_LEAF:
     case spec_op::IN_PLACE_INTERIOR:
@@ -3254,7 +3541,7 @@ bool TKTRIE_CLASS::commit_speculative(
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_speculation(pre_alloc& alloc) {
-    
+    // Iterate all allocated nodes - dealloc_node handles poison (won't recurse into borrowed children)
     for (int i = 0; i < alloc.count; ++i) {
         if (alloc.nodes[i]) {
             builder_.dealloc_node(alloc.nodes[i]);
@@ -3289,7 +3576,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, kb, value), true};
     } else {
-        
+        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
         ebr_maybe_cleanup();
         
         auto& slot = get_ebr_slot();
@@ -3303,13 +3590,18 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             
             stat_attempt();
 
+            // RETRY means concurrent write detected - try again
+            if (spec.op == spec_op::RETRY) {
+                continue;
+            }
+
             if (spec.op == spec_op::EXISTS) {
                 stat_success(retry);
                 slot.exit();
                 return {iterator(this, kb, value), false};
             }
 
-            
+            // In-place leaf - no allocation, brief lock
             if (spec.op == spec_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_path(spec)) continue;
@@ -3321,14 +3613,16 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     auto* ln = n->template as_list<true>();
                     if (ln->has(c)) continue;
                     if (ln->count() >= LIST_MAX) {
-                        
+                        // Need LIST_TO_FULL - re-probe will get it
                         continue;
                     }
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     ln->add_value(c, value);
                 } else {
                     auto* fn = n->template as_full<true>();
                     if (fn->has(c)) continue;
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     fn->add_value_atomic(c, value);
                 }
@@ -3338,11 +3632,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, kb, value), true};
             }
 
-            
+            // In-place interior - brief lock
             if (spec.op == spec_op::IN_PLACE_INTERIOR) {
                 if (spec.is_eos) {
                     if constexpr (FIXED_LEN > 0) {
-                        
+                        // Can't happen for fixed-length keys
                         continue;
                     } else {
                         std::lock_guard<mutex_t> lock(mutex_);
@@ -3351,6 +3645,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         ptr_t n = spec.target;
                         if (n->has_eos()) continue;
                         
+                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         n->set_eos(value);
                         size_.fetch_add(1);
@@ -3359,7 +3654,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         return {iterator(this, kb, value), true};
                     }
                 } else {
-                    
+                    // Adding child to interior - allocate child outside lock
                     ptr_t child = create_leaf_for_key(spec.remaining_key, value);
                     std::lock_guard<mutex_t> lock(mutex_);
                     if (!validate_path(spec)) { builder_.dealloc_node(child); continue; }
@@ -3372,13 +3667,15 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         if (ln->has(c)) { builder_.dealloc_node(child); continue; }
                         if (ln->count() >= LIST_MAX) {
                             builder_.dealloc_node(child);
-                            continue;  
+                            continue;  // Re-probe will get ADD_CHILD_CONVERT
                         }
+                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         ln->add_child(c, child);
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
                         if (fn->has(c)) { builder_.dealloc_node(child); continue; }
+                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         fn->add_child_atomic(c, child);
                     } else {
@@ -3392,15 +3689,15 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
             }
 
-            
-            
+            // Complex ops that need full speculative path (ADD_EOS_LEAF_LIST, DEMOTE_LEAF_LIST)
+            // Fall through to allocation-based speculative or fallback
             if (spec.op == spec_op::ADD_EOS_LEAF_LIST || spec.op == spec_op::DEMOTE_LEAF_LIST) {
-                
+                // These are complex - use fallback
                 if (retry == MAX_RETRIES) break;
                 continue;
             }
 
-            
+            // Speculative path: allocate outside lock, then brief lock for commit
             pre_alloc alloc = allocate_speculative(spec, value);
             
             if (alloc.root_replacement) {
@@ -3411,7 +3708,8 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 
                 if (commit_speculative(spec, alloc, value)) {
-                    
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    // Retire old node
                     if (spec.target) {
                         retire_node(spec.target);
                         if (retired_any) *retired_any = true;
@@ -3426,7 +3724,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             }
         }
         
-        
+        // Fallback after MAX_RETRIES
         stat_fallback();
         {
             std::lock_guard<mutex_t> lock(mutex_);
@@ -3441,6 +3739,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, kb, value), false};
             }
             
+            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
             if (res.new_node) {
                 root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
                 root_.store(res.new_node);
@@ -3457,11 +3756,24 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
-}  
+}  // namespace gteitelbaum
+
+
+// =============================================================================
+// SECTION: tktrie_erase_probe.h
+// =============================================================================
+
+// This file contains speculative erase probing and allocation
+// It should only be included from tktrie_insert_probe.h
+
 namespace gteitelbaum {
 
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
+
+// -----------------------------------------------------------------------------
+// Probe leaf for erase operation
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
@@ -3480,14 +3792,14 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     info.target_version = n->version();
     info.target_skip = std::string(skip);
 
-    
+    // SKIP leaf - delete entire node
     if (n->is_skip()) {
         if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
         info.op = erase_op::DELETE_SKIP_LEAF;
         return info;
     }
 
-    
+    // LIST or FULL leaf
     if (key.size() != 1) { info.op = erase_op::NOT_FOUND; return info; }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
@@ -3506,10 +3818,14 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
 
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
-    
+    // FULL leaf always in-place (never becomes empty from one removal)
     info.op = erase_op::IN_PLACE_LEAF_FULL;
     return info;
 }
+
+// -----------------------------------------------------------------------------
+// Probe interior for erase - handles EOS deletion
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
@@ -3519,7 +3835,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
     info.target_skip = std::string(n->skip_str());
     
     if (key.empty()) {
-        
+        // Deleting EOS from interior
         if constexpr (FIXED_LEN > 0) {
             info.op = erase_op::NOT_FOUND;
             return info;
@@ -3531,11 +3847,11 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
         
         int child_cnt = n->child_count();
         if (child_cnt == 0) {
-            info.op = erase_op::NOT_FOUND;  
+            info.op = erase_op::NOT_FOUND;  // Use slow path
             return info;
         }
         if (child_cnt == 1) {
-            
+            // Will collapse with single child
             unsigned char c = 0;
             ptr_t child = nullptr;
             if (n->is_list()) {
@@ -3560,6 +3876,10 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
     info.op = erase_op::NOT_FOUND;
     return info;
 }
+
+// -----------------------------------------------------------------------------
+// Main probe dispatcher
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
@@ -3606,6 +3926,10 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
 
     return probe_leaf_erase(n, key, info);
 }
+
+// -----------------------------------------------------------------------------
+// Allocate replacement nodes for erase
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
@@ -3668,6 +3992,10 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     return alloc;
 }
 
+// -----------------------------------------------------------------------------
+// Validate erase path
+// -----------------------------------------------------------------------------
+
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexcept {
     for (int i = 0; i < info.path_len; ++i) {
@@ -3683,6 +4011,10 @@ bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexce
     }
     return true;
 }
+
+// -----------------------------------------------------------------------------
+// Commit erase speculation
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_erase_speculative(
@@ -3772,6 +4104,10 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Dealloc erase speculation
+// -----------------------------------------------------------------------------
+
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
     for (int i = 0; i < alloc.count; ++i) {
@@ -3783,6 +4119,10 @@ void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
     alloc.count = 0;
     alloc.replacement = nullptr;
 }
+
+// -----------------------------------------------------------------------------
+// In-place erase handlers
+// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
@@ -3809,7 +4149,16 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
-}  
+}  // namespace gteitelbaum
+
+
+// =============================================================================
+// SECTION: tktrie_erase.h
+// =============================================================================
+
+// This file contains erase implementation
+// It should only be included from tktrie_erase_probe.h
+
 namespace gteitelbaum {
 
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
@@ -3817,9 +4166,12 @@ namespace gteitelbaum {
 
 TKTRIE_TEMPLATE
 std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
-    
+    // Returns (erased, retired_any)
     auto apply_erase_result = [this](erase_result& res) -> std::pair<bool, bool> {
         if (!res.erased) return {false, false};
+        if constexpr (THREADED) {
+            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+        }
         if (res.deleted_subtree) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             root_.store(nullptr);
@@ -3838,7 +4190,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        
+        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
         ebr_maybe_cleanup();
         
         auto& ebr_slot_ref = get_ebr_slot();
@@ -3855,11 +4207,12 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return {false, false};
             }
 
-            
+            // In-place operations - no allocation needed
             if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
                     ebr_slot_ref.exit();
                     return {true, false};
@@ -3871,6 +4224,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
                     ebr_slot_ref.exit();
                     return {true, false};
@@ -3878,7 +4232,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 continue;
             }
 
-            
+            // Speculative path: allocate outside lock, brief lock for commit
             erase_pre_alloc alloc = allocate_erase_speculative(info);
             
             {
@@ -3889,7 +4243,8 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 }
                 
                 if (commit_erase_speculative(info, alloc)) {
-                    
+                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    // Retire old nodes
                     bool retired_any = false;
                     if (info.target) {
                         retire_node(info.target);
@@ -3908,7 +4263,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             }
         }
         
-        
+        // Fallback after MAX_RETRIES
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
@@ -3917,6 +4272,8 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         }
     }
 }
+
+
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_impl(
     atomic_ptr*, ptr_t n, std::string_view key) {
@@ -4151,5 +4508,4 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
 #undef TKTRIE_TEMPLATE
 #undef TKTRIE_CLASS
 
-}  
-
+}  // namespace gteitelbaum
