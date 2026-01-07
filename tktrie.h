@@ -238,10 +238,11 @@ public:
     };
 
     // -------------------------------------------------------------------------
-    // Per-trie EBR retired node tracking (lock-free MPSC linked list)
-    // Uses retire_epoch_ and retire_next_ embedded in node_base
+    // Per-trie EBR - epoch-based reclamation with per-trie reader tracking
+    // No global state - each trie manages its own readers and retired nodes
     // -------------------------------------------------------------------------
-    static constexpr size_t EBR_MIN_RETIRED = 64;  // Cleanup when retired count reaches this
+    static constexpr size_t EBR_MIN_RETIRED = 64;      // Writers cleanup at this threshold
+    static constexpr size_t EBR_MAX_READER_SLOTS = 64; // Reader epoch slots (hash by thread)
 
 private:
     atomic_ptr root_;
@@ -249,9 +250,14 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
-    // Write sequence counter: bumped on any structural change
-    // Readers snapshot at start, check unchanged at end for fast validation
-    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> write_seq_{0};
+    // Epoch counter: bumped on writes, used for read validation AND EBR
+    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
+    
+    // Per-trie reader tracking: reader_epochs_[slot] = epoch when reader entered (0 = inactive)
+    // Slot collisions are safe: we see older epoch, delay reclamation conservatively
+    std::conditional_t<THREADED, 
+        std::array<std::atomic<uint64_t>, EBR_MAX_READER_SLOTS>,
+        std::array<uint64_t, 1>> reader_epochs_{};
     
     // Lock-free retired list using embedded fields in nodes (MPSC)
     std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
@@ -261,8 +267,9 @@ private:
     // EBR helpers
     void ebr_retire(ptr_t n, uint64_t epoch);      // Lock-free push
     void ebr_cleanup();                             // Free reclaimable nodes (grabs ebr_mutex_)
-    bool ebr_should_cleanup() const;                // Check threshold (no lock)
-    void ebr_maybe_cleanup();                       // Check + cleanup if needed
+    uint64_t min_reader_epoch() const noexcept;    // Scan slots for oldest active reader
+    void reader_enter() const noexcept;            // Store epoch in thread's slot
+    void reader_exit() const noexcept;             // Clear thread's slot
 
     // -------------------------------------------------------------------------
     // Static helpers

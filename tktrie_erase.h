@@ -14,7 +14,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
     auto apply_erase_result = [this](erase_result& res) -> std::pair<bool, bool> {
         if (!res.erased) return {false, false};
         if constexpr (THREADED) {
-            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+            epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
         }
         if (res.deleted_subtree) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
@@ -34,12 +34,12 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
-        ebr_maybe_cleanup();
+        // Writers cleanup at 1x threshold
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
+        }
         
-        auto& ebr_slot_ref = get_ebr_slot();
-        uint64_t epoch = ebr_global::instance().current_epoch();
-        ebr_slot_ref.enter(epoch);
+        reader_enter();
         
         static constexpr int MAX_RETRIES = 7;
         
@@ -47,7 +47,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             erase_spec_info info = probe_erase(root_.load(), kb);
 
             if (info.op == erase_op::NOT_FOUND) {
-                ebr_slot_ref.exit();
+                reader_exit();
                 return {false, false};
             }
 
@@ -56,9 +56,9 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
-                    ebr_slot_ref.exit();
+                    reader_exit();
                     return {true, false};
                 }
                 continue;
@@ -68,9 +68,9 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
-                    ebr_slot_ref.exit();
+                    reader_exit();
                     return {true, false};
                 }
                 continue;
@@ -87,7 +87,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 }
                 
                 if (commit_erase_speculative(info, alloc)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     // Retire old nodes
                     bool retired_any = false;
                     if (info.target) {
@@ -99,7 +99,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         retired_any = true;
                     }
                     size_.fetch_sub(1);
-                    ebr_slot_ref.exit();
+                    reader_exit();
                     return {true, retired_any};
                 }
                 dealloc_erase_speculation(alloc);
@@ -111,7 +111,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
-            ebr_slot_ref.exit();
+            reader_exit();
             return apply_erase_result(res);
         }
     }

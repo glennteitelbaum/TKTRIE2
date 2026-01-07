@@ -2,6 +2,7 @@
 // =============================================================================
 // TKTRIE - Combined Single-Header File (C++23)
 // A high-performance concurrent trie for integer and string keys
+// Fully per-trie EBR - no global state
 // =============================================================================
 
 #include <algorithm>
@@ -512,118 +513,34 @@ private:
 // SECTION: tktrie_ebr.h
 // =============================================================================
 
+// =============================================================================
+// TKTRIE EBR - Epoch-Based Reclamation (fully per-trie, no globals)
+// =============================================================================
+//
+// Each tktrie instance has its own:
+//   - epoch_ : incremented on writes
+//   - reader_epochs_[MAX_SLOTS] : tracks active reader epochs (0 = inactive)
+//   - retired list : nodes waiting to be freed
+//
+// Reader protocol:
+//   enter() - hash thread to slot, store current epoch
+//   exit()  - clear slot (store 0)
+//
+// Reclamation:
+//   Compute min_reader_epoch across slots, free nodes retired before that
+//
+// Slot collisions (two threads hash to same slot):
+//   Conservative - we see older epoch, delay reclamation. Safe.
+//
+// =============================================================================
+
 
 namespace gteitelbaum {
 
-// =============================================================================
-// EBR_SLOT - per-thread epoch tracking (single-field design)
-// 0 = inactive, non-zero = epoch when reader entered
-// =============================================================================
-
-class ebr_slot {
-    std::atomic<uint64_t> active_epoch_{0};
-    std::atomic<bool> valid_{true};
-    
-public:
-    ebr_slot();
-    ~ebr_slot();
-    
-    void enter(uint64_t epoch) noexcept {
-        active_epoch_.store(epoch, std::memory_order_release);
-    }
-    
-    // Exit - mark slot as inactive
-    void exit() noexcept {
-        active_epoch_.store(0, std::memory_order_release);
-    }
-    
-    // Returns 0 if inactive, epoch otherwise
-    uint64_t epoch() const noexcept { 
-        return active_epoch_.load(std::memory_order_acquire); 
-    }
-    
-    bool is_valid() const noexcept { 
-        return valid_.load(std::memory_order_acquire); 
-    }
-    
-    void invalidate() noexcept {
-        valid_.store(false, std::memory_order_release);
-    }
-};
-
-// =============================================================================
-// EBR_GLOBAL - global epoch and slot management
-// =============================================================================
-
-class ebr_global {
-private:
-    std::mutex slots_mutex_;
-    std::vector<ebr_slot*> slots_;
-    std::atomic<uint64_t> global_epoch_{1};  // Start at 1, 0 = inactive sentinel
-    
-    ebr_global() = default;
-    
-public:
-    ~ebr_global() = default;
-    
-    static ebr_global& instance() {
-        static ebr_global inst;
-        return inst;
-    }
-    
-    void register_slot(ebr_slot* slot) {
-        std::lock_guard<std::mutex> lock(slots_mutex_);
-        slots_.push_back(slot);
-    }
-    
-    void unregister_slot(ebr_slot* slot) {
-        std::lock_guard<std::mutex> lock(slots_mutex_);
-        auto it = std::find(slots_.begin(), slots_.end(), slot);
-        if (it != slots_.end()) slots_.erase(it);
-    }
-    
-    ebr_slot& get_slot() {
-        thread_local ebr_slot slot;
-        return slot;
-    }
-    
-    uint64_t current_epoch() const noexcept {
-        return global_epoch_.load(std::memory_order_acquire);
-    }
-    
-    uint64_t advance_epoch() noexcept {
-        return global_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    }
-    
-    // Compute min epoch across all slots (0s ignored as inactive)
-    // Returns current global epoch if no active readers
-    uint64_t compute_min_epoch() {
-        uint64_t ge = current_epoch();
-        uint64_t min_e = ge;
-        std::lock_guard<std::mutex> lock(slots_mutex_);
-        for (auto* slot : slots_) {
-            if (slot->is_valid()) {
-                uint64_t e = slot->epoch();
-                if (e != 0 && e < min_e) {
-                    min_e = e;
-                }
-            }
-        }
-        return min_e;
-    }
-};
-
-inline ebr_slot& get_ebr_slot() {
-    return ebr_global::instance().get_slot();
-}
-
-inline ebr_slot::ebr_slot() { 
-    ebr_global::instance().register_slot(this); 
-}
-
-inline ebr_slot::~ebr_slot() {
-    invalidate();
-    ebr_global::instance().unregister_slot(this);
+// Hash thread ID to slot index
+inline size_t thread_slot_hash(size_t max_slots) noexcept {
+    std::hash<std::thread::id> hasher;
+    return hasher(std::this_thread::get_id()) % max_slots;
 }
 
 }  // namespace gteitelbaum
@@ -1819,10 +1736,11 @@ public:
     };
 
     // -------------------------------------------------------------------------
-    // Per-trie EBR retired node tracking (lock-free MPSC linked list)
-    // Uses retire_epoch_ and retire_next_ embedded in node_base
+    // Per-trie EBR - epoch-based reclamation with per-trie reader tracking
+    // No global state - each trie manages its own readers and retired nodes
     // -------------------------------------------------------------------------
-    static constexpr size_t EBR_MIN_RETIRED = 64;  // Cleanup when retired count reaches this
+    static constexpr size_t EBR_MIN_RETIRED = 64;      // Writers cleanup at this threshold
+    static constexpr size_t EBR_MAX_READER_SLOTS = 64; // Reader epoch slots (hash by thread)
 
 private:
     atomic_ptr root_;
@@ -1830,9 +1748,14 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
-    // Write sequence counter: bumped on any structural change
-    // Readers snapshot at start, check unchanged at end for fast validation
-    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> write_seq_{0};
+    // Epoch counter: bumped on writes, used for read validation AND EBR
+    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
+    
+    // Per-trie reader tracking: reader_epochs_[slot] = epoch when reader entered (0 = inactive)
+    // Slot collisions are safe: we see older epoch, delay reclamation conservatively
+    std::conditional_t<THREADED, 
+        std::array<std::atomic<uint64_t>, EBR_MAX_READER_SLOTS>,
+        std::array<uint64_t, 1>> reader_epochs_{};
     
     // Lock-free retired list using embedded fields in nodes (MPSC)
     std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
@@ -1842,8 +1765,9 @@ private:
     // EBR helpers
     void ebr_retire(ptr_t n, uint64_t epoch);      // Lock-free push
     void ebr_cleanup();                             // Free reclaimable nodes (grabs ebr_mutex_)
-    bool ebr_should_cleanup() const;                // Check threshold (no lock)
-    void ebr_maybe_cleanup();                       // Check + cleanup if needed
+    uint64_t min_reader_epoch() const noexcept;    // Scan slots for oldest active reader
+    void reader_enter() const noexcept;            // Store epoch in thread's slot
+    void reader_exit() const noexcept;             // Clear thread's slot
 
     // -------------------------------------------------------------------------
     // Static helpers
@@ -2070,7 +1994,7 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n || builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
         n->poison();
-        uint64_t epoch = ebr_global::instance().current_epoch();
+        uint64_t epoch = epoch_.load(std::memory_order_acquire);
         ebr_retire(n, epoch);  // Lock-free
     } else {
         node_deleter(n);
@@ -2092,6 +2016,41 @@ void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
 }
 
 TKTRIE_TEMPLATE
+void TKTRIE_CLASS::reader_enter() const noexcept {
+    if constexpr (THREADED) {
+        size_t slot = thread_slot_hash(EBR_MAX_READER_SLOTS);
+        uint64_t epoch = epoch_.load(std::memory_order_acquire);
+        const_cast<std::atomic<uint64_t>&>(reader_epochs_[slot])
+            .store(epoch, std::memory_order_release);
+    }
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::reader_exit() const noexcept {
+    if constexpr (THREADED) {
+        size_t slot = thread_slot_hash(EBR_MAX_READER_SLOTS);
+        const_cast<std::atomic<uint64_t>&>(reader_epochs_[slot])
+            .store(0, std::memory_order_release);
+    }
+}
+
+TKTRIE_TEMPLATE
+uint64_t TKTRIE_CLASS::min_reader_epoch() const noexcept {
+    if constexpr (THREADED) {
+        uint64_t current = epoch_.load(std::memory_order_acquire);
+        uint64_t min_e = current;
+        for (size_t i = 0; i < EBR_MAX_READER_SLOTS; ++i) {
+            uint64_t e = reader_epochs_[i].load(std::memory_order_acquire);
+            if (e != 0 && e < min_e) {
+                min_e = e;
+            }
+        }
+        return min_e;
+    }
+    return 0;
+}
+
+TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_cleanup() {
     // Grab mutex, atomically take list, process, push back unreclaimable
     if constexpr (THREADED) {
@@ -2102,7 +2061,7 @@ void TKTRIE_CLASS::ebr_cleanup() {
         retired_count_.store(0, std::memory_order_relaxed);
         if (!list) return;
         
-        uint64_t min_epoch = ebr_global::instance().compute_min_epoch();
+        uint64_t min_epoch = min_reader_epoch();
         
         // Partition into freeable and still-retired
         ptr_t still_head = nullptr;
@@ -2112,8 +2071,8 @@ void TKTRIE_CLASS::ebr_cleanup() {
             ptr_t curr = list;
             list = list->retire_next_;
             
+            // Safe if retired at least 2 epochs before min reader epoch
             if (curr->retire_epoch_ + 2 <= min_epoch) {
-                // Safe to delete
                 node_deleter(curr);
             } else {
                 // Still needs protection - prepend to still list
@@ -2135,23 +2094,6 @@ void TKTRIE_CLASS::ebr_cleanup() {
             } while (!retired_head_.compare_exchange_weak(old_head, still_head,
                         std::memory_order_release, std::memory_order_relaxed));
             retired_count_.fetch_add(still_count, std::memory_order_relaxed);
-        }
-    }
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::ebr_should_cleanup() const {
-    if constexpr (THREADED) {
-        return retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED;
-    }
-    return false;
-}
-
-TKTRIE_TEMPLATE
-void TKTRIE_CLASS::ebr_maybe_cleanup() {
-    if constexpr (THREADED) {
-        if (ebr_should_cleanup()) {
-            ebr_cleanup();
         }
     }
 }
@@ -2437,22 +2379,20 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
-        // Readers rarely cleanup - only if list gets very large (2x threshold)
+        // Readers cleanup at 2x threshold (backstop only)
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
         
-        auto& slot = get_ebr_slot();
-        uint64_t epoch = ebr_global::instance().current_epoch();
-        slot.enter(epoch);
+        reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
-            // Fast path: check write_seq before and after traversal
-            uint64_t seq_before = write_seq_.load(std::memory_order_acquire);
+            // Fast path: check epoch before and after traversal
+            uint64_t epoch_before = epoch_.load(std::memory_order_acquire);
             
             ptr_t root = root_.load();
             if (!root) {
-                slot.exit();
+                reader_exit();
                 return false;
             }
             
@@ -2462,17 +2402,17 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
             // Simple traversal without path recording
             bool found = read_impl<false>(root, kbv);
             
-            // Validate: if write_seq unchanged, result is valid
-            uint64_t seq_after = write_seq_.load(std::memory_order_acquire);
-            if (seq_before == seq_after) {
-                slot.exit();
+            // Validate: if epoch unchanged, result is valid
+            uint64_t epoch_after = epoch_.load(std::memory_order_acquire);
+            if (epoch_before == epoch_after) {
+                reader_exit();
                 return found;
             }
             // Write happened during traversal, retry
         }
         // Fallback: too many retries, use locked read
         bool result = read_impl<false>(root_.load(), kbv);
-        slot.exit();
+        reader_exit();
         return result;
     } else {
         return read_impl<false>(root_.load(), kbv);
@@ -2487,8 +2427,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert(const std:
     auto result = insert_locked(kv.first, kbv, kv.second, &retired_any);
     if constexpr (THREADED) {
         if (retired_any) {
-            ebr_global::instance().advance_epoch();  // Atomic, no lock
-            ebr_maybe_cleanup();  // Grabs lock only if needed
+            epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        // Writers cleanup at 1x threshold
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
         }
     }
     return result;
@@ -2501,8 +2444,11 @@ bool TKTRIE_CLASS::erase(const Key& key) {
     auto [erased, retired_any] = erase_locked(kbv);
     if constexpr (THREADED) {
         if (retired_any) {
-            ebr_global::instance().advance_epoch();  // Atomic, no lock
-            ebr_maybe_cleanup();  // Grabs lock only if needed
+            epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        // Writers cleanup at 1x threshold
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
         }
     }
     return erased;
@@ -2514,34 +2460,32 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     std::string_view kbv(kb.data(), kb.size());
     T value;
     if constexpr (THREADED) {
-        // Readers rarely cleanup - only if list gets very large (2x threshold)
+        // Readers cleanup at 2x threshold (backstop only)
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
         
-        auto& slot = get_ebr_slot();
-        uint64_t epoch = ebr_global::instance().current_epoch();
-        slot.enter(epoch);
+        reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
             
             ptr_t root = root_.load();
             if (!root) {
-                slot.exit();
+                reader_exit();
                 return end();
             }
             if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic<true>(root, kbv, value, path);
             if (validate_read_path(path)) {
-                slot.exit();
+                reader_exit();
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
         }
         bool found = read_impl<true>(root_.load(), kbv, value);
-        slot.exit();
+        reader_exit();
         if (found) return iterator(this, kbv, value);
     } else {
         if (read_impl<true>(root_.load(), kbv, value)) {
@@ -3587,12 +3531,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, kb, value), true};
     } else {
-        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
-        ebr_maybe_cleanup();
+        // Writers cleanup at 1x threshold
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
+        }
         
-        auto& slot = get_ebr_slot();
-        uint64_t epoch = ebr_global::instance().current_epoch();
-        slot.enter(epoch);
+        reader_enter();
         
         constexpr int MAX_RETRIES = 7;
         
@@ -3608,7 +3552,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
             if (spec.op == spec_op::EXISTS) {
                 stat_success(retry);
-                slot.exit();
+                reader_exit();
                 return {iterator(this, kb, value), false};
             }
 
@@ -3627,19 +3571,19 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         // Need LIST_TO_FULL - re-probe will get it
                         continue;
                     }
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     ln->add_value(c, value);
                 } else {
                     auto* fn = n->template as_full<true>();
                     if (fn->has(c)) continue;
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     fn->add_value_atomic(c, value);
                 }
                 size_.fetch_add(1);
                 stat_success(retry);
-                slot.exit();
+                reader_exit();
                 return {iterator(this, kb, value), true};
             }
 
@@ -3656,12 +3600,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         ptr_t n = spec.target;
                         if (n->has_eos()) continue;
                         
-                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         n->set_eos(value);
                         size_.fetch_add(1);
                         stat_success(retry);
-                        slot.exit();
+                        reader_exit();
                         return {iterator(this, kb, value), true};
                     }
                 } else {
@@ -3680,13 +3624,13 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                             builder_.dealloc_node(child);
                             continue;  // Re-probe will get ADD_CHILD_CONVERT
                         }
-                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         ln->add_child(c, child);
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
                         if (fn->has(c)) { builder_.dealloc_node(child); continue; }
-                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         fn->add_child_atomic(c, child);
                     } else {
@@ -3695,7 +3639,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
-                    slot.exit();
+                    reader_exit();
                     return {iterator(this, kb, value), true};
                 }
             }
@@ -3719,7 +3663,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 
                 if (commit_speculative(spec, alloc, value)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     // Retire old node
                     if (spec.target) {
                         retire_node(spec.target);
@@ -3727,7 +3671,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
-                    slot.exit();
+                    reader_exit();
                     return {iterator(this, kb, value), true};
                 }
                 dealloc_speculation(alloc);
@@ -3746,11 +3690,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (!res.inserted) {
                 if (retired_any && !res.old_nodes.empty()) *retired_any = true;
                 for (auto* old : res.old_nodes) retire_node(old);
-                slot.exit();
+                reader_exit();
                 return {iterator(this, kb, value), false};
             }
             
-            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+            epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
             if (res.new_node) {
                 root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
                 root_.store(res.new_node);
@@ -3758,7 +3702,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (retired_any && !res.old_nodes.empty()) *retired_any = true;
             for (auto* old : res.old_nodes) retire_node(old);
             size_.fetch_add(1);
-            slot.exit();
+            reader_exit();
             return {iterator(this, kb, value), true};
         }
     }
@@ -4185,7 +4129,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
     auto apply_erase_result = [this](erase_result& res) -> std::pair<bool, bool> {
         if (!res.erased) return {false, false};
         if constexpr (THREADED) {
-            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+            epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
         }
         if (res.deleted_subtree) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
@@ -4205,12 +4149,12 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
-        ebr_maybe_cleanup();
+        // Writers cleanup at 1x threshold
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
+        }
         
-        auto& ebr_slot_ref = get_ebr_slot();
-        uint64_t epoch = ebr_global::instance().current_epoch();
-        ebr_slot_ref.enter(epoch);
+        reader_enter();
         
         static constexpr int MAX_RETRIES = 7;
         
@@ -4218,7 +4162,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             erase_spec_info info = probe_erase(root_.load(), kb);
 
             if (info.op == erase_op::NOT_FOUND) {
-                ebr_slot_ref.exit();
+                reader_exit();
                 return {false, false};
             }
 
@@ -4227,9 +4171,9 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
-                    ebr_slot_ref.exit();
+                    reader_exit();
                     return {true, false};
                 }
                 continue;
@@ -4239,9 +4183,9 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     size_.fetch_sub(1);
-                    ebr_slot_ref.exit();
+                    reader_exit();
                     return {true, false};
                 }
                 continue;
@@ -4258,7 +4202,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 }
                 
                 if (commit_erase_speculative(info, alloc)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     // Retire old nodes
                     bool retired_any = false;
                     if (info.target) {
@@ -4270,7 +4214,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         retired_any = true;
                     }
                     size_.fetch_sub(1);
-                    ebr_slot_ref.exit();
+                    reader_exit();
                     return {true, retired_any};
                 }
                 dealloc_erase_speculation(alloc);
@@ -4282,7 +4226,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
-            ebr_slot_ref.exit();
+            reader_exit();
             return apply_erase_result(res);
         }
     }

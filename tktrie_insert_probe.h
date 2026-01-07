@@ -515,12 +515,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, kb, value), true};
     } else {
-        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
-        ebr_maybe_cleanup();
+        // Writers cleanup at 1x threshold
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
+        }
         
-        auto& slot = get_ebr_slot();
-        uint64_t epoch = ebr_global::instance().current_epoch();
-        slot.enter(epoch);
+        reader_enter();
         
         constexpr int MAX_RETRIES = 7;
         
@@ -536,7 +536,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
             if (spec.op == spec_op::EXISTS) {
                 stat_success(retry);
-                slot.exit();
+                reader_exit();
                 return {iterator(this, kb, value), false};
             }
 
@@ -555,19 +555,19 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         // Need LIST_TO_FULL - re-probe will get it
                         continue;
                     }
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     ln->add_value(c, value);
                 } else {
                     auto* fn = n->template as_full<true>();
                     if (fn->has(c)) continue;
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     n->bump_version();
                     fn->add_value_atomic(c, value);
                 }
                 size_.fetch_add(1);
                 stat_success(retry);
-                slot.exit();
+                reader_exit();
                 return {iterator(this, kb, value), true};
             }
 
@@ -584,12 +584,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         ptr_t n = spec.target;
                         if (n->has_eos()) continue;
                         
-                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         n->set_eos(value);
                         size_.fetch_add(1);
                         stat_success(retry);
-                        slot.exit();
+                        reader_exit();
                         return {iterator(this, kb, value), true};
                     }
                 } else {
@@ -608,13 +608,13 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                             builder_.dealloc_node(child);
                             continue;  // Re-probe will get ADD_CHILD_CONVERT
                         }
-                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         ln->add_child(c, child);
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
                         if (fn->has(c)) { builder_.dealloc_node(child); continue; }
-                        write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                         n->bump_version();
                         fn->add_child_atomic(c, child);
                     } else {
@@ -623,7 +623,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
-                    slot.exit();
+                    reader_exit();
                     return {iterator(this, kb, value), true};
                 }
             }
@@ -647,7 +647,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 
                 if (commit_speculative(spec, alloc, value)) {
-                    write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
                     // Retire old node
                     if (spec.target) {
                         retire_node(spec.target);
@@ -655,7 +655,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
-                    slot.exit();
+                    reader_exit();
                     return {iterator(this, kb, value), true};
                 }
                 dealloc_speculation(alloc);
@@ -674,11 +674,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (!res.inserted) {
                 if (retired_any && !res.old_nodes.empty()) *retired_any = true;
                 for (auto* old : res.old_nodes) retire_node(old);
-                slot.exit();
+                reader_exit();
                 return {iterator(this, kb, value), false};
             }
             
-            write_seq_.fetch_add(1, std::memory_order_release);  // Signal readers
+            epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
             if (res.new_node) {
                 root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
                 root_.store(res.new_node);
@@ -686,7 +686,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (retired_any && !res.old_nodes.empty()) *retired_any = true;
             for (auto* old : res.old_nodes) retire_node(old);
             size_.fetch_add(1);
-            slot.exit();
+            reader_exit();
             return {iterator(this, kb, value), true};
         }
     }
