@@ -105,23 +105,25 @@ void TKTRIE_CLASS::ebr_try_reclaim() {
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexcept {
-    if (!n) return false;
+    if constexpr (THREADED) {
+        if (!n || n->is_poisoned()) return false;
+    } else {
+        if (!n) return false;
+    }
     
-    while (!n->is_leaf()) {
-        std::string_view skip = n->skip_str();
-        size_t m = match_skip_impl(skip, key);
-        if (m < skip.size()) return false;
-        key.remove_prefix(m);
-
-        if (key.empty()) {
-            if (!out) return n->has_eos();
-            return n->try_read_eos(*out);
-        }
-
+    // Unified loop: consume skip for every node (interior or leaf)
+    while (true) {
+        if (!consume_prefix(key, n->skip_str())) return false;
+        
+        if (n->is_leaf()) break;
+        
+        // Interior node: check EOS or descend
+        if (key.empty()) return out ? n->try_read_eos(*out) : n->has_eos();
+        
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
-
         n = n->get_child(c);
+        
         if constexpr (THREADED) {
             if (!n || n->is_poisoned()) return false;
         } else {
@@ -129,41 +131,25 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         }
     }
     
-    return read_from_leaf(n, key, out);
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T* out) const noexcept {
-    if constexpr (THREADED) {
-        if (leaf->is_poisoned()) return false;
-    }
-    
-    std::string_view skip = leaf->skip_str();
-    size_t m = match_skip_impl(skip, key);
-    if (m < skip.size()) return false;
-    key.remove_prefix(m);
-
-    if (leaf->is_skip()) {
+    // Leaf node: skip already consumed, poison already checked
+    if (n->is_skip()) {
         if (!key.empty()) return false;
-        if (!out) return true;
-        return leaf->as_skip()->value.try_read(*out);
+        return !out || n->as_skip()->value.try_read(*out);
     }
     
-    // LIST or FULL leaf
+    // LIST or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
-    if (leaf->is_list()) [[likely]] {
-        auto* ln = leaf->template as_list<true>();
+    if (n->is_list()) [[likely]] {
+        auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
-        if (!out) return true;
-        return ln->read_value(idx, *out);
+        return !out || ln->read_value(idx, *out);
     }
-    auto* fn = leaf->template as_full<true>();
+    auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
-    if (!out) return true;
-    return fn->read_value(c, *out);
+    return !out || fn->read_value(c, *out);
 }
 
 TKTRIE_TEMPLATE
@@ -172,27 +158,42 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, r
     
     if (!path.push(n)) return false;
     
-    while (!n->is_leaf()) {
-        std::string_view skip = n->skip_str();
-        size_t m = match_skip_impl(skip, key);
-        if (m < skip.size()) return false;
-        key.remove_prefix(m);
-
-        if (key.empty()) {
-            if (!out) return n->has_eos();
-            return n->try_read_eos(*out);
-        }
-
+    // Unified loop: consume skip for every node
+    while (true) {
+        if (!consume_prefix(key, n->skip_str())) return false;
+        
+        if (n->is_leaf()) break;
+        
+        // Interior node: check EOS or descend
+        if (key.empty()) return out ? n->try_read_eos(*out) : n->has_eos();
+        
         unsigned char c = static_cast<unsigned char>(key[0]);
         key.remove_prefix(1);
-
         n = n->get_child(c);
-        if (!n || n->is_poisoned()) return false;
         
+        if (!n || n->is_poisoned()) return false;
         if (!path.push(n)) return false;
     }
     
-    return read_from_leaf(n, key, out);
+    // Leaf node: skip already consumed, poison already checked in loop
+    if (n->is_skip()) {
+        if (!key.empty()) return false;
+        return !out || n->as_skip()->value.try_read(*out);
+    }
+    
+    // LIST or FULL leaf
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    
+    if (n->is_list()) [[likely]] {
+        auto* ln = n->template as_list<true>();
+        int idx = ln->find(c);
+        if (idx < 0) return false;
+        return !out || ln->read_value(idx, *out);
+    }
+    auto* fn = n->template as_full<true>();
+    if (!fn->has(c)) return false;
+    return !out || fn->read_value(c, *out);
 }
 
 TKTRIE_TEMPLATE

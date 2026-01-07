@@ -274,19 +274,18 @@ struct empty_mutex {
 // SKIP MATCHING
 // =============================================================================
 
+// Reader version - check if key starts with skip and consume it if so
+inline bool consume_prefix(std::string_view& key, std::string_view skip) noexcept {
+    size_t sz = skip.size();
+    if (sz > key.size() || std::memcmp(skip.data(), key.data(), sz) != 0) return false;
+    key.remove_prefix(sz);
+    return true;
+}
+
+// Insert version - returns mismatch position (needed for split operations)
 inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexcept {
     size_t min_len = skip.size() < key.size() ? skip.size() : key.size();
-    
-    if (min_len <= 8) {
-        size_t i = 0;
-        while (i < min_len && skip[i] == key[i]) ++i;
-        return i;
-    }
-    
-    if (std::memcmp(skip.data(), key.data(), min_len) == 0) {
-        return min_len;
-    }
-    
+    if (std::memcmp(skip.data(), key.data(), min_len) == 0) return min_len;
     size_t i = 0;
     while (i < min_len && skip[i] == key[i]) ++i;
     return i;

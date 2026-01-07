@@ -260,7 +260,6 @@ private:
     // Read operations
     // -------------------------------------------------------------------------
     bool read_impl(ptr_t n, std::string_view key, T* out) const noexcept;
-    bool read_from_leaf(ptr_t leaf, std::string_view key, T* out) const noexcept;
     bool contains_impl(ptr_t n, std::string_view key) const noexcept;
     
     bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, read_path& path) const noexcept;
