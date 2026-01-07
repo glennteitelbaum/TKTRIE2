@@ -596,6 +596,10 @@ struct node_base {
     
     atomic_storage<uint64_t, THREADED> header_;
     
+    
+    uint64_t retire_epoch_ = 0;
+    self_t* retire_next_ = nullptr;
+    
     constexpr node_base() noexcept = default;
     constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     
@@ -1596,10 +1600,6 @@ public:
     
     
     
-    struct retired_node {
-        ptr_t ptr;
-        uint64_t epoch;
-    };
     
     static constexpr size_t EBR_MIN_RETIRED = 64;  
 
@@ -1610,8 +1610,9 @@ private:
     builder_t builder_;
     
     
-    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_list_{};
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
+    std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
+    std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  
     
     
     void ebr_retire(ptr_t n, uint64_t epoch);      
@@ -1819,13 +1820,8 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n || builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
         n->poison();
-        std::lock_guard<std::mutex> lock(ebr_mutex_);
-        uint64_t epoch = ebr_global::instance().advance_epoch();
-        ebr_retire(n, epoch);
-        
-        if (retired_list_.size() >= EBR_MIN_RETIRED) {
-            ebr_cleanup();
-        }
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        ebr_retire(n, epoch);  
     } else {
         node_deleter(n);
     }
@@ -1835,7 +1831,13 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
     
     if constexpr (THREADED) {
-        retired_list_.push_back({n, epoch});
+        n->retire_epoch_ = epoch;
+        ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
+        do {
+            n->retire_next_ = old_head;
+        } while (!retired_head_.compare_exchange_weak(old_head, n,
+                    std::memory_order_release, std::memory_order_relaxed));
+        retired_count_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -1843,16 +1845,46 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_cleanup() {
     
     if constexpr (THREADED) {
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        
+        
+        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retired_count_.store(0, std::memory_order_relaxed);
+        if (!list) return;
+        
         uint64_t min_epoch = ebr_global::instance().compute_min_epoch();
         
-        auto it = retired_list_.begin();
-        while (it != retired_list_.end()) {
-            if (it->epoch + 2 <= min_epoch) {
-                node_deleter(it->ptr);
-                it = retired_list_.erase(it);
+        
+        ptr_t still_head = nullptr;
+        size_t still_count = 0;
+        
+        while (list) {
+            ptr_t curr = list;
+            list = list->retire_next_;
+            
+            if (curr->retire_epoch_ + 2 <= min_epoch) {
+                
+                node_deleter(curr);
             } else {
-                ++it;
+                
+                curr->retire_next_ = still_head;
+                still_head = curr;
+                ++still_count;
             }
+        }
+        
+        
+        if (still_head) {
+            
+            ptr_t still_tail = still_head;
+            while (still_tail->retire_next_) still_tail = still_tail->retire_next_;
+            
+            ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
+            do {
+                still_tail->retire_next_ = old_head;
+            } while (!retired_head_.compare_exchange_weak(old_head, still_head,
+                        std::memory_order_release, std::memory_order_relaxed));
+            retired_count_.fetch_add(still_count, std::memory_order_relaxed);
         }
     }
 }
@@ -1860,8 +1892,7 @@ void TKTRIE_CLASS::ebr_cleanup() {
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::ebr_should_cleanup() const {
     if constexpr (THREADED) {
-        
-        return retired_list_.size() >= EBR_MIN_RETIRED;
+        return retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED;
     }
     return false;
 }
@@ -1870,7 +1901,6 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_maybe_cleanup() {
     if constexpr (THREADED) {
         if (ebr_should_cleanup()) {
-            std::lock_guard<std::mutex> lock(ebr_mutex_);
             ebr_cleanup();
         }
     }
@@ -2132,10 +2162,13 @@ void TKTRIE_CLASS::clear() {
     if constexpr (THREADED) {
         
         std::lock_guard<std::mutex> lock(ebr_mutex_);
-        for (auto& rn : retired_list_) {
-            node_deleter(rn.ptr);
+        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retired_count_.store(0, std::memory_order_relaxed);
+        while (list) {
+            ptr_t curr = list;
+            list = list->retire_next_;
+            node_deleter(curr);
         }
-        retired_list_.clear();
     }
 }
 
@@ -2145,7 +2178,9 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
     std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
         
-        const_cast<tktrie*>(this)->ebr_maybe_cleanup();
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
+            const_cast<tktrie*>(this)->ebr_cleanup();
+        }
         
         auto& slot = get_ebr_slot();
         uint64_t epoch = ebr_global::instance().current_epoch();
@@ -2181,6 +2216,12 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert(const std:
     std::string_view kbv(kb.data(), kb.size());
     bool retired_any = false;
     auto result = insert_locked(kv.first, kbv, kv.second, &retired_any);
+    if constexpr (THREADED) {
+        if (retired_any) {
+            ebr_global::instance().advance_epoch();  
+            ebr_maybe_cleanup();  
+        }
+    }
     return result;
 }
 
@@ -2189,6 +2230,12 @@ bool TKTRIE_CLASS::erase(const Key& key) {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     auto [erased, retired_any] = erase_locked(kbv);
+    if constexpr (THREADED) {
+        if (retired_any) {
+            ebr_global::instance().advance_epoch();  
+            ebr_maybe_cleanup();  
+        }
+    }
     return erased;
 }
 
@@ -2199,7 +2246,9 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     T value;
     if constexpr (THREADED) {
         
-        const_cast<tktrie*>(this)->ebr_maybe_cleanup();
+        if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
+            const_cast<tktrie*>(this)->ebr_cleanup();
+        }
         
         auto& slot = get_ebr_slot();
         uint64_t epoch = ebr_global::instance().current_epoch();
@@ -2237,10 +2286,15 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
-        for (auto& r : retired_list_) {
-            node_deleter(r.ptr);
+        
+        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retired_count_.store(0, std::memory_order_relaxed);
+        
+        while (list) {
+            ptr_t curr = list;
+            list = list->retire_next_;
+            node_deleter(curr);
         }
-        retired_list_.clear();
     }
 }
 

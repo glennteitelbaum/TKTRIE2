@@ -103,6 +103,10 @@ struct node_base {
     
     atomic_storage<uint64_t, THREADED> header_;
     
+    // EBR retire fields - only used when node is poisoned/retired
+    uint64_t retire_epoch_ = 0;
+    self_t* retire_next_ = nullptr;
+    
     constexpr node_base() noexcept = default;
     constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     

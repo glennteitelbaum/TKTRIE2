@@ -224,14 +224,10 @@ public:
     };
 
     // -------------------------------------------------------------------------
-    // Per-trie EBR retired node tracking
+    // Per-trie EBR retired node tracking (lock-free MPSC linked list)
+    // Uses retire_epoch_ and retire_next_ embedded in node_base
     // -------------------------------------------------------------------------
-    struct retired_node {
-        ptr_t ptr;
-        uint64_t epoch;
-    };
-    
-    static constexpr size_t EBR_MIN_RETIRED = 64;  // Cleanup when retired list reaches this size
+    static constexpr size_t EBR_MIN_RETIRED = 64;  // Cleanup when retired count reaches this
 
 private:
     atomic_ptr root_;
@@ -239,15 +235,16 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
-    // Simple retired list protected by ebr_mutex_
-    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_list_{};
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
+    // Lock-free retired list using embedded fields in nodes (MPSC)
+    std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
+    std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for cleanup
     
     // EBR helpers
-    void ebr_retire(ptr_t n, uint64_t epoch);      // Add to retired list (under ebr_mutex_)
-    void ebr_cleanup();                             // Free reclaimable nodes (under ebr_mutex_)
+    void ebr_retire(ptr_t n, uint64_t epoch);      // Lock-free push
+    void ebr_cleanup();                             // Free reclaimable nodes (grabs ebr_mutex_)
     bool ebr_should_cleanup() const;                // Check threshold (no lock)
-    void ebr_maybe_cleanup();                       // Check + cleanup if needed (grabs ebr_mutex_)
+    void ebr_maybe_cleanup();                       // Check + cleanup if needed
 
     // -------------------------------------------------------------------------
     // Static helpers
