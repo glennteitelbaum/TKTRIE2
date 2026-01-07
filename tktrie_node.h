@@ -298,6 +298,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
         int idx = chars.find(c);
         if (idx < 0) return;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = idx; i < cnt - 1; ++i) {
             values[i] = std::move(values[i + 1]);
         }
@@ -308,6 +309,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     void copy_values_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->values[i].deep_copy_from(values[i]);
         }
@@ -363,6 +365,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
         int idx = chars.find(c);
         if (idx < 0) return;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = idx; i < cnt - 1; ++i) {
             children[i].store(children[i + 1].load());
         }
@@ -373,6 +376,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     void move_children_to(list_node* dest) {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
             children[i].store(nullptr);
@@ -382,6 +386,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     void copy_children_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
         }
@@ -451,6 +456,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
         int idx = chars.find(c);
         if (idx < 0) return;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = idx; i < cnt - 1; ++i) {
             children[i].store(children[i + 1].load());
         }
@@ -461,6 +467,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     void move_children_to(list_node* dest) {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
             children[i].store(nullptr);
@@ -470,6 +477,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     void copy_children_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
         }
@@ -672,6 +680,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 void list_node<T, THREADED, Allocator, FIXED_LEN, false>::move_interior_to_full(
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
@@ -685,6 +694,7 @@ void list_node<T, THREADED, Allocator, 0, false>::move_interior_to_full(
     full_node<T, THREADED, Allocator, 0, false>* dest) {
     dest->eos = std::move(eos);
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
@@ -698,6 +708,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 void list_node<T, THREADED, Allocator, FIXED_LEN, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
@@ -710,6 +721,7 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, 0, false>* dest) const {
     dest->eos.deep_copy_from(eos);
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);

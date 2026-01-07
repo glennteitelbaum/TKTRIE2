@@ -193,6 +193,7 @@ public:
     int find(unsigned char c) const noexcept {
         uint64_t d = data_.load(std::memory_order_acquire);
         int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 8)]];
         for (int i = 0; i < n; ++i) {
             if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
         }
@@ -202,6 +203,7 @@ public:
     int add(unsigned char c) noexcept {
         uint64_t d = data_.load(std::memory_order_relaxed);
         int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 7)]];  // Must have room to add
         // Clear count, set new char at position n, set new count
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
             (static_cast<uint64_t>(n + 1) << 56);
@@ -212,6 +214,8 @@ public:
     void remove_at(int idx) noexcept {
         uint64_t d = data_.load(std::memory_order_relaxed);
         int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 8)]];
+        [[assume(idx >= 0 && idx < n)]];
         // Shift chars down
         for (int i = idx; i < n - 1; ++i) {
             unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);

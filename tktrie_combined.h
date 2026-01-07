@@ -1,21 +1,7 @@
 #pragma once
 // =============================================================================
-// TKTRIE - Combined Single-Header File
+// TKTRIE - Combined Single-Header File (C++23)
 // A high-performance concurrent trie for integer and string keys
-// =============================================================================
-//
-// Usage:
-//   #include "tktrie_combined.h"
-//   using namespace gteitelbaum;
-//   
-//   // Non-threaded trie
-//   int64_trie<int> trie;
-//   trie.insert({42, 100});
-//   
-//   // Thread-safe trie
-//   concurrent_int64_trie<int> ctrie;
-//   ctrie.insert({42, 100});
-//
 // =============================================================================
 
 #include <algorithm>
@@ -221,6 +207,7 @@ public:
     int find(unsigned char c) const noexcept {
         uint64_t d = data_.load(std::memory_order_acquire);
         int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 8)]];
         for (int i = 0; i < n; ++i) {
             if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
         }
@@ -230,6 +217,7 @@ public:
     int add(unsigned char c) noexcept {
         uint64_t d = data_.load(std::memory_order_relaxed);
         int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 7)]];  // Must have room to add
         // Clear count, set new char at position n, set new count
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
             (static_cast<uint64_t>(n + 1) << 56);
@@ -240,6 +228,8 @@ public:
     void remove_at(int idx) noexcept {
         uint64_t d = data_.load(std::memory_order_relaxed);
         int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 8)]];
+        [[assume(idx >= 0 && idx < n)]];
         // Shift chars down
         for (int i = idx; i < n - 1; ++i) {
             unsigned char next = static_cast<unsigned char>((d >> ((i + 1) * 8)) & 0xFF);
@@ -934,6 +924,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
         int idx = chars.find(c);
         if (idx < 0) return;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = idx; i < cnt - 1; ++i) {
             values[i] = std::move(values[i + 1]);
         }
@@ -944,6 +935,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     void copy_values_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->values[i].deep_copy_from(values[i]);
         }
@@ -999,6 +991,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
         int idx = chars.find(c);
         if (idx < 0) return;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = idx; i < cnt - 1; ++i) {
             children[i].store(children[i + 1].load());
         }
@@ -1009,6 +1002,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     void move_children_to(list_node* dest) {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
             children[i].store(nullptr);
@@ -1018,6 +1012,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     void copy_children_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
         }
@@ -1087,6 +1082,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
         int idx = chars.find(c);
         if (idx < 0) return;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = idx; i < cnt - 1; ++i) {
             children[i].store(children[i + 1].load());
         }
@@ -1097,6 +1093,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     void move_children_to(list_node* dest) {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
             children[i].store(nullptr);
@@ -1106,6 +1103,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     void copy_children_to(list_node* dest) const {
         dest->chars = chars;
         int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
         for (int i = 0; i < cnt; ++i) {
             dest->children[i].store(children[i].load());
         }
@@ -1308,6 +1306,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 void list_node<T, THREADED, Allocator, FIXED_LEN, false>::move_interior_to_full(
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
@@ -1321,6 +1320,7 @@ void list_node<T, THREADED, Allocator, 0, false>::move_interior_to_full(
     full_node<T, THREADED, Allocator, 0, false>* dest) {
     dest->eos = std::move(eos);
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
@@ -1334,6 +1334,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 void list_node<T, THREADED, Allocator, FIXED_LEN, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
@@ -1346,6 +1347,7 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, 0, false>* dest) const {
     dest->eos.deep_copy_from(eos);
     int cnt = chars.count();
+        [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
         dest->valid.set(ch);
