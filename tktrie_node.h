@@ -754,9 +754,8 @@ struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     small_list chars{};
     std::array<void*, 7> dummy_children{};
     
-    constexpr not_found_storage() noexcept {
-        this->set_header(NOT_FOUND_SENTINEL_HEADER);
-    }
+    constexpr not_found_storage() noexcept 
+        : node_with_skip<T, THREADED, Allocator, FIXED_LEN>(NOT_FOUND_SENTINEL_HEADER) {}
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -764,21 +763,34 @@ struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     bitmap256 valid{};
     std::array<void*, 256> dummy_children{};
     
-    constexpr retry_storage() noexcept {
-        this->set_header(RETRY_SENTINEL_HEADER);
-    }
+    constexpr retry_storage() noexcept 
+        : node_with_skip<T, THREADED, Allocator, FIXED_LEN>(RETRY_SENTINEL_HEADER) {}
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct sentinel_holder {
+    static constinit not_found_storage<T, THREADED, Allocator, FIXED_LEN> not_found;
+    static constinit retry_storage<T, THREADED, Allocator, FIXED_LEN> retry;
+};
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+constinit not_found_storage<T, THREADED, Allocator, FIXED_LEN> 
+    sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found{};
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+constinit retry_storage<T, THREADED, Allocator, FIXED_LEN> 
+    sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::retry{};
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept {
-    static not_found_storage<T, THREADED, Allocator, FIXED_LEN> storage{};
-    return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(&storage);
+    return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(
+        &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found);
 }
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept {
-    static retry_storage<T, THREADED, Allocator, FIXED_LEN> storage{};
-    return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(&storage);
+    return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(
+        &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::retry);
 }
 
 // =============================================================================
