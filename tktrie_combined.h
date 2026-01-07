@@ -1236,8 +1236,12 @@ constinit retry_storage<T, THREADED, Allocator, FIXED_LEN>
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept {
-    return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(
-        &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found);
+    if constexpr (!THREADED) {
+        return nullptr;
+    } else {
+        return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(
+            &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found);
+    }
 }
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -1257,9 +1261,31 @@ public:
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
-    static bool is_sentinel(ptr_t n) noexcept {
-        return n == get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>() ||
-               n == get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>();
+    
+    
+    static constexpr bool is_not_found_sentinel(ptr_t n) noexcept {
+        if constexpr (!THREADED) {
+            return n == nullptr;  
+        } else {
+            return n == get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>();
+        }
+    }
+    
+    static constexpr bool is_retry_sentinel(ptr_t n) noexcept {
+        if constexpr (!THREADED) {
+            (void)n;
+            return false;
+        } else {
+            return n == get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>();
+        }
+    }
+    
+    static constexpr bool is_sentinel(ptr_t n) noexcept {
+        if constexpr (!THREADED) {
+            return n == nullptr;  
+        } else {
+            return is_not_found_sentinel(n) || is_retry_sentinel(n);
+        }
     }
     
     static void delete_node(ptr_t n) {
@@ -1909,7 +1935,13 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         key.remove_prefix(1);
 
         n = n->get_child(false, c);
-        if (!n || builder_t::is_sentinel(n)) return false;
+        
+        
+        if constexpr (THREADED) {
+            if (!n || builder_t::is_sentinel(n)) return false;
+        } else {
+            if (!n) return false;
+        }
     }
     
     return read_from_leaf(n, key, out);

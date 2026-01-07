@@ -122,7 +122,13 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out) const noexce
         key.remove_prefix(1);
 
         n = n->get_child(false, c);
-        if (!n || builder_t::is_sentinel(n)) return false;
+        // Non-threaded: not_found_sentinel is nullptr, so !n covers it
+        // Threaded: need to check both sentinels
+        if constexpr (THREADED) {
+            if (!n || builder_t::is_sentinel(n)) return false;
+        } else {
+            if (!n) return false;
+        }
     }
     
     return read_from_leaf(n, key, out);
