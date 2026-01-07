@@ -414,42 +414,34 @@ private:
 }  
 
 namespace gteitelbaum {
-class ebr_global;
-
 class ebr_slot {
-    std::atomic<uint64_t> epoch_{0};
-    std::atomic<bool> active_{false};
+    std::atomic<uint64_t> active_epoch_{0};
     std::atomic<bool> valid_{true};
     
 public:
-    class guard {
-        ebr_slot* slot_;
-    public:
-        explicit guard(ebr_slot* s) : slot_(s) { slot_->enter(); }
-        ~guard() { if (slot_) slot_->exit(); }
-        guard(const guard&) = delete;
-        guard& operator=(const guard&) = delete;
-        guard(guard&& o) noexcept : slot_(o.slot_) { o.slot_ = nullptr; }
-        guard& operator=(guard&&) = delete;
-    };
-    
     ebr_slot();
     ~ebr_slot();
     
-    void enter() noexcept {
-        epoch_.store(global_epoch().load(std::memory_order_acquire), std::memory_order_release);
-        active_.store(true, std::memory_order_release);
+    void enter(uint64_t epoch) noexcept {
+        active_epoch_.store(epoch, std::memory_order_release);
     }
     
-    void exit() noexcept { active_.store(false, std::memory_order_release); }
-    bool is_active() const noexcept { return active_.load(std::memory_order_acquire); }
-    bool is_valid() const noexcept { return valid_.load(std::memory_order_acquire); }
-    uint64_t epoch() const noexcept { return epoch_.load(std::memory_order_acquire); }
-    guard get_guard() { return guard(this); }
     
-    static std::atomic<uint64_t>& global_epoch() {
-        static std::atomic<uint64_t> e{0};
-        return e;
+    void exit() noexcept {
+        active_epoch_.store(0, std::memory_order_release);
+    }
+    
+    
+    uint64_t epoch() const noexcept { 
+        return active_epoch_.load(std::memory_order_acquire); 
+    }
+    
+    bool is_valid() const noexcept { 
+        return valid_.load(std::memory_order_acquire); 
+    }
+    
+    void invalidate() noexcept {
+        valid_.store(false, std::memory_order_release);
     }
 };
 
@@ -457,6 +449,7 @@ class ebr_global {
 private:
     std::mutex slots_mutex_;
     std::vector<ebr_slot*> slots_;
+    std::atomic<uint64_t> global_epoch_{1};  
     
     ebr_global() = default;
     
@@ -484,31 +477,42 @@ public:
         return slot;
     }
     
-    void advance_epoch() {
-        ebr_slot::global_epoch().fetch_add(1, std::memory_order_acq_rel);
+    uint64_t current_epoch() const noexcept {
+        return global_epoch_.load(std::memory_order_acquire);
+    }
+    
+    uint64_t advance_epoch() noexcept {
+        return global_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
     
     
-    uint64_t compute_safe_epoch() {
-        uint64_t ge = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        uint64_t safe = ge;
+    
+    uint64_t compute_min_epoch() {
+        uint64_t ge = current_epoch();
+        uint64_t min_e = ge;
         std::lock_guard<std::mutex> lock(slots_mutex_);
         for (auto* slot : slots_) {
-            if (slot->is_valid() && slot->is_active()) {
-                uint64_t se = slot->epoch();
-                if (se < safe) safe = se;
+            if (slot->is_valid()) {
+                uint64_t e = slot->epoch();
+                if (e != 0 && e < min_e) {
+                    min_e = e;
+                }
             }
         }
-        return safe;
+        return min_e;
     }
 };
 
 inline ebr_slot& get_ebr_slot() {
     return ebr_global::instance().get_slot();
 }
-inline ebr_slot::ebr_slot() { ebr_global::instance().register_slot(this); }
+
+inline ebr_slot::ebr_slot() { 
+    ebr_global::instance().register_slot(this); 
+}
+
 inline ebr_slot::~ebr_slot() {
-    valid_.store(false, std::memory_order_release);
+    invalidate();
     ebr_global::instance().unregister_slot(this);
 }
 
@@ -946,7 +950,7 @@ struct list_node<T, THREADED, Allocator, 0, false>
     }
     
     void copy_interior_to(list_node* dest) const {
-        dest->eos = eos;
+        dest->eos.deep_copy_from(eos);
         copy_children_to(dest);
     }
     
@@ -1112,7 +1116,7 @@ struct full_node<T, THREADED, Allocator, 0, false>
     }
     
     void copy_interior_to(full_node* dest) const {
-        dest->eos = eos;
+        dest->eos.deep_copy_from(eos);
         dest->valid = valid;
         valid.for_each_set([this, dest](unsigned char c) {
             dest->children[c].store(children[c].load());
@@ -1157,7 +1161,7 @@ void list_node<T, THREADED, Allocator, FIXED_LEN, false>::copy_interior_to_full(
 template <typename T, bool THREADED, typename Allocator>
 void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
     full_node<T, THREADED, Allocator, 0, false>* dest) const {
-    dest->eos = eos;
+    dest->eos.deep_copy_from(eos);
     int cnt = chars.count();
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars.char_at(i);
@@ -1595,8 +1599,9 @@ public:
     struct retired_node {
         ptr_t ptr;
         uint64_t epoch;
-        retired_node* next;
     };
+    
+    static constexpr size_t EBR_MIN_RETIRED = 64;  
 
 private:
     atomic_ptr root_;
@@ -1605,11 +1610,14 @@ private:
     builder_t builder_;
     
     
-    std::conditional_t<THREADED, std::atomic<retired_node*>, retired_node*> retired_head_{nullptr};
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  
+    std::conditional_t<THREADED, std::vector<retired_node>, int> retired_list_{};
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
     
-    void ebr_retire_node(ptr_t n, uint64_t epoch);  
-    void ebr_try_reclaim();
+    
+    void ebr_retire(ptr_t n, uint64_t epoch);      
+    void ebr_cleanup();                             
+    bool ebr_should_cleanup() const;                
+    void ebr_maybe_cleanup();                       
 
     
     
@@ -1620,14 +1628,26 @@ private:
     
     
     void retire_node(ptr_t n);
-    void maybe_reclaim() noexcept;
 
     
     
     
-    bool read_impl(ptr_t n, std::string_view key, T* out, bool need_value) const noexcept;
+    template <bool NEED_VALUE>
+    bool read_impl(ptr_t n, std::string_view key, T& out) const noexcept
+        requires NEED_VALUE;
     
-    bool read_impl_optimistic(ptr_t n, std::string_view key, T* out, bool need_value, read_path& path) const noexcept;
+    template <bool NEED_VALUE>
+    bool read_impl(ptr_t n, std::string_view key) const noexcept
+        requires (!NEED_VALUE);
+    
+    template <bool NEED_VALUE>
+    bool read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept
+        requires NEED_VALUE;
+    
+    template <bool NEED_VALUE>
+    bool read_impl_optimistic(ptr_t n, std::string_view key, read_path& path) const noexcept
+        requires (!NEED_VALUE);
+    
     bool validate_read_path(const read_path& path) const noexcept;
 
     
@@ -1799,78 +1819,67 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
     if (!n || builder_t::is_sentinel(n)) return;
     if constexpr (THREADED) {
         n->poison();
-        uint64_t epoch = ebr_slot::global_epoch().load(std::memory_order_acquire);
-        ebr_retire_node(n, epoch);  
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        uint64_t epoch = ebr_global::instance().advance_epoch();
+        ebr_retire(n, epoch);
+        
+        if (retired_list_.size() >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
+        }
     } else {
         node_deleter(n);
     }
 }
 
 TKTRIE_TEMPLATE
-void TKTRIE_CLASS::maybe_reclaim() noexcept {
+void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
+    
     if constexpr (THREADED) {
-        thread_local uint32_t reclaim_counter = 0;
-        if ((++reclaim_counter & 0x3FF) == 0) {
-            ebr_try_reclaim();
-        }
+        retired_list_.push_back({n, epoch});
     }
 }
 
 TKTRIE_TEMPLATE
-void TKTRIE_CLASS::ebr_retire_node(ptr_t n, uint64_t epoch) {
+void TKTRIE_CLASS::ebr_cleanup() {
+    
     if constexpr (THREADED) {
+        uint64_t min_epoch = ebr_global::instance().compute_min_epoch();
         
-        auto* node = new retired_node{n, epoch, nullptr};
-        retired_node* old_head = retired_head_.load(std::memory_order_relaxed);
-        do {
-            node->next = old_head;
-        } while (!retired_head_.compare_exchange_weak(old_head, node,
-                    std::memory_order_release, std::memory_order_relaxed));
-    }
-}
-
-TKTRIE_TEMPLATE
-void TKTRIE_CLASS::ebr_try_reclaim() {
-    if constexpr (THREADED) {
-        uint64_t safe = ebr_global::instance().compute_safe_epoch();
-        
-        
-        retired_node* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
-        if (!list) return;
-        
-        
-        retired_node* still_head = nullptr;
-        retired_node* still_tail = nullptr;
-        
-        while (list) {
-            retired_node* curr = list;
-            list = list->next;
-            
-            if (curr->epoch + 2 <= safe) {
-                
-                node_deleter(curr->ptr);
-                delete curr;
+        auto it = retired_list_.begin();
+        while (it != retired_list_.end()) {
+            if (it->epoch + 2 <= min_epoch) {
+                node_deleter(it->ptr);
+                it = retired_list_.erase(it);
             } else {
-                
-                curr->next = still_head;
-                still_head = curr;
-                if (!still_tail) still_tail = curr;
+                ++it;
             }
         }
+    }
+}
+
+TKTRIE_TEMPLATE
+bool TKTRIE_CLASS::ebr_should_cleanup() const {
+    if constexpr (THREADED) {
         
-        
-        if (still_head) {
-            retired_node* old_head = retired_head_.load(std::memory_order_relaxed);
-            do {
-                still_tail->next = old_head;
-            } while (!retired_head_.compare_exchange_weak(old_head, still_head,
-                        std::memory_order_release, std::memory_order_relaxed));
+        return retired_list_.size() >= EBR_MIN_RETIRED;
+    }
+    return false;
+}
+
+TKTRIE_TEMPLATE
+void TKTRIE_CLASS::ebr_maybe_cleanup() {
+    if constexpr (THREADED) {
+        if (ebr_should_cleanup()) {
+            std::lock_guard<std::mutex> lock(ebr_mutex_);
+            ebr_cleanup();
         }
     }
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out, bool need_value) const noexcept {
+template <bool NEED_VALUE>
+inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexcept
+    requires NEED_VALUE {
     if constexpr (THREADED) {
         if (!n || n->is_poisoned()) return false;
     } else {
@@ -1885,11 +1894,7 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out, bool need_va
         
         
         if (key.empty()) {
-            if (need_value) {
-                return n->try_read_eos(*out);
-            } else {
-                return n->has_eos();
-            }
+            return n->try_read_eos(out);
         }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
@@ -1906,11 +1911,7 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out, bool need_va
     
     if (n->is_skip()) {
         if (!key.empty()) return false;
-        if (need_value) {
-            return n->as_skip()->value.try_read(*out);
-        } else {
-            return true;
-        }
+        return n->as_skip()->value.try_read(out);
     }
     
     
@@ -1921,23 +1922,64 @@ bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T* out, bool need_va
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
-        if (need_value) {
-            return ln->read_value(idx, *out);
-        } else {
-            return true;
-        }
+        return ln->read_value(idx, out);
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
-    if (need_value) {
-        return fn->read_value(c, *out);
-    } else {
-        return true;
-    }
+    return fn->read_value(c, out);
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, bool need_value, read_path& path) const noexcept {
+template <bool NEED_VALUE>
+inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcept
+    requires (!NEED_VALUE) {
+    if constexpr (THREADED) {
+        if (!n || n->is_poisoned()) return false;
+    } else {
+        if (!n) return false;
+    }
+    
+    
+    while (true) {
+        if (!consume_prefix(key, n->skip_str())) return false;
+        
+        if (n->is_leaf()) break;
+        
+        
+        if (key.empty()) {
+            return n->has_eos();
+        }
+        
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        key.remove_prefix(1);
+        n = n->get_child(c);
+        
+        if constexpr (THREADED) {
+            if (!n || n->is_poisoned()) return false;
+        } else {
+            if (!n) return false;
+        }
+    }
+    
+    
+    if (n->is_skip()) {
+        return key.empty();
+    }
+    
+    
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    
+    if (n->is_list()) [[likely]] {
+        return n->template as_list<true>()->has(c);
+    }
+    return n->template as_full<true>()->has(c);
+}
+
+TKTRIE_TEMPLATE
+template <bool NEED_VALUE>
+inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept
+    requires NEED_VALUE {
     if (!n || n->is_poisoned()) return false;
     
     if (!path.push(n)) return false;
@@ -1950,11 +1992,7 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, b
         
         
         if (key.empty()) {
-            if (need_value) {
-                return n->try_read_eos(*out);
-            } else {
-                return n->has_eos();
-            }
+            return n->try_read_eos(out);
         }
         
         unsigned char c = static_cast<unsigned char>(key[0]);
@@ -1968,11 +2006,7 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, b
     
     if (n->is_skip()) {
         if (!key.empty()) return false;
-        if (need_value) {
-            return n->as_skip()->value.try_read(*out);
-        } else {
-            return true;
-        }
+        return n->as_skip()->value.try_read(out);
     }
     
     
@@ -1983,23 +2017,57 @@ bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T* out, b
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
-        if (need_value) {
-            return ln->read_value(idx, *out);
-        } else {
-            return true;
-        }
+        return ln->read_value(idx, out);
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
-    if (need_value) {
-        return fn->read_value(c, *out);
-    } else {
-        return true;
-    }
+    return fn->read_value(c, out);
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
+template <bool NEED_VALUE>
+inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, read_path& path) const noexcept
+    requires (!NEED_VALUE) {
+    if (!n || n->is_poisoned()) return false;
+    
+    if (!path.push(n)) return false;
+    
+    
+    while (true) {
+        if (!consume_prefix(key, n->skip_str())) return false;
+        
+        if (n->is_leaf()) break;
+        
+        
+        if (key.empty()) {
+            return n->has_eos();
+        }
+        
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        key.remove_prefix(1);
+        n = n->get_child(c);
+        
+        if (!n || n->is_poisoned()) return false;
+        if (!path.push(n)) return false;
+    }
+    
+    
+    if (n->is_skip()) {
+        return key.empty();
+    }
+    
+    
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    
+    if (n->is_list()) [[likely]] {
+        return n->template as_list<true>()->has(c);
+    }
+    return n->template as_full<true>()->has(c);
+}
+
+TKTRIE_TEMPLATE
+inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     for (int i = 0; i < path.len; ++i) {
         if (path.nodes[i]->is_poisoned()) return false;
         if (path.nodes[i]->version() != path.versions[i]) return false;
@@ -2063,37 +2131,47 @@ void TKTRIE_CLASS::clear() {
     size_.store(0);
     if constexpr (THREADED) {
         
-        retired_node* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
-        while (list) {
-            retired_node* curr = list;
-            list = list->next;
-            node_deleter(curr->ptr);
-            delete curr;
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        for (auto& rn : retired_list_) {
+            node_deleter(rn.ptr);
         }
+        retired_list_.clear();
     }
 }
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::contains(const Key& key) const {
+inline bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
+        
+        const_cast<tktrie*>(this)->ebr_maybe_cleanup();
+        
         auto& slot = get_ebr_slot();
-        auto guard = slot.get_guard();
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        slot.enter(epoch);
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
             
             ptr_t root = root_.load();
-            if (!root) return false;
+            if (!root) {
+                slot.exit();
+                return false;
+            }
             if (root->is_poisoned()) continue;  
             
-            bool found = read_impl_optimistic(root, kbv, nullptr, false, path);
-            if (validate_read_path(path)) return found;
+            bool found = read_impl_optimistic<false>(root, kbv, path);
+            if (validate_read_path(path)) {
+                slot.exit();
+                return found;
+            }
         }
-        return read_impl(root_.load(), kbv, nullptr, false);
+        bool result = read_impl<false>(root_.load(), kbv);
+        slot.exit();
+        return result;
     } else {
-        return read_impl(root_.load(), kbv, nullptr, false);
+        return read_impl<false>(root_.load(), kbv);
     }
 }
 
@@ -2103,11 +2181,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert(const std:
     std::string_view kbv(kb.data(), kb.size());
     bool retired_any = false;
     auto result = insert_locked(kv.first, kbv, kv.second, &retired_any);
-    if constexpr (THREADED) {
-        if (retired_any) {
-            ebr_global::instance().advance_epoch();
-        }
-    }
     return result;
 }
 
@@ -2116,11 +2189,6 @@ bool TKTRIE_CLASS::erase(const Key& key) {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     auto [erased, retired_any] = erase_locked(kbv);
-    if constexpr (THREADED) {
-        if (retired_any) {
-            ebr_global::instance().advance_epoch();
-        }
-    }
     return erased;
 }
 
@@ -2130,27 +2198,35 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     std::string_view kbv(kb.data(), kb.size());
     T value;
     if constexpr (THREADED) {
+        
+        const_cast<tktrie*>(this)->ebr_maybe_cleanup();
+        
         auto& slot = get_ebr_slot();
-        auto guard = slot.get_guard();
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        slot.enter(epoch);
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             read_path path;
             
             ptr_t root = root_.load();
-            if (!root) return end();
+            if (!root) {
+                slot.exit();
+                return end();
+            }
             if (root->is_poisoned()) continue;
             
-            bool found = read_impl_optimistic(root, kbv, &value, true, path);
+            bool found = read_impl_optimistic<true>(root, kbv, value, path);
             if (validate_read_path(path)) {
+                slot.exit();
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
         }
-        if (read_impl(root_.load(), kbv, &value, true)) {
-            return iterator(this, kbv, value);
-        }
+        bool found = read_impl<true>(root_.load(), kbv, value);
+        slot.exit();
+        if (found) return iterator(this, kbv, value);
     } else {
-        if (read_impl(root_.load(), kbv, &value, true)) {
+        if (read_impl<true>(root_.load(), kbv, value)) {
             return iterator(this, kbv, value);
         }
     }
@@ -2160,14 +2236,11 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
-        
-        retired_node* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
-        while (list) {
-            retired_node* curr = list;
-            list = list->next;
-            node_deleter(curr->ptr);
-            delete curr;
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        for (auto& r : retired_list_) {
+            node_deleter(r.ptr);
         }
+        retired_list_.clear();
     }
 }
 
@@ -3162,19 +3235,23 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
         return {iterator(this, kb, value), true};
     } else {
-        maybe_reclaim();
+        
+        ebr_maybe_cleanup();
         
         auto& slot = get_ebr_slot();
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        slot.enter(epoch);
+        
         constexpr int MAX_RETRIES = 7;
         
         for (int retry = 0; retry <= MAX_RETRIES; ++retry) {
-            auto guard = slot.get_guard();
             speculative_info spec = probe_speculative(root_.load(), kb);
             
             stat_attempt();
 
             if (spec.op == spec_op::EXISTS) {
                 stat_success(retry);
+                slot.exit();
                 return {iterator(this, kb, value), false};
             }
 
@@ -3203,6 +3280,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 size_.fetch_add(1);
                 stat_success(retry);
+                slot.exit();
                 return {iterator(this, kb, value), true};
             }
 
@@ -3223,6 +3301,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         n->set_eos(value);
                         size_.fetch_add(1);
                         stat_success(retry);
+                        slot.exit();
                         return {iterator(this, kb, value), true};
                     }
                 } else {
@@ -3254,6 +3333,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
+                    slot.exit();
                     return {iterator(this, kb, value), true};
                 }
             }
@@ -3284,6 +3364,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
+                    slot.exit();
                     return {iterator(this, kb, value), true};
                 }
                 dealloc_speculation(alloc);
@@ -3302,6 +3383,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (!res.inserted) {
                 if (retired_any && !res.old_nodes.empty()) *retired_any = true;
                 for (auto* old : res.old_nodes) retire_node(old);
+                slot.exit();
                 return {iterator(this, kb, value), false};
             }
             
@@ -3312,6 +3394,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (retired_any && !res.old_nodes.empty()) *retired_any = true;
             for (auto* old : res.old_nodes) retire_node(old);
             size_.fetch_add(1);
+            slot.exit();
             return {iterator(this, kb, value), true};
         }
     }
@@ -3701,16 +3784,20 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        maybe_reclaim();
+        
+        ebr_maybe_cleanup();
         
         auto& ebr_slot_ref = get_ebr_slot();
+        uint64_t epoch = ebr_global::instance().current_epoch();
+        ebr_slot_ref.enter(epoch);
+        
         static constexpr int MAX_RETRIES = 7;
         
         for (int retry = 0; retry <= MAX_RETRIES; ++retry) {
-            auto guard = ebr_slot_ref.get_guard();
             erase_spec_info info = probe_erase(root_.load(), kb);
 
             if (info.op == erase_op::NOT_FOUND) {
+                ebr_slot_ref.exit();
                 return {false, false};
             }
 
@@ -3720,6 +3807,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
+                    ebr_slot_ref.exit();
                     return {true, false};
                 }
                 continue;
@@ -3730,6 +3818,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
+                    ebr_slot_ref.exit();
                     return {true, false};
                 }
                 continue;
@@ -3757,6 +3846,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         retired_any = true;
                     }
                     size_.fetch_sub(1);
+                    ebr_slot_ref.exit();
                     return {true, retired_any};
                 }
                 dealloc_erase_speculation(alloc);
@@ -3768,6 +3858,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
+            ebr_slot_ref.exit();
             return apply_erase_result(res);
         }
     }

@@ -24,8 +24,10 @@ public:
         active_epoch_.store(epoch, std::memory_order_release);
     }
     
-    // No-op exit - stale epochs handled by cleanup threshold
-    void exit() noexcept {}
+    // Exit - mark slot as inactive
+    void exit() noexcept {
+        active_epoch_.store(0, std::memory_order_release);
+    }
     
     // Returns 0 if inactive, epoch otherwise
     uint64_t epoch() const noexcept { 

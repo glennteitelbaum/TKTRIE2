@@ -231,7 +231,7 @@ public:
         uint64_t epoch;
     };
     
-    static constexpr uint64_t EBR_CLEANUP_THRESHOLD = 100;
+    static constexpr size_t EBR_MIN_RETIRED = 64;  // Cleanup when retired list reaches this size
 
 private:
     atomic_ptr root_;

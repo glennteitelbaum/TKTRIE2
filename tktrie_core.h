@@ -32,7 +32,10 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         uint64_t epoch = ebr_global::instance().advance_epoch();
         ebr_retire(n, epoch);
-        ebr_cleanup();  // Check and cleanup while holding lock
+        // Cleanup when list reaches threshold
+        if (retired_list_.size() >= EBR_MIN_RETIRED) {
+            ebr_cleanup();
+        }
     } else {
         node_deleter(n);
     }
@@ -67,9 +70,8 @@ void TKTRIE_CLASS::ebr_cleanup() {
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::ebr_should_cleanup() const {
     if constexpr (THREADED) {
-        uint64_t current = ebr_global::instance().current_epoch();
-        uint64_t min_epoch = ebr_global::instance().compute_min_epoch();
-        return (current - min_epoch) > EBR_CLEANUP_THRESHOLD;
+        // Racy read of size - safe because we just want a hint
+        return retired_list_.size() >= EBR_MIN_RETIRED;
     }
     return false;
 }
@@ -360,7 +362,7 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
-        // Check cleanup BEFORE enter so our epoch doesn't block our own cleanup
+        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
         const_cast<tktrie*>(this)->ebr_maybe_cleanup();
         
         auto& slot = get_ebr_slot();
@@ -371,13 +373,21 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
             read_path path;
             
             ptr_t root = root_.load();
-            if (!root) return false;
+            if (!root) {
+                slot.exit();
+                return false;
+            }
             if (root->is_poisoned()) continue;  // Write in progress, retry
             
             bool found = read_impl_optimistic<false>(root, kbv, path);
-            if (validate_read_path(path)) return found;
+            if (validate_read_path(path)) {
+                slot.exit();
+                return found;
+            }
         }
-        return read_impl<false>(root_.load(), kbv);
+        bool result = read_impl<false>(root_.load(), kbv);
+        slot.exit();
+        return result;
     } else {
         return read_impl<false>(root_.load(), kbv);
     }
@@ -406,7 +416,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     std::string_view kbv(kb.data(), kb.size());
     T value;
     if constexpr (THREADED) {
-        // Check cleanup BEFORE enter so our epoch doesn't block our own cleanup
+        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
         const_cast<tktrie*>(this)->ebr_maybe_cleanup();
         
         auto& slot = get_ebr_slot();
@@ -417,18 +427,22 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             read_path path;
             
             ptr_t root = root_.load();
-            if (!root) return end();
+            if (!root) {
+                slot.exit();
+                return end();
+            }
             if (root->is_poisoned()) continue;
             
             bool found = read_impl_optimistic<true>(root, kbv, value, path);
             if (validate_read_path(path)) {
+                slot.exit();
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
         }
-        if (read_impl<true>(root_.load(), kbv, value)) {
-            return iterator(this, kbv, value);
-        }
+        bool found = read_impl<true>(root_.load(), kbv, value);
+        slot.exit();
+        if (found) return iterator(this, kbv, value);
     } else {
         if (read_impl<true>(root_.load(), kbv, value)) {
             return iterator(this, kbv, value);

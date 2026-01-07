@@ -31,7 +31,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        // Check cleanup BEFORE enter so our epoch doesn't block our own cleanup
+        // Check cleanup BEFORE enter so our epoch doesn't block cleanup
         ebr_maybe_cleanup();
         
         auto& ebr_slot_ref = get_ebr_slot();
@@ -44,6 +44,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             erase_spec_info info = probe_erase(root_.load(), kb);
 
             if (info.op == erase_op::NOT_FOUND) {
+                ebr_slot_ref.exit();
                 return {false, false};
             }
 
@@ -53,6 +54,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
+                    ebr_slot_ref.exit();
                     return {true, false};
                 }
                 continue;
@@ -63,6 +65,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (!validate_erase_path(info)) continue;
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
                     size_.fetch_sub(1);
+                    ebr_slot_ref.exit();
                     return {true, false};
                 }
                 continue;
@@ -90,6 +93,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         retired_any = true;
                     }
                     size_.fetch_sub(1);
+                    ebr_slot_ref.exit();
                     return {true, retired_any};
                 }
                 dealloc_erase_speculation(alloc);
@@ -101,6 +105,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
+            ebr_slot_ref.exit();
             return apply_erase_result(res);
         }
     }
