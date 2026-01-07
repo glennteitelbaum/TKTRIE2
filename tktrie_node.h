@@ -265,11 +265,11 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     // Unified interface
     int count() const noexcept { return chars.count(); }
+    int find(unsigned char c) const noexcept { return chars.find(c); }
     bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
     
-    bool get_value(unsigned char c, T& out) const noexcept {
-        int idx = chars.find(c);
-        if (idx < 0) return false;
+    // Caller must verify find(c) >= 0 first
+    bool read_value(int idx, T& out) const noexcept {
         return values[idx].try_read(out);
     }
     
@@ -501,10 +501,10 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     // Unified interface
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }  // Non-atomic read
     
-    bool get_value(unsigned char c, T& out) const noexcept {
-        if (!valid.template atomic_test<THREADED>(c)) return false;
+    // Caller must verify has(c) first
+    bool read_value(unsigned char c, T& out) const noexcept {
         return values[c].try_read(out);
     }
     
@@ -555,14 +555,14 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     // Unified interface
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
     
     ptr_t get_child(unsigned char c) const noexcept {
         return children[c].load();
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
-        return valid.template atomic_test<THREADED>(c) ? &children[c] : nullptr;
+        return valid.test(c) ? &children[c] : nullptr;
     }
     
     void add_child(unsigned char c, ptr_t child) {
@@ -617,14 +617,14 @@ struct full_node<T, THREADED, Allocator, 0, false>
     
     // Unified interface
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
     
     ptr_t get_child(unsigned char c) const noexcept {
         return children[c].load();
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
-        return valid.template atomic_test<THREADED>(c) ? &children[c] : nullptr;
+        return valid.test(c) ? &children[c] : nullptr;
     }
     
     void add_child(unsigned char c, ptr_t child) {

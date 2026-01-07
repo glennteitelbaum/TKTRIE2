@@ -155,12 +155,15 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T* out) cons
     
     if (leaf->is_list()) [[likely]] {
         auto* ln = leaf->template as_list<true>();
-        if (!out) return ln->has(c);
-        return ln->get_value(c, *out);
+        int idx = ln->find(c);
+        if (idx < 0) return false;
+        if (!out) return true;
+        return ln->read_value(idx, *out);
     }
     auto* fn = leaf->template as_full<true>();
-    if (!out) return fn->has(c);
-    return fn->get_value(c, *out);
+    if (!fn->has(c)) return false;
+    if (!out) return true;
+    return fn->read_value(c, *out);
 }
 
 TKTRIE_TEMPLATE

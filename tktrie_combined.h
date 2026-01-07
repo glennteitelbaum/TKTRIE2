@@ -746,11 +746,11 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     
     int count() const noexcept { return chars.count(); }
+    int find(unsigned char c) const noexcept { return chars.find(c); }
     bool has(unsigned char c) const noexcept { return chars.find(c) >= 0; }
     
-    bool get_value(unsigned char c, T& out) const noexcept {
-        int idx = chars.find(c);
-        if (idx < 0) return false;
+    
+    bool read_value(int idx, T& out) const noexcept {
         return values[idx].try_read(out);
     }
     
@@ -970,10 +970,10 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }  
     
-    bool get_value(unsigned char c, T& out) const noexcept {
-        if (!valid.template atomic_test<THREADED>(c)) return false;
+    
+    bool read_value(unsigned char c, T& out) const noexcept {
         return values[c].try_read(out);
     }
     
@@ -1020,14 +1020,14 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
     
     ptr_t get_child(unsigned char c) const noexcept {
         return children[c].load();
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
-        return valid.template atomic_test<THREADED>(c) ? &children[c] : nullptr;
+        return valid.test(c) ? &children[c] : nullptr;
     }
     
     void add_child(unsigned char c, ptr_t child) {
@@ -1078,14 +1078,14 @@ struct full_node<T, THREADED, Allocator, 0, false>
     
     
     int count() const noexcept { return valid.count(); }
-    bool has(unsigned char c) const noexcept { return valid.template atomic_test<THREADED>(c); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
     
     ptr_t get_child(unsigned char c) const noexcept {
         return children[c].load();
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
-        return valid.template atomic_test<THREADED>(c) ? &children[c] : nullptr;
+        return valid.test(c) ? &children[c] : nullptr;
     }
     
     void add_child(unsigned char c, ptr_t child) {
@@ -1924,12 +1924,15 @@ bool TKTRIE_CLASS::read_from_leaf(ptr_t leaf, std::string_view key, T* out) cons
     
     if (leaf->is_list()) [[likely]] {
         auto* ln = leaf->template as_list<true>();
-        if (!out) return ln->has(c);
-        return ln->get_value(c, *out);
+        int idx = ln->find(c);
+        if (idx < 0) return false;
+        if (!out) return true;
+        return ln->read_value(idx, *out);
     }
     auto* fn = leaf->template as_full<true>();
-    if (!out) return fn->has(c);
-    return fn->get_value(c, *out);
+    if (!fn->has(c)) return false;
+    if (!out) return true;
+    return fn->read_value(c, *out);
 }
 
 TKTRIE_TEMPLATE
