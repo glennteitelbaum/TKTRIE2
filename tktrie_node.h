@@ -113,6 +113,7 @@ struct node_base {
     uint64_t version() const noexcept { return get_version(header()); }
     void bump_version() noexcept { header_.store(gteitelbaum::bump_version(header_.load())); }
     void poison() noexcept { header_.store(header_.load() | FLAG_POISON); }
+    void unpoison() noexcept { header_.store(header_.load() & ~FLAG_POISON); }
     bool is_poisoned() const noexcept { return is_poisoned_header(header()); }
     
     // Type queries
@@ -408,11 +409,24 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
         }
     }
     
+    void copy_children_to(list_node* dest) const {
+        dest->chars = chars;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
     void move_interior_to(list_node* dest) {
         move_children_to(dest);
     }
     
+    void copy_interior_to(list_node* dest) const {
+        copy_children_to(dest);
+    }
+    
     void move_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest);
+    void copy_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const;
 };
 
 // =============================================================================
@@ -482,12 +496,26 @@ struct list_node<T, THREADED, Allocator, 0, false>
         }
     }
     
+    void copy_children_to(list_node* dest) const {
+        dest->chars = chars;
+        int cnt = chars.count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
     void move_interior_to(list_node* dest) {
         dest->eos = std::move(eos);
         move_children_to(dest);
     }
     
+    void copy_interior_to(list_node* dest) const {
+        dest->eos = eos;
+        copy_children_to(dest);
+    }
+    
     void move_interior_to_full(full_node<T, THREADED, Allocator, 0, false>* dest);
+    void copy_interior_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) const;
 };
 
 // =============================================================================
@@ -594,6 +622,13 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
             children[c].store(nullptr);
         });
     }
+    
+    void copy_interior_to(full_node* dest) const {
+        dest->valid = valid;
+        valid.for_each_set([this, dest](unsigned char c) {
+            dest->children[c].store(children[c].load());
+        });
+    }
 };
 
 // =============================================================================
@@ -650,6 +685,14 @@ struct full_node<T, THREADED, Allocator, 0, false>
             children[c].store(nullptr);
         });
     }
+    
+    void copy_interior_to(full_node* dest) const {
+        dest->eos = eos;
+        dest->valid = valid;
+        valid.for_each_set([this, dest](unsigned char c) {
+            dest->children[c].store(children[c].load());
+        });
+    }
 };
 
 // Out-of-line definitions for move_interior_to_full
@@ -675,6 +718,30 @@ void list_node<T, THREADED, Allocator, 0, false>::move_interior_to_full(
         dest->valid.set(ch);
         dest->children[ch].store(children[i].load());
         children[i].store(nullptr);
+    }
+}
+
+// Out-of-line definitions for copy_interior_to_full
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+void list_node<T, THREADED, Allocator, FIXED_LEN, false>::copy_interior_to_full(
+    full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
+    int cnt = chars.count();
+    for (int i = 0; i < cnt; ++i) {
+        unsigned char ch = chars.char_at(i);
+        dest->valid.set(ch);
+        dest->children[ch].store(children[i].load());
+    }
+}
+
+template <typename T, bool THREADED, typename Allocator>
+void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
+    full_node<T, THREADED, Allocator, 0, false>* dest) const {
+    dest->eos = eos;
+    int cnt = chars.count();
+    for (int i = 0; i < cnt; ++i) {
+        unsigned char ch = chars.char_at(i);
+        dest->valid.set(ch);
+        dest->children[ch].store(children[i].load());
     }
 }
 
@@ -785,6 +852,12 @@ public:
     
     void dealloc_node(ptr_t n) {
         if (!n || is_sentinel(n)) return;
+        
+        // If poisoned, this is a speculative node with borrowed children - don't recurse
+        if (n->is_poisoned()) {
+            delete_node(n);
+            return;
+        }
         
         if (!n->is_leaf()) {
             if (n->is_list()) [[likely]] {

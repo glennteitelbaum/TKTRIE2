@@ -162,7 +162,7 @@ public:
         void add(ptr_t n) { nodes[count++] = n; }
     };
     
-    // Retry statistics (for tuning)
+#ifdef TKTRIE_INSTRUMENT_RETRIES
     struct retry_stats {
         std::atomic<uint64_t> speculative_attempts{0};
         std::atomic<uint64_t> speculative_successes{0};
@@ -173,6 +173,17 @@ public:
         static retry_stats stats;
         return stats;
     }
+    static void stat_attempt() { get_retry_stats().speculative_attempts.fetch_add(1, std::memory_order_relaxed); }
+    static void stat_success(int r) { 
+        get_retry_stats().speculative_successes.fetch_add(1, std::memory_order_relaxed);
+        if (r < 8) get_retry_stats().retries[r].fetch_add(1, std::memory_order_relaxed);
+    }
+    static void stat_fallback() { get_retry_stats().fallbacks.fetch_add(1, std::memory_order_relaxed); }
+#else
+    static void stat_attempt() {}
+    static void stat_success(int) {}
+    static void stat_fallback() {}
+#endif
 
     // -------------------------------------------------------------------------
     // Speculative erase types
