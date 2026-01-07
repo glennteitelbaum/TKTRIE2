@@ -901,6 +901,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     // Caller must verify find(c) >= 0 first
     bool read_value(int idx, T& out) const noexcept {
+        [[assume(idx >= 0 && idx < 7)]];
         return values[idx].try_read(out);
     }
     
@@ -2349,6 +2350,7 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
 
 TKTRIE_TEMPLATE
 inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
+    [[assume(path.len >= 0 && path.len <= 64)]];
     for (int i = 0; i < path.len; ++i) {
         // Single atomic load: poison and version are both in header
         uint64_t h = path.nodes[i]->header();
@@ -2848,6 +2850,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
         ptr_t full = builder_.make_leaf_full(leaf->skip_str());
         auto* fn = full->template as_full<true>();
+        [[assume(ln->count() == 7)]];  // Must be LIST_MAX to reach here
         for (int i = 0; i < ln->count(); ++i) {
             unsigned char ch = ln->chars.char_at(i);
             T val;
@@ -2880,6 +2883,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
     if (leaf->is_list()) [[likely]] {
         auto* src = leaf->template as_list<true>();
         int leaf_count = src->count();
+        [[assume(leaf_count >= 0 && leaf_count <= 7)]];
         int existing_idx = src->chars.find(first_c);
         bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
         
@@ -3361,6 +3365,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t full = builder_.make_leaf_full(std::string(skip));
         auto* src = info.target->template as_list<true>();
         auto* dst = full->template as_full<true>();
+        [[assume(src->count() == 7)]];  // Must be LIST_MAX to reach here
         for (int i = 0; i < src->count(); ++i) {
             unsigned char ch = src->chars.char_at(i);
             T val{};
@@ -3458,6 +3463,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
+    [[assume(info.path_len >= 0 && info.path_len <= 64)]];
     for (int i = 0; i < info.path_len; ++i) {
         if (info.path[i].node->is_poisoned()) return false;
         if (info.path[i].node->version() != info.path[i].version) return false;
@@ -3505,6 +3511,7 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::EMPTY_TREE:
         if (root_.load() != nullptr) return false;
         // Unpoison before making visible
+        [[assume(alloc.count >= 0 && alloc.count <= 8)]];
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
         }
@@ -3523,6 +3530,7 @@ bool TKTRIE_CLASS::commit_speculative(
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
         // Unpoison before making visible
+        [[assume(alloc.count >= 0 && alloc.count <= 8)]];
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
         }
@@ -3543,6 +3551,7 @@ bool TKTRIE_CLASS::commit_speculative(
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_speculation(pre_alloc& alloc) {
+    [[assume(alloc.count >= 0 && alloc.count <= 8)]];
     // Iterate all allocated nodes - dealloc_node handles poison (won't recurse into borrowed children)
     for (int i = 0; i < alloc.count; ++i) {
         if (alloc.nodes[i]) {
@@ -4000,6 +4009,7 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexcept {
+    [[assume(info.path_len >= 0 && info.path_len <= 64)]];
     for (int i = 0; i < info.path_len; ++i) {
         if (info.path[i].node->is_poisoned()) return false;
         if (info.path[i].node->version() != info.path[i].version) return false;
@@ -4064,6 +4074,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
         
         if (alloc.replacement) {
             if (!slot || slot->load() != target) return false;
+            [[assume(alloc.count >= 0 && alloc.count <= 4)]];
             for (int i = 0; i < alloc.count; ++i) {
                 if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
             }
@@ -4085,6 +4096,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
         if (!alloc.replacement) return false;
         if (!slot || slot->load() != info.target) return false;
         
+        [[assume(alloc.count >= 0 && alloc.count <= 4)]];
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
         }
@@ -4112,6 +4124,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
+    [[assume(alloc.count >= 0 && alloc.count <= 4)]];
     for (int i = 0; i < alloc.count; ++i) {
         if (alloc.nodes[i]) {
             builder_.dealloc_node(alloc.nodes[i]);

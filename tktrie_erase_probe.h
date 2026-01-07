@@ -235,6 +235,7 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexcept {
+    [[assume(info.path_len >= 0 && info.path_len <= 64)]];
     for (int i = 0; i < info.path_len; ++i) {
         if (info.path[i].node->is_poisoned()) return false;
         if (info.path[i].node->version() != info.path[i].version) return false;
@@ -299,6 +300,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
         
         if (alloc.replacement) {
             if (!slot || slot->load() != target) return false;
+            [[assume(alloc.count >= 0 && alloc.count <= 4)]];
             for (int i = 0; i < alloc.count; ++i) {
                 if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
             }
@@ -320,6 +322,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
         if (!alloc.replacement) return false;
         if (!slot || slot->load() != info.target) return false;
         
+        [[assume(alloc.count >= 0 && alloc.count <= 4)]];
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
         }
@@ -347,6 +350,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
+    [[assume(alloc.count >= 0 && alloc.count <= 4)]];
     for (int i = 0; i < alloc.count; ++i) {
         if (alloc.nodes[i]) {
             builder_.dealloc_node(alloc.nodes[i]);

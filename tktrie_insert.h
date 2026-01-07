@@ -273,6 +273,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
         ptr_t full = builder_.make_leaf_full(leaf->skip_str());
         auto* fn = full->template as_full<true>();
+        [[assume(ln->count() == 7)]];  // Must be LIST_MAX to reach here
         for (int i = 0; i < ln->count(); ++i) {
             unsigned char ch = ln->chars.char_at(i);
             T val;
@@ -305,6 +306,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
     if (leaf->is_list()) [[likely]] {
         auto* src = leaf->template as_list<true>();
         int leaf_count = src->count();
+        [[assume(leaf_count >= 0 && leaf_count <= 7)]];
         int existing_idx = src->chars.find(first_c);
         bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
         

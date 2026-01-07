@@ -275,6 +275,7 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     // Caller must verify find(c) >= 0 first
     bool read_value(int idx, T& out) const noexcept {
+        [[assume(idx >= 0 && idx < 7)]];
         return values[idx].try_read(out);
     }
     
