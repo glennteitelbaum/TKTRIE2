@@ -387,6 +387,9 @@ public:
     iterator find(const Key& key) const;
     iterator end() const noexcept { return iterator(); }
     void reclaim_retired() noexcept;
+    
+    // For diagnostics/testing only
+    ptr_t test_root() const noexcept { return root_.load(); }
 };
 
 // =============================================================================
