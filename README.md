@@ -1,107 +1,152 @@
-# tktrie Performance
+# TKTRIE
 
-## When to Use
+A high-performance concurrent trie (radix tree) optimized for integer and string keys.
 
-| Use Case | Recommendation |
-|----------|----------------|
-| Single-threaded, need fastest lookups | `std::unordered_map` |
-| Single-threaded, need ordered iteration | `tktrie` or `std::map` *(small N)* |
-| Multi-threaded, read-heavy (>90% reads) | `concurrent_tktrie` |
-| Multi-threaded, many readers + few writers | `concurrent_tktrie` |
-| Multi-threaded, write-heavy | `guarded unordered_map` |
-| Prefix/range queries needed | `tktrie` |
-| Sequential/sorted keys | `tktrie` (best compression) |
+## Features
 
----
+- **Lock-free reads**: Readers never block, even during concurrent writes
+- **Per-trie isolation**: Each trie has independent epoch tracking - no global contention
+- **Adaptive node types**: Five node types (SKIP, BINARY, LIST, POP, FULL) minimize memory usage
+- **Skip compression**: Patricia-style path compression reduces tree depth
+- **Integer key support**: Native support for int32/int64 keys with sort-preserving encoding
+- **C++20**: Modern C++ with concepts, constexpr, and standard library features
 
-## Non-Threaded Performance (100K keys)
+## Quick Start
 
-### Random Keys
+```cpp
+#include "tktrie.h"
 
-| Operation | tktrie | std::map | unordered_map | vs map | vs umap |
-|-----------|-------:|--------:|-------------:|-------:|--------:|
-| insert | 25.5ms | 25.7ms | 6.4ms | 0.99x | 3.96x |
-| find | 5.7ms | 19.1ms | 1.4ms | **0.30x** | 4.20x |
-| insert+erase | 33.8ms | 41.6ms | 7.2ms | 0.81x | 4.72x |
+using namespace gteitelbaum;
 
-### Sequential Keys
+// Single-threaded integer trie
+int64_trie<std::string> trie;
+trie.insert({42, "hello"});
+trie.insert({100, "world"});
 
-| Operation | tktrie | std::map | unordered_map | vs map | vs umap |
-|-----------|-------:|--------:|-------------:|-------:|--------:|
-| insert | 3.5ms | 9.7ms | 2.5ms | **0.36x** | 1.40x |
-| find | 1.1ms | 6.1ms | 0.3ms | **0.18x** | 3.76x |
-| insert+erase | 6.1ms | 14.1ms | 3.6ms | **0.44x** | 1.73x |
+auto it = trie.find(42);
+if (it.valid()) {
+    std::cout << it.value() << std::endl;  // "hello"
+}
 
----
+// Concurrent integer trie (thread-safe)
+concurrent_int64_trie<int> ctrie;
+// Safe to call from multiple threads:
+ctrie.insert({1, 100});
+ctrie.find(1);
+ctrie.erase(1);
+```
 
-## Threaded Performance (100K keys)
+## Type Aliases
 
-### Find Scaling (Random Keys)
+| Alias | Description |
+|-------|-------------|
+| `string_trie<T>` | Single-threaded string key trie |
+| `concurrent_string_trie<T>` | Thread-safe string key trie |
+| `int32_trie<T>` | Single-threaded int32 key trie |
+| `concurrent_int32_trie<T>` | Thread-safe int32 key trie |
+| `int64_trie<T>` | Single-threaded int64 key trie |
+| `concurrent_int64_trie<T>` | Thread-safe int64 key trie |
 
-| Threads | tktrie | guarded_map | guarded_umap | vs gmap | vs gumap |
-|--------:|-------:|------------:|-----------:|--------:|---------:|
-| 1 | 8.8ms | 27.7ms | 4.3ms | 0.32x | 2.05x |
-| 2 | 3.7ms | 14.2ms | 7.5ms | **0.26x** | **0.50x** |
-| 4 | 1.9ms | 8.2ms | 8.4ms | **0.24x** | **0.23x** |
+## Configuration Defines
 
-### Find Scaling (Sequential Keys)
+### User-Configurable
 
-| Threads | tktrie | guarded_map | guarded_umap | vs gmap | vs gumap |
-|--------:|-------:|------------:|-----------:|--------:|---------:|
-| 1 | 1.7ms | 9.3ms | 2.3ms | 0.18x | 0.72x |
-| 2 | 1.0ms | 6.3ms | 7.5ms | **0.16x** | **0.13x** |
-| 4 | 0.6ms | 8.9ms | 8.6ms | **0.07x** | **0.07x** |
+| Define | Effect |
+|--------|--------|
+| `NDEBUG` | Disables debug assertions (standard C++) |
+| `TKTRIE_INSTRUMENT_RETRIES` | Enables retry statistics collection for debugging concurrent behavior |
 
----
+### Internal Constants
 
-## Read vs Write Contention (4 readers)
+These are defined in `tktrie_defines.h` and control node sizing:
 
-### Random Keys
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `BINARY_MAX` | 2 | Maximum entries in BINARY node |
+| `LIST_MAX` | 7 | Maximum entries in LIST node |
+| `POP_MAX` | 32 | Maximum entries in POP node |
 
-| Writers | tktrie reads/ms | guarded_map reads/ms | guarded_umap reads/ms |
-|--------:|----------------:|---------------------:|----------------------:|
-| 0 | 64,839 | 11,937 | 12,784 |
-| 1 | 13,160 | 10,548 | 11,281 |
-| 2 | 27,443 | 9,278 | 10,556 |
-| 4 | 21,026 | 9,471 | 9,414 |
+### Header Flags (Internal)
 
-### Sequential Keys
+| Flag | Bit | Description |
+|------|-----|-------------|
+| `FLAG_LEAF` | 63 | Node is a leaf (stores values) |
+| `FLAG_SKIP` | 62 | SKIP node type (1 entry, leaf only) |
+| `FLAG_BINARY` | 61 | BINARY node type (2 entries) |
+| `FLAG_LIST` | 60 | LIST node type (3-7 entries) |
+| `FLAG_POP` | 59 | POP node type (8-32 entries) |
+| `FLAG_POISON` | 58 | Node is retired (pending deletion) |
 
-| Writers | tktrie reads/ms | guarded_map reads/ms | guarded_umap reads/ms |
-|--------:|----------------:|---------------------:|----------------------:|
-| 0 | 338,826 | 10,930 | 11,767 |
-| 1 | 163,613 | 9,570 | 9,753 |
-| 2 | 160,361 | 8,387 | 9,433 |
-| 4 | 75,269 | 8,095 | 8,447 |
+## Header File Hierarchy
 
----
+```
+tktrie.h                    ← Main include (use this)
+├── tktrie_defines.h        ← Constants, utilities, small_list, bitmap256
+├── tktrie_node.h           ← Node types (skip, binary, list, pop, full)
+│   ├── tktrie_defines.h
+│   └── tktrie_dataptr.h    ← Compressed data pointer for fixed-length keys
+├── tktrie_ebr.h            ← Epoch-based reclamation utilities
+└── tktrie_core.h           ← Core implementation (find, contains, clear)
+    └── tktrie_insert.h     ← Insert implementation
+        └── tktrie_insert_probe.h  ← Speculative insert probing
+            └── tktrie_erase_probe.h   ← Speculative erase probing
+                └── tktrie_erase.h     ← Erase implementation
+```
 
-## Reader Scaling (1 writer active)
+### File Descriptions
 
-### Random Keys
+| File | Lines | Description |
+|------|-------|-------------|
+| `tktrie.h` | ~490 | Main header - class declaration, type aliases, iterator |
+| `tktrie_defines.h` | ~280 | Constants, `small_list`, `bitmap256`, endian utilities |
+| `tktrie_node.h` | ~1400 | All 5 node types with leaf/interior specializations |
+| `tktrie_dataptr.h` | ~110 | Compressed pointer for fixed-length key optimization |
+| `tktrie_ebr.h` | ~35 | Thread slot hashing for EBR |
+| `tktrie_core.h` | ~620 | Read operations, EBR cleanup, public API |
+| `tktrie_insert.h` | ~350 | Insert logic and node splitting |
+| `tktrie_insert_probe.h` | ~340 | Lock-free insert probing |
+| `tktrie_erase_probe.h` | ~100 | Lock-free erase probing |
+| `tktrie_erase.h` | ~200 | Erase logic and node collapse |
 
-| Readers | tktrie reads/ms | tktrie writes/ms | guarded_map reads/ms | guarded_map writes/ms |
-|--------:|----------------:|-----------------:|---------------------:|----------------------:|
-| 1 | 2,916 | 202 | 4,921 | 169 |
-| 2 | 6,574 | 231 | 12,977 | 54 |
-| 4 | 13,566 | 166 | 12,077 | 10 |
-| 8 | 22,663 | 104 | 5,702 | 1 |
+## Template Parameters
 
-### Sequential Keys
+```cpp
+template <typename Key, typename T, bool THREADED = false, typename Allocator = std::allocator<uint64_t>>
+class tktrie;
+```
 
-| Readers | tktrie reads/ms | tktrie writes/ms | guarded_map reads/ms | guarded_map writes/ms |
-|--------:|----------------:|-----------------:|---------------------:|----------------------:|
-| 1 | 50,630 | 149 | 4,889 | 1,130 |
-| 2 | 96,335 | 118 | 12,111 | 64 |
-| 4 | 170,698 | 148 | 10,088 | 20 |
-| 8 | 296,288 | 51 | 5,280 | 1 |
+| Parameter | Description |
+|-----------|-------------|
+| `Key` | Key type (`std::string`, `int32_t`, `int64_t`, or any integral type) |
+| `T` | Value type |
+| `THREADED` | `false` = single-threaded, `true` = concurrent with lock-free reads |
+| `Allocator` | Allocator type (default: `std::allocator<uint64_t>`) |
 
----
+## Performance
 
-## Key Takeaways
+Under concurrent workloads with active writers, TKTRIE provides:
 
-- **Reads scale**: tktrie reads scale with thread count; guarded containers don't
-- **Sequential keys**: 10-30x faster than random due to skip compression
-- **Read-heavy wins**: At 8 readers + 1 writer, tktrie delivers 4-56x read throughput
-- **Write throughput**: tktrie maintains 50-200 writes/ms under contention vs 1-20 for guarded
-- **Single-threaded**: tktrie beats std::map 3-5x on finds; unordered_map is faster for pure hash lookups
+- **2-6x faster reads** than mutex-guarded `std::map` or `std::unordered_map`
+- **Near-linear read scaling** with thread count (lock-free)
+- **No reader blocking** regardless of write activity
+
+For single-threaded workloads, `std::unordered_map` is typically faster due to O(1) hash lookups.
+
+## Documentation
+
+- [**Concepts**](./concepts.md) - Core concepts: tries, skip compression, sentinels, EBR, poison bits
+- [**Architecture**](./architecture.md) - Detailed technical guide: node types, memory layouts, operation flows
+- [**Comparison**](./comparison.md) - Benchmark results vs `std::map` and `std::unordered_map`
+
+## Requirements
+
+- C++20 compiler (GCC 10+, Clang 12+, MSVC 19.29+)
+- Standard library with `<bit>`, `<concepts>`, `<atomic>`
+
+## License
+
+[Your license here]
+
+## Author
+
+G. Teitelbaum
