@@ -451,6 +451,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                         T val{};
                         n->try_read_eos(val);
                         dest->eos.set(val);
+                        new_bn->set_eos_flag();  // Update header flag
                     }
                 }
                 res.new_node = new_bn;
@@ -488,6 +489,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                         T val{};
                         n->try_read_eos(val);
                         dest->eos.set(val);
+                        new_ln->set_eos_flag();  // Update header flag
                     }
                 }
                 res.new_node = new_ln;
@@ -514,6 +516,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                         T val{};
                         n->try_read_eos(val);
                         dest->eos.set(val);
+                        new_pn->set_eos_flag();  // Update header flag
                     }
                 }
                 res.new_node = new_pn;

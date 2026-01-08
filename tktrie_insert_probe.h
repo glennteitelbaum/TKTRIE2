@@ -387,6 +387,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 
         ptr_t new_int = builder_.make_interior_binary(common);
         ptr_t old_child;
+        bool had_eos = info.target->has_eos();  // Capture EOS state before copy
         // Copy interior with borrowed children (poison prevents recursive delete)
         if (info.target->is_binary()) {
             old_child = builder_.make_interior_binary(skip.substr(m + 1));
@@ -400,6 +401,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         } else {
             old_child = builder_.make_interior_full(skip.substr(m + 1));
             info.target->template as_full<false>()->copy_interior_to(old_child->template as_full<false>());
+        }
+        if constexpr (FIXED_LEN == 0) {
+            if (had_eos) old_child->set_eos_flag();  // Preserve EOS flag
         }
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         new_int->template as_binary<false>()->add_child(old_c, old_child);
@@ -423,6 +427,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             new_int->set_eos(value);
         }
         ptr_t old_child;
+        bool had_eos = info.target->has_eos();  // Capture EOS state before copy
         // Copy interior with borrowed children (poison prevents recursive delete)
         if (info.target->is_binary()) {
             old_child = builder_.make_interior_binary(skip.substr(m + 1));
@@ -436,6 +441,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         } else {
             old_child = builder_.make_interior_full(skip.substr(m + 1));
             info.target->template as_full<false>()->copy_interior_to(old_child->template as_full<false>());
+        }
+        if constexpr (FIXED_LEN == 0) {
+            if (had_eos) old_child->set_eos_flag();  // Preserve EOS flag
         }
         new_int->template as_binary<false>()->add_child(old_c, old_child);
 
@@ -459,6 +467,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             T eos_val;
             if (src->eos.try_read(eos_val)) {
                 dst->eos.set(eos_val);
+                list->set_eos_flag();  // Update header flag
             }
         }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
@@ -485,6 +494,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             T eos_val;
             if (src->eos.try_read(eos_val)) {
                 dst->eos.set(eos_val);
+                pop->set_eos_flag();  // Update header flag
             }
         }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
@@ -506,6 +516,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             T eos_val;
             if (info.target->template as_pop<false>()->eos.try_read(eos_val)) {
                 full->template as_full<false>()->eos.set(eos_val);
+                full->set_eos_flag();  // Update header flag
             }
         }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);

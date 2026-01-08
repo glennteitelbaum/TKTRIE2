@@ -85,66 +85,83 @@ public:
         }
     }
     
+    // SKIP: always at floor (1 entry), never at ceil
     ptr_t make_leaf_skip(std::string_view sk, const T& value) {
         auto* n = new skip_t();
-        n->set_header(make_header(true, FLAG_SKIP));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(true, FLAG_SKIP, skip_used, /*floor=*/true, /*ceil=*/false));
         n->skip.assign(sk);
         n->value.set(value);
         return n;
     }
     
+    // BINARY: always at floor (1-2 entries), ceil when count=2
+    // Created empty, caller sets entries then updates flags
     ptr_t make_leaf_binary(std::string_view sk) {
         auto* n = new leaf_binary_t();
-        n->set_header(make_header(true, FLAG_BINARY));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(true, FLAG_BINARY, skip_used, /*floor=*/true, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
+    // LIST: floor when count=3, ceil when count=7
+    // Created empty, caller sets entries then updates flags
     ptr_t make_leaf_list(std::string_view sk) {
         auto* n = new leaf_list_t();
-        n->set_header(make_header(true, FLAG_LIST));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(true, FLAG_LIST, skip_used, /*floor=*/false, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
+    // POP: floor when count=8, ceil when count=32
     ptr_t make_leaf_pop(std::string_view sk) {
         auto* n = new leaf_pop_t();
-        n->set_header(make_header(true, FLAG_POP));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(true, FLAG_POP, skip_used, /*floor=*/false, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
+    // FULL: floor when count=33, never at ceil
     ptr_t make_leaf_full(std::string_view sk) {
         auto* n = new leaf_full_t();
-        n->set_header(make_header(true, 0));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(true, FLAG_FULL, skip_used, /*floor=*/false, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
+    // Interior nodes - same pattern
     ptr_t make_interior_binary(std::string_view sk) {
         auto* n = new interior_binary_t();
-        n->set_header(make_header(false, FLAG_BINARY));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(false, FLAG_BINARY, skip_used, /*floor=*/true, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
     ptr_t make_interior_list(std::string_view sk) {
         auto* n = new interior_list_t();
-        n->set_header(make_header(false, FLAG_LIST));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(false, FLAG_LIST, skip_used, /*floor=*/false, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
     ptr_t make_interior_pop(std::string_view sk) {
         auto* n = new interior_pop_t();
-        n->set_header(make_header(false, FLAG_POP));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(false, FLAG_POP, skip_used, /*floor=*/false, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }
     
     ptr_t make_interior_full(std::string_view sk) {
         auto* n = new interior_full_t();
-        n->set_header(make_header(false, 0));
+        bool skip_used = !sk.empty();
+        n->set_header(make_header(false, FLAG_FULL, skip_used, /*floor=*/false, /*ceil=*/false));
         n->skip.assign(sk);
         return n;
     }

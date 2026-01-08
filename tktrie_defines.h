@@ -99,47 +99,84 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][SKIP:1][BINARY:1][LIST:1][POP:1][POISON:1][VERSION:58]
-// Type determination (mutually exclusive):
-//   SKIP:   FLAG_SKIP set (always leaf, single key-value)
-//   BINARY: FLAG_BINARY set (2 entries, leaf or interior)
-//   LIST:   FLAG_LIST set (3-7 entries, leaf or interior)
-//   POP:    FLAG_POP set (8-32 entries, leaf or interior)
-//   FULL:   none of SKIP/BINARY/LIST/POP set (33+ entries, leaf or interior)
-// Note: For interior with FIXED_LEN==0, entry count includes EOS if present
-static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
-static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf, 1 entry
-static constexpr uint64_t FLAG_BINARY = 1ULL << 61;  // leaf or interior, 2 entries
-static constexpr uint64_t FLAG_LIST   = 1ULL << 60;  // leaf or interior, 3-7 entries
-static constexpr uint64_t FLAG_POP    = 1ULL << 59;  // leaf or interior, 8-32 entries
-static constexpr uint64_t FLAG_POISON = 1ULL << 58;
-static constexpr uint64_t VERSION_MASK = (1ULL << 58) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP | FLAG_POISON;
-static constexpr uint64_t TYPE_FLAGS_MASK = FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP;
+// Header layout (11 bits flags, 53 bits version):
+// [LEAF:1][POISON:1][HAS_EOS:1][SKIP_USED:1][IS_FLOOR:1][IS_CEIL:1]
+// [IS_SKIP:1][IS_BINARY:1][IS_LIST:1][IS_POP:1][IS_FULL:1][VERSION:53]
+//
+// Flag meanings:
+//   LEAF:      Node is a leaf (stores values, not children)
+//   POISON:    Node is being retired (EBR)
+//   HAS_EOS:   Interior node has end-of-string value (FIXED_LEN==0 only)
+//   SKIP_USED: Skip string is non-empty (optimization: skip skip_str() load if false)
+//   IS_FLOOR:  At minimum count for type (erase needs structural change)
+//   IS_CEIL:   At maximum count for type (insert needs structural change)
+//   IS_SKIP/BINARY/LIST/POP/FULL: Node type (exactly one set)
+//
+// IS_FLOOR/IS_CEIL thresholds (child/value count, EOS not counted):
+//   SKIP:   floor=always, ceil=n/a (single value)
+//   BINARY: floor=always (1-2), ceil=count==2
+//   LIST:   floor=count==3, ceil=count==7
+//   POP:    floor=count==8, ceil=count==32
+//   FULL:   floor=count==33, ceil=never
+
+static constexpr uint64_t FLAG_LEAF      = 1ULL << 63;
+static constexpr uint64_t FLAG_POISON    = 1ULL << 62;
+static constexpr uint64_t FLAG_HAS_EOS   = 1ULL << 61;
+static constexpr uint64_t FLAG_SKIP_USED = 1ULL << 60;
+static constexpr uint64_t FLAG_IS_FLOOR  = 1ULL << 59;
+static constexpr uint64_t FLAG_IS_CEIL   = 1ULL << 58;
+static constexpr uint64_t FLAG_SKIP      = 1ULL << 57;
+static constexpr uint64_t FLAG_BINARY    = 1ULL << 56;
+static constexpr uint64_t FLAG_LIST      = 1ULL << 55;
+static constexpr uint64_t FLAG_POP       = 1ULL << 54;
+static constexpr uint64_t FLAG_FULL      = 1ULL << 53;
+
+static constexpr uint64_t VERSION_MASK = (1ULL << 53) - 1;
+static constexpr uint64_t FLAGS_MASK = ~VERSION_MASK;
+static constexpr uint64_t TYPE_FLAGS_MASK = FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP | FLAG_FULL;
 
 static constexpr int BINARY_MAX = 2;
 static constexpr int LIST_MAX = 7;
 static constexpr int POP_MAX = 32;
+static constexpr int FULL_MIN = 33;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no type flags) + poison
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON | FLAG_FULL;
 
+// Header queries
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
 }
-
-inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, uint64_t version = 0) noexcept {
-    return (is_leaf ? FLAG_LEAF : 0) | type_flag | (version & VERSION_MASK);
-}
 inline constexpr bool is_leaf(uint64_t h) noexcept { return (h & FLAG_LEAF) != 0; }
+inline constexpr bool has_eos_flag(uint64_t h) noexcept { return (h & FLAG_HAS_EOS) != 0; }
+inline constexpr bool has_skip_used(uint64_t h) noexcept { return (h & FLAG_SKIP_USED) != 0; }
+inline constexpr bool is_at_floor(uint64_t h) noexcept { return (h & FLAG_IS_FLOOR) != 0; }
+inline constexpr bool is_at_ceil(uint64_t h) noexcept { return (h & FLAG_IS_CEIL) != 0; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
 
-// Bump version preserving flags (including poison)
+// Make header with all relevant flags
+// type_flag should be one of FLAG_SKIP, FLAG_BINARY, FLAG_LIST, FLAG_POP, FLAG_FULL
+inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, 
+                                       bool skip_used = false, bool at_floor = false, 
+                                       bool at_ceil = false, uint64_t version = 0) noexcept {
+    return (is_leaf ? FLAG_LEAF : 0) 
+         | type_flag 
+         | (skip_used ? FLAG_SKIP_USED : 0)
+         | (at_floor ? FLAG_IS_FLOOR : 0)
+         | (at_ceil ? FLAG_IS_CEIL : 0)
+         | (version & VERSION_MASK);
+}
+
+// Bump version preserving all flags
 inline constexpr uint64_t bump_version(uint64_t h) noexcept {
     uint64_t flags = h & FLAGS_MASK;
     uint64_t ver = (h & VERSION_MASK) + 1;
     return flags | (ver & VERSION_MASK);
 }
+
+// Flag manipulation helpers
+inline constexpr uint64_t set_flag(uint64_t h, uint64_t flag) noexcept { return h | flag; }
+inline constexpr uint64_t clear_flag(uint64_t h, uint64_t flag) noexcept { return h & ~flag; }
 
 template <typename T>
 constexpr T ktrie_byteswap(T value) noexcept {

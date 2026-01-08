@@ -126,13 +126,29 @@ struct node_base {
     void unpoison() noexcept { header_.store(header_.load() & ~FLAG_POISON); }
     bool is_poisoned() const noexcept { return is_poisoned_header(header()); }
     
-    // Type queries
+    // Type queries (exactly one type flag is set)
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
     bool is_binary() const noexcept { return header() & FLAG_BINARY; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
     bool is_pop() const noexcept { return header() & FLAG_POP; }
-    bool is_full() const noexcept { return !(header() & TYPE_FLAGS_MASK); }
+    bool is_full() const noexcept { return header() & FLAG_FULL; }
+    
+    // Capacity flag queries
+    bool at_floor() const noexcept { return is_at_floor(header()); }
+    bool at_ceil() const noexcept { return is_at_ceil(header()); }
+    bool skip_used() const noexcept { return has_skip_used(header()); }
+    bool eos_flag() const noexcept { return has_eos_flag(header()); }
+    
+    // Flag manipulation (atomic read-modify-write)
+    void set_floor() noexcept { header_.store(set_flag(header_.load(), FLAG_IS_FLOOR)); }
+    void clear_floor() noexcept { header_.store(clear_flag(header_.load(), FLAG_IS_FLOOR)); }
+    void set_ceil() noexcept { header_.store(set_flag(header_.load(), FLAG_IS_CEIL)); }
+    void clear_ceil() noexcept { header_.store(clear_flag(header_.load(), FLAG_IS_CEIL)); }
+    void set_eos_flag() noexcept { header_.store(set_flag(header_.load(), FLAG_HAS_EOS)); }
+    void clear_eos_flag() noexcept { header_.store(clear_flag(header_.load(), FLAG_HAS_EOS)); }
+    void set_skip_used_flag() noexcept { header_.store(set_flag(header_.load(), FLAG_SKIP_USED)); }
+    void clear_skip_used_flag() noexcept { header_.store(clear_flag(header_.load(), FLAG_SKIP_USED)); }
     
     // Downcasts
     skip_node<T, THREADED, Allocator, FIXED_LEN>* as_skip() noexcept {
@@ -223,10 +239,7 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             return false;
         } else {
-            if (is_binary()) return as_binary<false>()->eos.has_data();
-            if (is_list()) [[likely]] return as_list<false>()->eos.has_data();
-            if (is_pop()) return as_pop<false>()->eos.has_data();
-            return as_full<false>()->eos.has_data();
+            return eos_flag();  // Use cached flag instead of pointer check
         }
     }
     
@@ -235,6 +248,7 @@ struct node_base {
             (void)out;
             return false;
         } else {
+            if (!eos_flag()) return false;  // Fast path: check flag first
             if (is_binary()) return as_binary<false>()->eos.try_read(out);
             if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
             if (is_pop()) return as_pop<false>()->eos.try_read(out);
@@ -250,6 +264,7 @@ struct node_base {
             else if (is_list()) [[likely]] as_list<false>()->eos.set(value);
             else if (is_pop()) as_pop<false>()->eos.set(value);
             else as_full<false>()->eos.set(value);
+            set_eos_flag();  // Update header flag
         }
     }
     
@@ -261,6 +276,7 @@ struct node_base {
             else if (is_list()) [[likely]] as_list<false>()->eos.clear();
             else if (is_pop()) as_pop<false>()->eos.clear();
             else as_full<false>()->eos.clear();
+            clear_eos_flag();  // Update header flag
         }
     }
 };

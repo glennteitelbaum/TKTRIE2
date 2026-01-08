@@ -607,10 +607,13 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std::string_view new_skip) {
+    bool had_eos = n->has_eos();  // Check BEFORE moving (move clears source)
+    
     if (n->is_binary()) {
         ptr_t clone = builder_.make_interior_binary(new_skip);
         if constexpr (FIXED_LEN == 0) {
             n->template as_binary<false>()->move_interior_to(clone->template as_binary<false>());
+            if (had_eos) clone->set_eos_flag();  // Preserve EOS flag
         } else {
             n->template as_binary<false>()->move_children_to(clone->template as_binary<false>());
         }
@@ -619,12 +622,16 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
     if (n->is_list()) [[likely]] {
         ptr_t clone = builder_.make_interior_list(new_skip);
         n->template as_list<false>()->move_interior_to(clone->template as_list<false>());
+        if constexpr (FIXED_LEN == 0) {
+            if (had_eos) clone->set_eos_flag();  // Preserve EOS flag
+        }
         return clone;
     }
     if (n->is_pop()) {
         ptr_t clone = builder_.make_interior_pop(new_skip);
         if constexpr (FIXED_LEN == 0) {
             n->template as_pop<false>()->move_interior_to(clone->template as_pop<false>());
+            if (had_eos) clone->set_eos_flag();  // Preserve EOS flag
         } else {
             n->template as_pop<false>()->move_children_to(clone->template as_pop<false>());
         }
@@ -632,6 +639,9 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
     }
     ptr_t clone = builder_.make_interior_full(new_skip);
     n->template as_full<false>()->move_interior_to(clone->template as_full<false>());
+    if constexpr (FIXED_LEN == 0) {
+        if (had_eos) clone->set_eos_flag();  // Preserve EOS flag
+    }
     return clone;
 }
 
@@ -696,6 +706,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
             T eos_val;
             if (bn->eos.try_read(eos_val)) {
                 ln->eos.set(eos_val);
+                list->set_eos_flag();  // Update header flag
             }
         }
         ln->add_child(c, child);
@@ -731,6 +742,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
                 auto* fn = full->template as_full<false>();
                 pn->move_children_to_full(fn);
                 fn->eos.set(eos_val);
+                full->set_eos_flag();  // Update header flag
                 fn->add_child(c, child);
                 builder_.delete_node(pop);
                 res.new_node = full;

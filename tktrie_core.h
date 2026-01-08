@@ -150,7 +150,10 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
     
     // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
-        if (!consume_prefix(key, n->skip_str())) return false;
+        // Skip string optimization: only load skip_str if skip is non-empty
+        if (n->skip_used()) {
+            if (!consume_prefix(key, n->skip_str())) return false;
+        }
         
         if (n->is_leaf()) break;
         
@@ -213,7 +216,10 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
     
     // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
-        if (!consume_prefix(key, n->skip_str())) return false;
+        // Skip string optimization: only load skip_str if skip is non-empty
+        if (n->skip_used()) {
+            if (!consume_prefix(key, n->skip_str())) return false;
+        }
         
         if (n->is_leaf()) break;
         
@@ -263,7 +269,10 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
     
     // Unified loop: consume skip for every node
     while (true) {
-        if (!consume_prefix(key, n->skip_str())) return false;
+        // Skip string optimization: only load skip_str if skip is non-empty
+        if (n->skip_used()) {
+            if (!consume_prefix(key, n->skip_str())) return false;
+        }
         
         if (n->is_leaf()) break;
         
@@ -320,7 +329,10 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
     
     // Unified loop: consume skip for every node
     while (true) {
-        if (!consume_prefix(key, n->skip_str())) return false;
+        // Skip string optimization: only load skip_str if skip is non-empty
+        if (n->skip_used()) {
+            if (!consume_prefix(key, n->skip_str())) return false;
+        }
         
         if (n->is_leaf()) break;
         

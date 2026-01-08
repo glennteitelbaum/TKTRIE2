@@ -258,6 +258,7 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
                 child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
             }
         } else {
+            bool had_eos = child->has_eos();  // Capture before copy
             if (child->is_binary()) {
                 merged = builder_.make_interior_binary(new_skip);
                 child->template as_binary<false>()->copy_interior_to(merged->template as_binary<false>());
@@ -270,6 +271,9 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
             } else {
                 merged = builder_.make_interior_full(new_skip);
                 child->template as_full<false>()->copy_interior_to(merged->template as_full<false>());
+            }
+            if constexpr (FIXED_LEN == 0) {
+                if (had_eos) merged->set_eos_flag();  // Preserve EOS flag
             }
         }
         
