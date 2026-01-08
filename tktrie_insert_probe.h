@@ -33,18 +33,19 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
         return info;
     }
 
+    // BINARY, LIST, POP, or FULL leaf
     info.target = n;
     info.target_version = n->version();
     info.target_skip = std::string(skip);
 
     if ((m < skip.size()) & (m < key.size())) {
-        info.op = spec_op::SPLIT_LEAF_LIST;
+        info.op = spec_op::SPLIT_LEAF_MULTI;
         info.match_pos = m;
         info.remaining_key = std::string(key);
         return info;
     }
     if (m < skip.size()) {
-        info.op = spec_op::PREFIX_LEAF_LIST;
+        info.op = spec_op::PREFIX_LEAF_MULTI;
         info.match_pos = m;
         info.remaining_key = std::string(key);
         return info;
@@ -52,18 +53,31 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     key.remove_prefix(m);
     info.remaining_key = std::string(key);
 
-    if (key.empty()) { info.op = spec_op::ADD_EOS_LEAF_LIST; return info; }
-    if (key.size() != 1) { info.op = spec_op::DEMOTE_LEAF_LIST; return info; }
+    if (key.empty()) { info.op = spec_op::ADD_EOS_LEAF_MULTI; return info; }
+    if (key.size() != 1) { info.op = spec_op::DEMOTE_LEAF_MULTI; return info; }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
     info.c = c;
 
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<true>();
+        if (bn->has(c)) { info.op = spec_op::EXISTS; return info; }
+        info.op = (bn->count() < BINARY_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::BINARY_TO_LIST_LEAF;
+        return info;
+    }
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
         if (ln->has(c)) { info.op = spec_op::EXISTS; return info; }
-        info.op = (ln->count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_FULL_LEAF;
+        info.op = (ln->count() < LIST_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::LIST_TO_POP_LEAF;
         return info;
     }
+    if (n->is_pop()) {
+        auto* pn = n->template as_pop<true>();
+        if (pn->has(c)) { info.op = spec_op::EXISTS; return info; }
+        info.op = (pn->count() < POP_MAX) ? spec_op::IN_PLACE_LEAF : spec_op::POP_TO_FULL_LEAF;
+        return info;
+    }
+    // FULL
     auto* fn = n->template as_full<true>();
     info.op = fn->has(c) ? spec_op::EXISTS : spec_op::IN_PLACE_LEAF;
     return info;
@@ -130,10 +144,20 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             info.c = c;
             info.remaining_key = std::string(key.substr(1));
 
-            if (n->is_list()) {
-                info.op = (n->template as_list<false>()->count() < LIST_MAX) 
-                    ? spec_op::IN_PLACE_INTERIOR : spec_op::ADD_CHILD_CONVERT;
+            if (n->is_binary()) {
+                auto* bn = n->template as_binary<false>();
+                info.op = (bn->count() < BINARY_MAX) 
+                    ? spec_op::IN_PLACE_INTERIOR : spec_op::BINARY_TO_LIST_INTERIOR;
+            } else if (n->is_list()) {
+                auto* ln = n->template as_list<false>();
+                info.op = (ln->count() < LIST_MAX) 
+                    ? spec_op::IN_PLACE_INTERIOR : spec_op::LIST_TO_POP_INTERIOR;
+            } else if (n->is_pop()) {
+                auto* pn = n->template as_pop<false>();
+                info.op = (pn->count() < POP_MAX) 
+                    ? spec_op::IN_PLACE_INTERIOR : spec_op::POP_TO_FULL_INTERIOR;
             } else {
+                // FULL - always in-place
                 info.op = spec_op::IN_PLACE_INTERIOR;
             }
             return info;
@@ -237,22 +261,29 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         alloc.add(child);
         break;
     }
-    case spec_op::SPLIT_LEAF_LIST: {
+    case spec_op::SPLIT_LEAF_MULTI: {
         std::string common(skip.substr(0, m));
         unsigned char old_c = static_cast<unsigned char>(skip[m]);
         unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-        ptr_t interior = builder_.make_interior_list(common);
+        ptr_t interior = builder_.make_interior_binary(common);
         ptr_t old_child;
-        if (info.target->is_list()) {
+        if (info.target->is_binary()) {
+            old_child = builder_.make_leaf_binary(skip.substr(m + 1));
+            info.target->template as_binary<true>()->copy_values_to(old_child->template as_binary<true>());
+        } else if (info.target->is_list()) {
             old_child = builder_.make_leaf_list(skip.substr(m + 1));
             info.target->template as_list<true>()->copy_values_to(old_child->template as_list<true>());
+        } else if (info.target->is_pop()) {
+            old_child = builder_.make_leaf_pop(skip.substr(m + 1));
+            info.target->template as_pop<true>()->copy_values_to(old_child->template as_pop<true>());
         } else {
             old_child = builder_.make_leaf_full(skip.substr(m + 1));
             info.target->template as_full<true>()->copy_values_to(old_child->template as_full<true>());
         }
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+        interior->template as_binary<false>()->add_child(old_c, old_child);
+        interior->template as_binary<false>()->add_child(new_c, new_child);
 
         interior->poison();
         old_child->poison();
@@ -264,22 +295,28 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         alloc.add(new_child);
         break;
     }
-    case spec_op::PREFIX_LEAF_LIST: {
+    case spec_op::PREFIX_LEAF_MULTI: {
         unsigned char old_c = static_cast<unsigned char>(skip[m]);
         
-        ptr_t interior = builder_.make_interior_list(std::string(key));
+        ptr_t interior = builder_.make_interior_binary(std::string(key));
         if constexpr (FIXED_LEN == 0) {
             interior->set_eos(value);
         }
         ptr_t old_child;
-        if (info.target->is_list()) {
+        if (info.target->is_binary()) {
+            old_child = builder_.make_leaf_binary(skip.substr(m + 1));
+            info.target->template as_binary<true>()->copy_values_to(old_child->template as_binary<true>());
+        } else if (info.target->is_list()) {
             old_child = builder_.make_leaf_list(skip.substr(m + 1));
             info.target->template as_list<true>()->copy_values_to(old_child->template as_list<true>());
+        } else if (info.target->is_pop()) {
+            old_child = builder_.make_leaf_pop(skip.substr(m + 1));
+            info.target->template as_pop<true>()->copy_values_to(old_child->template as_pop<true>());
         } else {
             old_child = builder_.make_leaf_full(skip.substr(m + 1));
             info.target->template as_full<true>()->copy_values_to(old_child->template as_full<true>());
         }
-        interior->template as_list<false>()->add_child(old_c, old_child);
+        interior->template as_binary<false>()->add_child(old_c, old_child);
 
         interior->poison();
         old_child->poison();
@@ -289,17 +326,52 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         alloc.add(old_child);
         break;
     }
-    case spec_op::LIST_TO_FULL_LEAF: {
-        ptr_t full = builder_.make_leaf_full(std::string(skip));
+    case spec_op::BINARY_TO_LIST_LEAF: {
+        ptr_t list = builder_.make_leaf_list(std::string(skip));
+        auto* src = info.target->template as_binary<true>();
+        auto* dst = list->template as_list<true>();
+        for (int i = 0; i < src->count(); ++i) {
+            T val{};
+            src->values[i].try_read(val);
+            dst->add_value(src->chars[i], val);
+        }
+        dst->add_value(info.c, value);
+        
+        list->poison();
+        
+        alloc.root_replacement = list;
+        alloc.add(list);
+        break;
+    }
+    case spec_op::LIST_TO_POP_LEAF: {
+        ptr_t pop = builder_.make_leaf_pop(std::string(skip));
         auto* src = info.target->template as_list<true>();
-        auto* dst = full->template as_full<true>();
-        [[assume(src->count() == 7)]];  // Must be LIST_MAX to reach here
+        auto* dst = pop->template as_pop<true>();
         for (int i = 0; i < src->count(); ++i) {
             unsigned char ch = src->chars.char_at(i);
             T val{};
             src->values[i].try_read(val);
             dst->add_value(ch, val);
         }
+        dst->add_value(info.c, value);
+        
+        pop->poison();
+        
+        alloc.root_replacement = pop;
+        alloc.add(pop);
+        break;
+    }
+    case spec_op::POP_TO_FULL_LEAF: {
+        ptr_t full = builder_.make_leaf_full(std::string(skip));
+        auto* src = info.target->template as_pop<true>();
+        auto* dst = full->template as_full<true>();
+        int slot = 0;
+        src->valid.for_each_set([src, dst, &slot](unsigned char ch) {
+            T val{};
+            src->values[slot].try_read(val);
+            dst->add_value(ch, val);
+            ++slot;
+        });
         dst->add_value(info.c, value);
         
         full->poison();
@@ -313,18 +385,25 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         unsigned char old_c = static_cast<unsigned char>(skip[m]);
         unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-        ptr_t new_int = builder_.make_interior_list(common);
+        ptr_t new_int = builder_.make_interior_binary(common);
         ptr_t old_child;
         // Copy interior with borrowed children (poison prevents recursive delete)
-        if (info.target->is_list()) {
+        if (info.target->is_binary()) {
+            old_child = builder_.make_interior_binary(skip.substr(m + 1));
+            info.target->template as_binary<false>()->copy_interior_to(old_child->template as_binary<false>());
+        } else if (info.target->is_list()) {
             old_child = builder_.make_interior_list(skip.substr(m + 1));
             info.target->template as_list<false>()->copy_interior_to(old_child->template as_list<false>());
+        } else if (info.target->is_pop()) {
+            old_child = builder_.make_interior_pop(skip.substr(m + 1));
+            info.target->template as_pop<false>()->copy_interior_to(old_child->template as_pop<false>());
         } else {
             old_child = builder_.make_interior_full(skip.substr(m + 1));
             info.target->template as_full<false>()->copy_interior_to(old_child->template as_full<false>());
         }
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        new_int->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+        new_int->template as_binary<false>()->add_child(old_c, old_child);
+        new_int->template as_binary<false>()->add_child(new_c, new_child);
 
         new_int->poison();
         old_child->poison();
@@ -339,20 +418,26 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::PREFIX_INTERIOR: {
         unsigned char old_c = static_cast<unsigned char>(skip[m]);
         
-        ptr_t new_int = builder_.make_interior_list(std::string(key));
+        ptr_t new_int = builder_.make_interior_binary(std::string(key));
         if constexpr (FIXED_LEN == 0) {
             new_int->set_eos(value);
         }
         ptr_t old_child;
         // Copy interior with borrowed children (poison prevents recursive delete)
-        if (info.target->is_list()) {
+        if (info.target->is_binary()) {
+            old_child = builder_.make_interior_binary(skip.substr(m + 1));
+            info.target->template as_binary<false>()->copy_interior_to(old_child->template as_binary<false>());
+        } else if (info.target->is_list()) {
             old_child = builder_.make_interior_list(skip.substr(m + 1));
             info.target->template as_list<false>()->copy_interior_to(old_child->template as_list<false>());
+        } else if (info.target->is_pop()) {
+            old_child = builder_.make_interior_pop(skip.substr(m + 1));
+            info.target->template as_pop<false>()->copy_interior_to(old_child->template as_pop<false>());
         } else {
             old_child = builder_.make_interior_full(skip.substr(m + 1));
             info.target->template as_full<false>()->copy_interior_to(old_child->template as_full<false>());
         }
-        new_int->template as_list<false>()->add_child(old_c, old_child);
+        new_int->template as_binary<false>()->add_child(old_c, old_child);
 
         new_int->poison();
         old_child->poison();
@@ -362,10 +447,67 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         alloc.add(old_child);
         break;
     }
-    case spec_op::ADD_CHILD_CONVERT: {
-        // LIST interior full, convert to FULL - copy children (poison prevents recursive delete)
+    case spec_op::BINARY_TO_LIST_INTERIOR: {
+        // BINARY interior full, convert to LIST
+        ptr_t list = builder_.make_interior_list(std::string(skip));
+        auto* src = info.target->template as_binary<false>();
+        auto* dst = list->template as_list<false>();
+        for (int i = 0; i < src->count(); ++i) {
+            dst->add_child(src->chars[i], src->children[i].load());
+        }
+        if constexpr (FIXED_LEN == 0) {
+            T eos_val;
+            if (src->eos.try_read(eos_val)) {
+                dst->eos.set(eos_val);
+            }
+        }
+        ptr_t child = create_leaf_for_key(info.remaining_key, value);
+        dst->add_child(info.c, child);
+        
+        list->poison();
+        child->poison();
+        
+        alloc.root_replacement = list;
+        alloc.add(list);
+        alloc.add(child);
+        break;
+    }
+    case spec_op::LIST_TO_POP_INTERIOR: {
+        // LIST interior full, convert to POP
+        ptr_t pop = builder_.make_interior_pop(std::string(skip));
+        auto* src = info.target->template as_list<false>();
+        auto* dst = pop->template as_pop<false>();
+        for (int i = 0; i < src->count(); ++i) {
+            unsigned char ch = src->chars.char_at(i);
+            dst->add_child(ch, src->children[i].load());
+        }
+        if constexpr (FIXED_LEN == 0) {
+            T eos_val;
+            if (src->eos.try_read(eos_val)) {
+                dst->eos.set(eos_val);
+            }
+        }
+        ptr_t child = create_leaf_for_key(info.remaining_key, value);
+        dst->add_child(info.c, child);
+        
+        pop->poison();
+        child->poison();
+        
+        alloc.root_replacement = pop;
+        alloc.add(pop);
+        alloc.add(child);
+        break;
+    }
+    case spec_op::POP_TO_FULL_INTERIOR: {
+        // POP interior full, convert to FULL
         ptr_t full = builder_.make_interior_full(std::string(skip));
-        info.target->template as_list<false>()->copy_interior_to_full(full->template as_full<false>());
+        info.target->template as_pop<false>()->copy_children_to_full(full->template as_full<false>());
+        if constexpr (FIXED_LEN == 0) {
+            T eos_val;
+            if (info.target->template as_pop<false>()->eos.try_read(eos_val)) {
+                full->template as_full<false>()->eos.set(eos_val);
+            }
+        }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
         full->template as_full<false>()->add_child(info.c, child);
         
@@ -379,10 +521,11 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     }
     // These are handled differently (in-place or complex)
     case spec_op::EXISTS:
+    case spec_op::RETRY:
     case spec_op::IN_PLACE_LEAF:
     case spec_op::IN_PLACE_INTERIOR:
-    case spec_op::ADD_EOS_LEAF_LIST:
-    case spec_op::DEMOTE_LEAF_LIST:
+    case spec_op::ADD_EOS_LEAF_MULTI:
+    case spec_op::DEMOTE_LEAF_MULTI:
         break;
     }
 
@@ -448,12 +591,16 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::SPLIT_LEAF_SKIP:
     case spec_op::PREFIX_LEAF_SKIP:
     case spec_op::EXTEND_LEAF_SKIP:
-    case spec_op::SPLIT_LEAF_LIST:
-    case spec_op::PREFIX_LEAF_LIST:
-    case spec_op::LIST_TO_FULL_LEAF:
+    case spec_op::SPLIT_LEAF_MULTI:
+    case spec_op::PREFIX_LEAF_MULTI:
+    case spec_op::BINARY_TO_LIST_LEAF:
+    case spec_op::LIST_TO_POP_LEAF:
+    case spec_op::POP_TO_FULL_LEAF:
     case spec_op::SPLIT_INTERIOR:
     case spec_op::PREFIX_INTERIOR:
-    case spec_op::ADD_CHILD_CONVERT: {
+    case spec_op::BINARY_TO_LIST_INTERIOR:
+    case spec_op::LIST_TO_POP_INTERIOR:
+    case spec_op::POP_TO_FULL_INTERIOR: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
         // Unpoison before making visible
@@ -467,10 +614,11 @@ bool TKTRIE_CLASS::commit_speculative(
 
     // These should not reach commit_speculative
     case spec_op::EXISTS:
+    case spec_op::RETRY:
     case spec_op::IN_PLACE_LEAF:
     case spec_op::IN_PLACE_INTERIOR:
-    case spec_op::ADD_EOS_LEAF_LIST:
-    case spec_op::DEMOTE_LEAF_LIST:
+    case spec_op::ADD_EOS_LEAF_MULTI:
+    case spec_op::DEMOTE_LEAF_MULTI:
         return false;
     }
     return false;
@@ -547,20 +695,31 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 ptr_t n = spec.target;
                 unsigned char c = spec.c;
                 
-                if (n->is_list()) {
+                if (n->is_binary()) {
+                    auto* bn = n->template as_binary<true>();
+                    if (bn->has(c)) continue;
+                    if (bn->count() >= BINARY_MAX) continue;  // Re-probe for conversion
+                    epoch_.fetch_add(1, std::memory_order_release);
+                    n->bump_version();
+                    bn->add_entry(c, value);
+                } else if (n->is_list()) {
                     auto* ln = n->template as_list<true>();
                     if (ln->has(c)) continue;
-                    if (ln->count() >= LIST_MAX) {
-                        // Need LIST_TO_FULL - re-probe will get it
-                        continue;
-                    }
-                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    if (ln->count() >= LIST_MAX) continue;  // Re-probe for conversion
+                    epoch_.fetch_add(1, std::memory_order_release);
                     n->bump_version();
                     ln->add_value(c, value);
+                } else if (n->is_pop()) {
+                    auto* pn = n->template as_pop<true>();
+                    if (pn->has(c)) continue;
+                    if (pn->count() >= POP_MAX) continue;  // Re-probe for conversion
+                    epoch_.fetch_add(1, std::memory_order_release);
+                    n->bump_version();
+                    pn->add_value(c, value);
                 } else {
                     auto* fn = n->template as_full<true>();
                     if (fn->has(c)) continue;
-                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);
                     n->bump_version();
                     fn->add_value_atomic(c, value);
                 }
@@ -583,7 +742,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         ptr_t n = spec.target;
                         if (n->has_eos()) continue;
                         
-                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         n->set_eos(value);
                         size_.fetch_add(1);
@@ -600,20 +759,40 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     ptr_t n = spec.target;
                     unsigned char c = spec.c;
                     
-                    if (n->is_list()) {
+                    if (n->is_binary()) {
+                        auto* bn = n->template as_binary<false>();
+                        if (bn->has(c)) { builder_.dealloc_node(child); continue; }
+                        if (bn->count() >= BINARY_MAX) {
+                            builder_.dealloc_node(child);
+                            continue;  // Re-probe for conversion
+                        }
+                        epoch_.fetch_add(1, std::memory_order_release);
+                        n->bump_version();
+                        bn->add_child(c, child);
+                    } else if (n->is_list()) {
                         auto* ln = n->template as_list<false>();
                         if (ln->has(c)) { builder_.dealloc_node(child); continue; }
                         if (ln->count() >= LIST_MAX) {
                             builder_.dealloc_node(child);
-                            continue;  // Re-probe will get ADD_CHILD_CONVERT
+                            continue;  // Re-probe for conversion
                         }
-                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         ln->add_child(c, child);
+                    } else if (n->is_pop()) {
+                        auto* pn = n->template as_pop<false>();
+                        if (pn->has(c)) { builder_.dealloc_node(child); continue; }
+                        if (pn->count() >= POP_MAX) {
+                            builder_.dealloc_node(child);
+                            continue;  // Re-probe for conversion
+                        }
+                        epoch_.fetch_add(1, std::memory_order_release);
+                        n->bump_version();
+                        pn->add_child(c, child);
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
                         if (fn->has(c)) { builder_.dealloc_node(child); continue; }
-                        epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+                        epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         fn->add_child_atomic(c, child);
                     } else {
@@ -627,9 +806,9 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
             }
 
-            // Complex ops that need full speculative path (ADD_EOS_LEAF_LIST, DEMOTE_LEAF_LIST)
+            // Complex ops that need full speculative path (ADD_EOS_LEAF_MULTI, DEMOTE_LEAF_MULTI)
             // Fall through to allocation-based speculative or fallback
-            if (spec.op == spec_op::ADD_EOS_LEAF_LIST || spec.op == spec_op::DEMOTE_LEAF_LIST) {
+            if (spec.op == spec_op::ADD_EOS_LEAF_MULTI || spec.op == spec_op::DEMOTE_LEAF_MULTI) {
                 // These are complex - use fallback
                 if (retry == MAX_RETRIES) break;
                 continue;

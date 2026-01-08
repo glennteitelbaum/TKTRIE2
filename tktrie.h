@@ -165,8 +165,10 @@ public:
         EXISTS, RETRY,  // RETRY = need to re-probe (concurrent write detected)
         IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
         SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
-        SPLIT_LEAF_LIST, PREFIX_LEAF_LIST, ADD_EOS_LEAF_LIST, LIST_TO_FULL_LEAF,
-        DEMOTE_LEAF_LIST, SPLIT_INTERIOR, PREFIX_INTERIOR, ADD_CHILD_CONVERT,
+        SPLIT_LEAF_MULTI, PREFIX_LEAF_MULTI, ADD_EOS_LEAF_MULTI,
+        BINARY_TO_LIST_LEAF, LIST_TO_POP_LEAF, POP_TO_FULL_LEAF,
+        DEMOTE_LEAF_MULTI, SPLIT_INTERIOR, PREFIX_INTERIOR,
+        BINARY_TO_LIST_INTERIOR, LIST_TO_POP_INTERIOR, POP_TO_FULL_INTERIOR,
     };
 
     struct speculative_info {
@@ -219,10 +221,10 @@ public:
     enum class erase_op {
         NOT_FOUND,
         // In-place operations (no structural change)
-        IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_FULL,
+        IN_PLACE_LEAF_BINARY, IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_POP, IN_PLACE_LEAF_FULL,
         // Structural operations
         DELETE_SKIP_LEAF,           // Delete entire SKIP leaf
-        DELETE_LAST_LEAF_ENTRY,     // Delete last entry from LIST/FULL leaf  
+        DELETE_LAST_LEAF_ENTRY,     // Delete last entry from BINARY/LIST/POP/FULL leaf  
         DELETE_EOS_INTERIOR,        // Remove EOS from interior (may collapse)
         DELETE_CHILD_COLLAPSE,      // Remove child and collapse to merged node
         DELETE_CHILD_NO_COLLAPSE,   // Remove child, no collapse needed
@@ -365,7 +367,9 @@ private:
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     erase_spec_info probe_interior_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
+    bool do_inplace_leaf_binary_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
+    bool do_inplace_leaf_pop_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     erase_pre_alloc allocate_erase_speculative(const erase_spec_info& info);
     bool validate_erase_path(const erase_spec_info& info) const noexcept;

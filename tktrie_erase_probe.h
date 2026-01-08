@@ -36,11 +36,22 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
         return info;
     }
 
-    // LIST or FULL leaf
+    // BINARY, LIST, POP, or FULL leaf
     if (key.size() != 1) { info.op = erase_op::NOT_FOUND; return info; }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
     info.c = c;
+
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<true>();
+        if (!bn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
+        if (bn->count() == 1) {
+            info.op = erase_op::DELETE_LAST_LEAF_ENTRY;
+        } else {
+            info.op = erase_op::IN_PLACE_LEAF_BINARY;
+        }
+        return info;
+    }
 
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
@@ -53,9 +64,18 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
         return info;
     }
 
+    if (n->is_pop()) {
+        auto* pn = n->template as_pop<true>();
+        if (!pn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
+        // POP never goes to 0 from in-place removal (min 8 entries)
+        info.op = erase_op::IN_PLACE_LEAF_POP;
+        return info;
+    }
+
+    // FULL
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
-    // FULL leaf always in-place (never becomes empty from one removal)
+    // FULL never goes to 0 from in-place removal (min 33 entries)
     info.op = erase_op::IN_PLACE_LEAF_FULL;
     return info;
 }
@@ -91,10 +111,18 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
             // Will collapse with single child
             unsigned char c = 0;
             ptr_t child = nullptr;
-            if (n->is_list()) {
+            if (n->is_binary()) {
+                auto* bn = n->template as_binary<false>();
+                c = bn->first_char();
+                child = bn->child_at_slot(0);
+            } else if (n->is_list()) {
                 auto* ln = n->template as_list<false>();
                 c = ln->chars.char_at(0);
                 child = ln->children[0].load();
+            } else if (n->is_pop()) {
+                auto* pn = n->template as_pop<false>();
+                c = pn->first_char();
+                child = pn->child_at_slot(0);
             } else {
                 auto* fn = n->template as_full<false>();
                 c = fn->valid.first();
@@ -195,17 +223,29 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
                 T val{};
                 child->as_skip()->value.try_read(val);
                 merged = builder_.make_leaf_skip(new_skip, val);
+            } else if (child->is_binary()) {
+                merged = builder_.make_leaf_binary(new_skip);
+                child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
             } else if (child->is_list()) {
                 merged = builder_.make_leaf_list(new_skip);
                 child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
+            } else if (child->is_pop()) {
+                merged = builder_.make_leaf_pop(new_skip);
+                child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
             } else {
                 merged = builder_.make_leaf_full(new_skip);
                 child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
             }
         } else {
-            if (child->is_list()) {
+            if (child->is_binary()) {
+                merged = builder_.make_interior_binary(new_skip);
+                child->template as_binary<false>()->copy_interior_to(merged->template as_binary<false>());
+            } else if (child->is_list()) {
                 merged = builder_.make_interior_list(new_skip);
                 child->template as_list<false>()->copy_interior_to(merged->template as_list<false>());
+            } else if (child->is_pop()) {
+                merged = builder_.make_interior_pop(new_skip);
+                child->template as_pop<false>()->copy_interior_to(merged->template as_pop<false>());
             } else {
                 merged = builder_.make_interior_full(new_skip);
                 child->template as_full<false>()->copy_interior_to(merged->template as_full<false>());
@@ -221,7 +261,9 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     }
     
     case erase_op::NOT_FOUND:
+    case erase_op::IN_PLACE_LEAF_BINARY:
     case erase_op::IN_PLACE_LEAF_LIST:
+    case erase_op::IN_PLACE_LEAF_POP:
     case erase_op::IN_PLACE_LEAF_FULL:
         break;
     }
@@ -286,8 +328,14 @@ bool TKTRIE_CLASS::commit_erase_speculative(
         if (parent->version() != info.target_version) return false;
         
         parent->bump_version();
-        if (parent->is_list()) {
+        if (parent->is_binary()) {
+            auto* bn = parent->template as_binary<false>();
+            int idx = bn->find(info.c);
+            if (idx >= 0) bn->remove_child(idx);
+        } else if (parent->is_list()) {
             parent->template as_list<false>()->remove_child(info.c);
+        } else if (parent->is_pop()) {
+            parent->template as_pop<false>()->remove_child(info.c);
         } else {
             parent->template as_full<false>()->remove_child(info.c);
         }
@@ -337,7 +385,9 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     }
     
     case erase_op::NOT_FOUND:
+    case erase_op::IN_PLACE_LEAF_BINARY:
     case erase_op::IN_PLACE_LEAF_LIST:
+    case erase_op::IN_PLACE_LEAF_POP:
     case erase_op::IN_PLACE_LEAF_FULL:
         return false;
     }
@@ -366,6 +416,19 @@ void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
+bool TKTRIE_CLASS::do_inplace_leaf_binary_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
+    if (leaf->version() != expected_version) return false;
+    auto* bn = leaf->template as_binary<true>();
+    if (!bn->has(c)) return false;
+    if (bn->count() <= 1) return false;  // Would need structural change
+
+    leaf->bump_version();
+    int idx = bn->find(c);
+    bn->remove_entry(idx);
+    return true;
+}
+
+TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
     if (leaf->version() != expected_version) return false;
     auto* ln = leaf->template as_list<true>();
@@ -374,6 +437,17 @@ bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint6
 
     leaf->bump_version();
     ln->remove_value(c);
+    return true;
+}
+
+TKTRIE_TEMPLATE
+bool TKTRIE_CLASS::do_inplace_leaf_pop_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
+    if (leaf->version() != expected_version) return false;
+    auto* pn = leaf->template as_pop<true>();
+    if (!pn->has(c)) return false;
+
+    leaf->bump_version();
+    pn->remove_value(c);
     return true;
 }
 

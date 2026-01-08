@@ -425,6 +425,10 @@ struct binary_node<T, THREADED, Allocator, FIXED_LEN, false>
             dest->children[i].store(children[i].load());
         }
     }
+    
+    void copy_interior_to(binary_node* dest) const {
+        copy_children_to(dest);
+    }
 };
 
 // =============================================================================
@@ -938,6 +942,18 @@ struct pop_node<T, THREADED, Allocator, FIXED_LEN, false>
             dest->children[i].store(children[i].load());
             children[i].store(nullptr);
         }
+    }
+    
+    void copy_children_to(pop_node* dest) const {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
+    void copy_interior_to(pop_node* dest) const {
+        copy_children_to(dest);
     }
     
     unsigned char first_char() const noexcept { return valid.first(); }
