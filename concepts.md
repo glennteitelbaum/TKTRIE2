@@ -71,25 +71,35 @@ Standard trie for "application":       TKTRIE with skip compression:
 
 Each node has a **skip string** that must match before descending. This dramatically reduces depth.
 
-### 2. Three Node Types
+### 2. Five Node Types
 
-TKTRIE uses three node types optimized for different branching factors:
+TKTRIE uses five node types optimized for different branching factors:
 
-| Type | Children | Use Case |
-|------|----------|----------|
-| **SKIP** | 0 | Leaf-only, stores single key suffix + value |
-| **LIST** | 1-7 | Small branching factor, packed in 64-bit word |
-| **FULL** | 8-256 | Large branching factor, 256-entry array + bitmap |
+| Type | Entries | Leaf Size | Interior Size | Use Case |
+|------|---------|-----------|---------------|----------|
+| **SKIP** | 1 | 24 B | N/A | Single key suffix + value (leaf only) |
+| **BINARY** | 2 | 32 B | 40 B | Two entries, minimal overhead |
+| **LIST** | 3-7 | 56 B | 80 B | Small branching, packed 64-bit chars |
+| **POP** | 8-32 | 176 B | 304 B | Medium branching, popcount indexing |
+| **FULL** | 33-256 | 1 KB | 2 KB | Large branching, direct array indexing |
 
 ```cpp
-// LIST node: children packed in single atomic uint64
-// Layout: [count:8][char6:8][char5:8]...[char0:8]
-small_list chars;            // Which characters have children
-std::array<ptr, 7> children; // The child pointers
+// BINARY node: exactly 2 entries
+unsigned char chars[2];       // The two characters
+std::array<ptr, 2> children;  // or std::array<T, 2> values
 
-// FULL node: direct indexing by character
-bitmap256 valid;             // Which slots are occupied
-std::array<ptr, 256> children;
+// LIST node: 3-7 entries packed in 64-bit word
+// Layout: [count:8][char6:8][char5:8]...[char0:8]
+small_list chars;             // Which characters have entries
+std::array<ptr, 7> children;  // or std::array<T, 7> values
+
+// POP node: 8-32 entries using popcount indexing
+bitmap32 valid;               // 32-bit bitmap of valid slots
+std::array<ptr, 32> children; // Sparse array, use popcount to find index
+
+// FULL node: 33-256 entries, direct indexing by character
+bitmap256 valid;              // 256-bit bitmap of valid slots
+std::array<ptr, 256> children;// Direct index: children[char]
 ```
 
 ### 3. Leaf vs Interior Distinction
@@ -99,15 +109,20 @@ Nodes are tagged as **leaf** or **interior**:
 - **Leaf nodes**: Store actual values, no child pointers
 - **Interior nodes**: Store child pointers, optional end-of-string (EOS) value
 
-The same LIST/FULL structure is reused:
-- Leaf LIST: `chars` + `values[7]` array
-- Interior LIST: `chars` + `children[7]` array + optional `eos_ptr`
+The same BINARY/LIST/POP/FULL structures are reused:
+- Leaf: stores `values[]` array
+- Interior: stores `children[]` array + optional `eos_ptr` (for variable-length keys)
 
-### 4. Adaptive Promotion
+### 4. Adaptive Promotion/Demotion
 
-Nodes automatically convert when needed:
-- LIST with 7 children + new insert → promotes to FULL
-- FULL with few children after delete → may demote to LIST
+Nodes automatically convert when capacity is exceeded:
+
+```
+SKIP(1) → BINARY(2) → LIST(3-7) → POP(8-32) → FULL(33-256)
+```
+
+- Insert adds entry → may promote to next tier
+- Erase removes entry → may demote to previous tier
 
 ### 5. Integer Key Support
 

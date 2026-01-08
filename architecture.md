@@ -52,27 +52,30 @@ TKTRIE is a radix trie with three key innovations:
 ### Node Type Hierarchy
 
 ```
-                       node_base<T>
-                            │
-             ┌──────────────┼──────────────┐
-             │              │              │
-         skip_node      list_node      full_node
-        (LEAF only)    (LEAF/INT)     (LEAF/INT)
+                           node_base<T>
+                                │
+        ┌───────────┬───────────┼───────────┬───────────┐
+        │           │           │           │           │
+    skip_node   binary_node  list_node   pop_node   full_node
+   (LEAF only)  (LEAF/INT)  (LEAF/INT)  (LEAF/INT)  (LEAF/INT)
+     1 entry    2 entries   3-7 entries 8-32 entries 33-256 entries
 ```
 
 All nodes share a common `node_base` with a 64-bit header. The header determines:
 - Whether the node is a leaf or interior
-- Which concrete type (SKIP, LIST, FULL)
+- Which concrete type (SKIP, BINARY, LIST, POP, FULL)
 - Poison status (for safe reclamation)
 - Version number (for optimistic concurrency)
 
 ### Node Type Selection
 
-| Child Count | Leaf Type | Interior Type |
-|-------------|-----------|---------------|
-| 0 (single value) | SKIP | N/A |
-| 1-7 | LIST | LIST |
-| 8-256 | FULL | FULL |
+| Entry Count | Leaf Type | Interior Type | Size (Leaf/Int) |
+|-------------|-----------|---------------|-----------------|
+| 1 (single value) | SKIP | N/A | 24 B |
+| 2 | BINARY | BINARY | 32 B / 40 B |
+| 3-7 | LIST | LIST | 56 B / 80 B |
+| 8-32 | POP | POP | 176 B / 304 B |
+| 33-256 | FULL | FULL | 1 KB / 2 KB |
 
 ---
 
@@ -81,30 +84,36 @@ All nodes share a common `node_base` with a 64-bit header. The header determines
 The 64-bit header packs type flags and version into a single atomic word:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    64-bit Header Layout                      │
-├──────┬──────┬──────┬──────┬──────────────────────────────────┤
-│  63  │  62  │  61  │  60  │  59                           0  │
-├──────┼──────┼──────┼──────┼──────────────────────────────────┤
-│ LEAF │ SKIP │ LIST │ POIS │        VERSION (60 bits)         │
-└──────┴──────┴──────┴──────┴──────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         64-bit Header Layout                           │
+├──────┬──────┬────────┬──────┬──────┬──────┬─────────────────────────────┤
+│  63  │  62  │   61   │  60  │  59  │  58  │  57                      0  │
+├──────┼──────┼────────┼──────┼──────┼──────┼─────────────────────────────┤
+│ LEAF │ SKIP │ BINARY │ LIST │ POP  │ POIS │      VERSION (58 bits)      │
+└──────┴──────┴────────┴──────┴──────┴──────┴─────────────────────────────┘
 
-LEAF (bit 63): 1 = leaf node, 0 = interior node
-SKIP (bit 62): 1 = skip_node type
-LIST (bit 61): 1 = list_node type
-POIS (bit 60): 1 = poisoned (pending deletion)
-VERSION:       60-bit counter, incremented on modification
+LEAF (bit 63):   1 = leaf node, 0 = interior node
+SKIP (bit 62):   1 = skip_node type (always leaf)
+BINARY (bit 61): 1 = binary_node type (2 entries)
+LIST (bit 60):   1 = list_node type (3-7 entries)
+POP (bit 59):    1 = pop_node type (8-32 entries)
+POIS (bit 58):   1 = poisoned (pending deletion)
+VERSION:         58-bit counter, incremented on modification
 ```
 
 ### Flag Combinations
 
-| LEAF | SKIP | LIST | Node Type | Description |
-|------|------|------|-----------|-------------|
-| 1 | 1 | 0 | skip_node (leaf) | Single key-value pair |
-| 1 | 0 | 1 | list_node (leaf) | 1-7 values indexed by char |
-| 1 | 0 | 0 | full_node (leaf) | 8-256 values indexed by char |
-| 0 | 0 | 1 | list_node (interior) | 1-7 child pointers |
-| 0 | 0 | 0 | full_node (interior) | 8-256 child pointers |
+| LEAF | SKIP | BINARY | LIST | POP | Node Type | Description |
+|------|------|--------|------|-----|-----------|-------------|
+| 1 | 1 | 0 | 0 | 0 | skip_node (leaf) | Single key-value pair |
+| 1 | 0 | 1 | 0 | 0 | binary_node (leaf) | 2 values indexed by char |
+| 1 | 0 | 0 | 1 | 0 | list_node (leaf) | 3-7 values indexed by char |
+| 1 | 0 | 0 | 0 | 1 | pop_node (leaf) | 8-32 values, popcount indexed |
+| 1 | 0 | 0 | 0 | 0 | full_node (leaf) | 33-256 values, direct indexed |
+| 0 | 0 | 1 | 0 | 0 | binary_node (interior) | 2 child pointers |
+| 0 | 0 | 0 | 1 | 0 | list_node (interior) | 3-7 child pointers |
+| 0 | 0 | 0 | 0 | 1 | pop_node (interior) | 8-32 child pointers |
+| 0 | 0 | 0 | 0 | 0 | full_node (interior) | 33-256 child pointers |
 
 Note: SKIP nodes are always leaves (cannot have children).
 
@@ -114,9 +123,11 @@ Note: SKIP nodes are always leaves (cannot have children).
 // Constants
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
 static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;
-static constexpr uint64_t FLAG_LIST   = 1ULL << 61;
-static constexpr uint64_t FLAG_POISON = 1ULL << 60;
-static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
+static constexpr uint64_t FLAG_BINARY = 1ULL << 61;
+static constexpr uint64_t FLAG_LIST   = 1ULL << 60;
+static constexpr uint64_t FLAG_POP    = 1ULL << 59;
+static constexpr uint64_t FLAG_POISON = 1ULL << 58;
+static constexpr uint64_t VERSION_MASK = (1ULL << 58) - 1;
 
 // Extract version
 uint64_t get_version(uint64_t h) { return h & VERSION_MASK; }
@@ -139,49 +150,66 @@ void poison() {
 
 ## Node Types in Detail
 
-### skip_node (Leaf Only)
+### skip_node (Leaf Only, 1 entry)
 
 Stores a single key-value pair. The "skip" string holds remaining key bytes.
 
 ```cpp
 struct skip_node : node_base {
     T           leaf_value;   // The stored value
-    std::string skip;         // Remaining key bytes
+    std::string skip;         // Remaining key bytes (or fixed array for integer keys)
 };
 ```
 
-**Memory Layout:**
+**Memory Layout (24 bytes for int keys):**
 ```
 ┌─────────────────────────────────────────────────┐
 │                   skip_node                     │
 ├──────────────┬────────────────┬─────────────────┤
-│    header    │   leaf_value   │      skip       │
-│   (8 bytes)  │   (sizeof T)   │  (24 + N bytes) │
+│    header    │   leaf_value   │   skip_bytes    │
+│   (8 bytes)  │   (sizeof T)   │   (8 bytes)     │
 └──────────────┴────────────────┴─────────────────┘
 ```
 
-**Example:** Key "hello" with value 42
-```
-skip_node {
-    header: LEAF | SKIP | version
-    leaf_value: 42
-    skip: "hello"
-}
+### binary_node (Leaf or Interior, 2 entries)
+
+Stores exactly 2 entries with minimal overhead.
+
+```cpp
+struct binary_node : node_base {
+    T*          eos_ptr;      // End-of-string value (interior only, string keys)
+    unsigned char chars[2];   // The two characters
+    union {
+        std::array<T, 2>          leaf_values;  // If leaf
+        std::array<atomic_ptr, 2> children;     // If interior
+    };
+    // skip stored inline or via fixed array
+};
 ```
 
-### list_node (Leaf or Interior)
+**Memory Layout (32 bytes leaf, 40 bytes interior for int keys):**
+```
+┌───────────────────────────────────────────────────────────────┐
+│                      binary_node (leaf)                       │
+├──────────────┬────────────────┬───────────────┬───────────────┤
+│    header    │   skip_bytes   │  chars[0,1]   │  values[0,1]  │
+│   (8 bytes)  │   (8 bytes)    │   (2 bytes)   │  (2*sizeof T) │
+└──────────────┴────────────────┴───────────────┴───────────────┘
+```
 
-Stores up to 7 entries, indexed by character.
+### list_node (Leaf or Interior, 3-7 entries)
+
+Stores 3-7 entries, with characters packed into a 64-bit word.
 
 ```cpp
 struct list_node : node_base {
     T*          eos_ptr;      // End-of-string value (interior only)
-    std::string skip;         // Common prefix
-    small_list  chars;        // Packed list of 1-7 chars
+    small_list  chars;        // Packed list of 3-7 chars
     union {
         std::array<T, 7>          leaf_values;  // If leaf
         std::array<atomic_ptr, 7> children;     // If interior
     };
+    // skip stored inline or via fixed array
 };
 ```
 
@@ -191,44 +219,69 @@ struct list_node : node_base {
 │ count  │ char_6 │ char_5 │ char_4 │ char_3 │ char_2 │ char_1 │ char_0 │
 │ 8 bits │ 8 bits │ 8 bits │ 8 bits │ 8 bits │ 8 bits │ 8 bits │ 8 bits │
 └────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘
-  byte 7   byte 6   byte 5   byte 4   byte 3   byte 2   byte 1   byte 0
 ```
 
-**Leaf Example:** Keys "a", "b", "c" with values 1, 2, 3
+**Memory Layout (56 bytes leaf, 80 bytes interior for int keys):**
 ```
-list_node (LEAF) {
-    header: LEAF | LIST | version
-    eos_ptr: nullptr
-    skip: ""
-    chars: [count=3, 'a', 'b', 'c', _, _, _, _]
-    leaf_values: [1, 2, 3, _, _, _, _]
-}
-```
-
-**Interior Example:** Node with children for 'x' and 'y'
-```
-list_node (INTERIOR) {
-    header: LIST | version
-    eos_ptr: nullptr (or ptr to value if "" is a valid key)
-    skip: "pre"
-    chars: [count=2, 'x', 'y', _, _, _, _, _]
-    children: [ptr_x, ptr_y, null, null, null, null, null]
-}
+┌───────────────────────────────────────────────────────────────────────┐
+│                        list_node (leaf)                               │
+├──────────────┬────────────────┬───────────────┬────────────────────────┤
+│    header    │   skip_bytes   │  small_list   │     values[0..6]       │
+│   (8 bytes)  │   (8 bytes)    │   (8 bytes)   │     (7 * sizeof T)     │
+└──────────────┴────────────────┴───────────────┴────────────────────────┘
 ```
 
-### full_node (Leaf or Interior)
+### pop_node (Leaf or Interior, 8-32 entries)
 
-Stores up to 256 entries, directly indexed by character value.
+Uses popcount indexing for efficient sparse storage.
+
+```cpp
+struct pop_node : node_base {
+    T*          eos_ptr;      // End-of-string value (interior only)
+    uint32_t    valid;        // 32-bit bitmap of valid entries
+    union {
+        std::array<T, 32>          leaf_values;  // Sparse, indexed via popcount
+        std::array<atomic_ptr, 32> children;     // Sparse, indexed via popcount
+    };
+    // skip stored inline or via fixed array
+};
+```
+
+**Popcount Indexing:**
+```
+valid = 0b00001001_00100001  // chars 0, 5, 8, 11 are valid
+
+To find index for char c:
+  if (valid & (1 << c)) {
+      index = popcount(valid & ((1 << c) - 1));  // Count bits below c
+  }
+
+Example: char 8 → popcount(0b00100001) = 2 → values[2]
+```
+
+**Memory Layout (176 bytes leaf, 304 bytes interior for int keys):**
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          pop_node (leaf)                                  │
+├──────────────┬────────────────┬───────────────┬────────────────────────────┤
+│    header    │   skip_bytes   │  valid (32b)  │       values[0..31]        │
+│   (8 bytes)  │   (8 bytes)    │   (4 bytes)   │      (32 * sizeof T)       │
+└──────────────┴────────────────┴───────────────┴────────────────────────────┘
+```
+
+### full_node (Leaf or Interior, 33-256 entries)
+
+Direct array indexing for maximum branching factor.
 
 ```cpp
 struct full_node : node_base {
     T*          eos_ptr;      // End-of-string value (interior only)
-    std::string skip;         // Common prefix
     bitmap256   valid;        // Which indices are valid
     union {
-        std::array<T, 256>          leaf_values;  // If leaf
-        std::array<atomic_ptr, 256> children;     // If interior
+        std::array<T, 256>          leaf_values;  // Direct indexed by char
+        std::array<atomic_ptr, 256> children;     // Direct indexed by char
     };
+    // skip stored inline or via fixed array
 };
 ```
 
@@ -243,17 +296,14 @@ struct full_node : node_base {
 └───────────────┴───────────────┴───────────────┴───────────────┘
 ```
 
-**Leaf Example:** Keys 'A'(65), 'B'(66), 'Z'(90) with values
+**Memory Layout (1072 bytes leaf, 2096 bytes interior for int keys):**
 ```
-full_node (LEAF) {
-    header: LEAF | version  (no SKIP, no LIST = FULL)
-    eos_ptr: nullptr
-    skip: ""
-    valid: bits_[1] has bits 1,2,26 set (65-64=1, 66-64=2, 90-64=26)
-    leaf_values[65]: value_A
-    leaf_values[66]: value_B
-    leaf_values[90]: value_Z
-}
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          full_node (leaf)                                 │
+├──────────────┬────────────────┬───────────────┬────────────────────────────┤
+│    header    │   skip_bytes   │  bitmap256    │       values[0..255]       │
+│   (8 bytes)  │   (8 bytes)    │  (32 bytes)   │     (256 * sizeof T)       │
+└──────────────┴────────────────┴───────────────┴────────────────────────────┘
 ```
 
 ---
@@ -1109,7 +1159,7 @@ TKTRIE achieves high concurrent read performance through:
 1. **Lock-free reads**: Epoch validation enables optimistic traversal with O(1) consistency check
 2. **Per-trie EBR**: Each trie has its own epoch, reader slots, and retired list - no global state
 3. **Skip compression**: Shallow trees (avg depth ~3) minimize traversal cost
-4. **Adaptive nodes**: SKIP/LIST/FULL minimize memory while maintaining performance
+4. **Five adaptive node types**: SKIP(1) → BINARY(2) → LIST(3-7) → POP(8-32) → FULL(33-256) minimize memory
 5. **Poison bits**: Writers mark nodes dead before retiring, readers detect and retry
 
 The architecture trades write complexity for read performance, making it ideal for read-heavy concurrent workloads where reads can be 2-8x faster than mutex-guarded alternatives.
