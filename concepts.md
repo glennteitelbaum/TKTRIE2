@@ -356,7 +356,9 @@ bool is_poisoned() const noexcept {
 }
 
 void poison() noexcept {
-    header_.store(header_.load() | FLAG_POISON);
+    // Bump version AND set poison - version check catches both modifications and poison
+    uint64_t h = header_.load();
+    header_.store(bump_version(h) | FLAG_POISON);
 }
 ```
 
@@ -423,10 +425,23 @@ inline constexpr uint64_t bump_version(uint64_t h) noexcept {
 }
 ```
 
+**Key insight**: `poison()` bumps the version:
+
+```cpp
+void poison() noexcept {
+    uint64_t h = header_.load();
+    header_.store(bump_version(h) | FLAG_POISON);  // Version changes!
+}
+```
+
+This means a **single version check** catches both:
+- In-place modifications (child added, value changed)
+- Node retirement (poison was set)
+
 Versions enable optimistic concurrency:
 1. Reader records version before traversal
-2. Reader records version after traversal  
-3. If versions match and node not poisoned → result is valid
+2. Reader performs traversal
+3. If version unchanged → result is valid (poison would have changed version)
 4. Otherwise → retry
 
 ---

@@ -328,10 +328,9 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
 TKTRIE_TEMPLATE
 inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     [[assume(path.len >= 0 && path.len <= 64)]];
+    // Version check is sufficient - poison() bumps version
     for (int i = 0; i < path.len; ++i) {
-        // Single atomic load: poison and version are both in header
-        uint64_t h = path.nodes[i]->header();
-        if (is_poisoned_header(h) || get_version(h) != path.versions[i]) {
+        if (get_version(path.nodes[i]->header()) != path.versions[i]) {
             return false;
         }
     }

@@ -392,12 +392,11 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
     [[assume(info.path_len >= 0 && info.path_len <= 64)]];
+    // Version check is sufficient - poison() bumps version
     for (int i = 0; i < info.path_len; ++i) {
-        if (info.path[i].node->is_poisoned()) return false;
         if (info.path[i].node->version() != info.path[i].version) return false;
     }
     if (info.target && (info.path_len == 0 || info.path[info.path_len-1].node != info.target)) {
-        if (info.target->is_poisoned()) return false;
         if (info.target->version() != info.target_version) return false;
     }
     return true;

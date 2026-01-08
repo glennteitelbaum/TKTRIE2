@@ -609,7 +609,11 @@ struct node_base {
     // Version and poison
     uint64_t version() const noexcept { return get_version(header()); }
     void bump_version() noexcept { header_.store(gteitelbaum::bump_version(header_.load())); }
-    void poison() noexcept { header_.store(header_.load() | FLAG_POISON); }
+    void poison() noexcept {
+        // Bump version AND set poison - ensures version check catches poisoned nodes
+        uint64_t h = header_.load();
+        header_.store(gteitelbaum::bump_version(h) | FLAG_POISON);
+    }
     void unpoison() noexcept { header_.store(header_.load() & ~FLAG_POISON); }
     bool is_poisoned() const noexcept { return is_poisoned_header(header()); }
     
@@ -2252,10 +2256,9 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
 TKTRIE_TEMPLATE
 inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     [[assume(path.len >= 0 && path.len <= 64)]];
+    // Version check is sufficient - poison() bumps version
     for (int i = 0; i < path.len; ++i) {
-        // Single atomic load: poison and version are both in header
-        uint64_t h = path.nodes[i]->header();
-        if (is_poisoned_header(h) || get_version(h) != path.versions[i]) {
+        if (get_version(path.nodes[i]->header()) != path.versions[i]) {
             return false;
         }
     }
@@ -3363,12 +3366,11 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
     [[assume(info.path_len >= 0 && info.path_len <= 64)]];
+    // Version check is sufficient - poison() bumps version
     for (int i = 0; i < info.path_len; ++i) {
-        if (info.path[i].node->is_poisoned()) return false;
         if (info.path[i].node->version() != info.path[i].version) return false;
     }
     if (info.target && (info.path_len == 0 || info.path[info.path_len-1].node != info.target)) {
-        if (info.target->is_poisoned()) return false;
         if (info.target->version() != info.target_version) return false;
     }
     return true;

@@ -114,7 +114,11 @@ struct node_base {
     // Version and poison
     uint64_t version() const noexcept { return get_version(header()); }
     void bump_version() noexcept { header_.store(gteitelbaum::bump_version(header_.load())); }
-    void poison() noexcept { header_.store(header_.load() | FLAG_POISON); }
+    void poison() noexcept {
+        // Bump version AND set poison - ensures version check catches poisoned nodes
+        uint64_t h = header_.load();
+        header_.store(gteitelbaum::bump_version(h) | FLAG_POISON);
+    }
     void unpoison() noexcept { header_.store(header_.load() & ~FLAG_POISON); }
     bool is_poisoned() const noexcept { return is_poisoned_header(header()); }
     
