@@ -115,9 +115,6 @@ static constexpr int LIST_MAX = 7;
 // Interior FULL node header with poison flag set - used for retry sentinel
 static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
 
-// Interior LIST node header - used for not_found sentinel
-static constexpr uint64_t NOT_FOUND_SENTINEL_HEADER = FLAG_LIST;  // LIST, not leaf, no poison
-
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
 }

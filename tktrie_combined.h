@@ -1,36 +1,25 @@
+// TKTRIE - Combined single-header version
+// Auto-generated - do not edit
 #pragma once
-// =============================================================================
-// TKTRIE - Combined Single-Header File (C++23)
-// A high-performance concurrent trie for integer and string keys
-// Fully per-trie EBR with cache-line padded reader slots
-// =============================================================================
 
-#include <algorithm>
+// === tktrie_defines.h ===
+
 #include <array>
 #include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
-#include <utility>
-#include <vector>
-
-
-// =============================================================================
-// SECTION: tktrie_defines.h
-// =============================================================================
-
 
 #ifdef NDEBUG
 #define KTRIE_DEBUG_ASSERT(cond) ((void)0)
 #else
+#include <cassert>
 #define KTRIE_DEBUG_ASSERT(cond) assert(cond)
 #endif
 
@@ -129,9 +118,6 @@ static constexpr int LIST_MAX = 7;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
 static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
-
-// Interior LIST node header - used for not_found sentinel
-static constexpr uint64_t NOT_FOUND_SENTINEL_HEADER = FLAG_LIST;  // LIST, not leaf, no poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
@@ -332,10 +318,12 @@ inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexc
 
 }  // namespace gteitelbaum
 
-// =============================================================================
-// SECTION: tktrie_dataptr.h
-// =============================================================================
+// === tktrie_dataptr.h ===
 
+#include <atomic>
+#include <cstring>
+#include <memory>
+#include <type_traits>
 
 
 namespace gteitelbaum {
@@ -507,46 +495,12 @@ private:
 
 }  // namespace gteitelbaum
 
-// =============================================================================
-// SECTION: tktrie_ebr.h
-// =============================================================================
+// === tktrie_node.h ===
 
-// =============================================================================
-// TKTRIE EBR - Epoch-Based Reclamation (fully per-trie, no globals)
-// =============================================================================
-//
-// Each tktrie instance has its own:
-//   - epoch_ : incremented on writes
-//   - reader_epochs_[MAX_SLOTS] : tracks active reader epochs (0 = inactive)
-//   - retired list : nodes waiting to be freed
-//
-// Reader protocol:
-//   enter() - hash thread to slot, store current epoch
-//   exit()  - clear slot (store 0)
-//
-// Reclamation:
-//   Compute min_reader_epoch across slots, free nodes retired before that
-//
-// Slot collisions (two threads hash to same slot):
-//   Conservative - we see older epoch, delay reclamation. Safe.
-//
-// =============================================================================
-
-
-namespace gteitelbaum {
-
-// Hash thread ID to slot index
-inline size_t thread_slot_hash(size_t max_slots) noexcept {
-    std::hash<std::thread::id> hasher;
-    return hasher(std::this_thread::get_id()) % max_slots;
-}
-
-}  // namespace gteitelbaum
-
-// =============================================================================
-// SECTION: tktrie_node.h
-// =============================================================================
-
+#include <atomic>
+#include <array>
+#include <memory>
+#include <string>
 
 namespace gteitelbaum {
 
@@ -561,10 +515,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
 
-// Forward declare sentinel getters
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept;
-
+// Forward declare retry sentinel getter
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept;
 
@@ -611,7 +562,7 @@ struct skip_string<0> {
 };
 
 // =============================================================================
-// ATOMIC_NODE_PTR - defaults to NOT_FOUND sentinel
+// ATOMIC_NODE_PTR - defaults to nullptr
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -621,7 +572,7 @@ struct atomic_node_ptr {
     
     std::atomic<ptr_t> ptr_;
     
-    atomic_node_ptr() noexcept : ptr_(get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>()) {}
+    atomic_node_ptr() noexcept : ptr_(nullptr) {}
     explicit atomic_node_ptr(ptr_t p) noexcept : ptr_(p) {}
     
     ptr_t load() const noexcept { return ptr_.load(std::memory_order_acquire); }
@@ -1272,17 +1223,8 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
 }
 
 // =============================================================================
-// SENTINEL STORAGE TYPES - constinit compatible
+// RETRY SENTINEL STORAGE - constinit compatible
 // =============================================================================
-
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
-    small_list<THREADED> chars{};
-    std::array<void*, 7> dummy_children{};
-    
-    constexpr not_found_storage() noexcept 
-        : node_with_skip<T, THREADED, Allocator, FIXED_LEN>(NOT_FOUND_SENTINEL_HEADER) {}
-};
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
@@ -1295,27 +1237,12 @@ struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct sentinel_holder {
-    static constinit not_found_storage<T, THREADED, Allocator, FIXED_LEN> not_found;
     static constinit retry_storage<T, THREADED, Allocator, FIXED_LEN> retry;
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-constinit not_found_storage<T, THREADED, Allocator, FIXED_LEN> 
-    sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found{};
-
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 constinit retry_storage<T, THREADED, Allocator, FIXED_LEN> 
     sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::retry{};
-
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept {
-    if constexpr (!THREADED) {
-        return nullptr;
-    } else {
-        return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(
-            &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found);
-    }
-}
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept {
@@ -1338,16 +1265,6 @@ public:
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
-    // not_found_sentinel: nullptr for non-threaded, actual sentinel for threaded
-    // retry_sentinel: threaded-only
-    static constexpr bool is_not_found_sentinel(ptr_t n) noexcept {
-        if constexpr (!THREADED) {
-            return n == nullptr;  // not_found IS nullptr for non-threaded
-        } else {
-            return n == get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>();
-        }
-    }
-    
     static constexpr bool is_retry_sentinel(ptr_t n) noexcept {
         if constexpr (!THREADED) {
             (void)n;
@@ -1357,12 +1274,9 @@ public:
         }
     }
     
+    // is_sentinel is now just is_retry_sentinel (no more not_found sentinel)
     static constexpr bool is_sentinel(ptr_t n) noexcept {
-        if constexpr (!THREADED) {
-            return n == nullptr;  // Only not_found (which is nullptr)
-        } else {
-            return is_not_found_sentinel(n) || is_retry_sentinel(n);
-        }
+        return is_retry_sentinel(n);
     }
     
     static void delete_node(ptr_t n) {
@@ -1501,10 +1415,50 @@ public:
 
 }  // namespace gteitelbaum
 
+// === tktrie_ebr.h ===
+
 // =============================================================================
-// SECTION: tktrie.h
+// TKTRIE EBR - Epoch-Based Reclamation (fully per-trie, no globals)
+// =============================================================================
+//
+// Each tktrie instance has its own:
+//   - epoch_ : incremented on writes
+//   - reader_epochs_[MAX_SLOTS] : tracks active reader epochs (0 = inactive)
+//   - retired list : nodes waiting to be freed
+//
+// Reader protocol:
+//   enter() - hash thread to slot, store current epoch
+//   exit()  - clear slot (store 0)
+//
+// Reclamation:
+//   Compute min_reader_epoch across slots, free nodes retired before that
+//
+// Slot collisions (two threads hash to same slot):
+//   Conservative - we see older epoch, delay reclamation. Safe.
+//
 // =============================================================================
 
+#include <atomic>
+#include <thread>
+
+namespace gteitelbaum {
+
+// Hash thread ID to slot index
+inline size_t thread_slot_hash(size_t max_slots) noexcept {
+    std::hash<std::thread::id> hasher;
+    return hasher(std::this_thread::get_id()) % max_slots;
+}
+
+}  // namespace gteitelbaum
+
+// === tktrie.h ===
+
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 
 namespace gteitelbaum {
@@ -1883,6 +1837,9 @@ public:
     iterator find(const Key& key) const;
     iterator end() const noexcept { return iterator(); }
     void reclaim_retired() noexcept;
+    
+    // For diagnostics/testing only
+    ptr_t test_root() const noexcept { return root_.load(); }
 };
 
 // =============================================================================
@@ -1965,9 +1922,7 @@ using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator>;
 }  // namespace gteitelbaum
 
 
-// =============================================================================
-// SECTION: tktrie_core.h
-// =============================================================================
+// === tktrie_core.h ===
 
 // This file contains implementation details for tktrie
 // It should only be included from tktrie.h
@@ -2521,9 +2476,7 @@ void TKTRIE_CLASS::reclaim_retired() noexcept {
 }  // namespace gteitelbaum
 
 
-// =============================================================================
-// SECTION: tktrie_insert.h
-// =============================================================================
+// === tktrie_insert.h ===
 
 // This file contains implementation details for tktrie (insert operations)
 // It should only be included from tktrie_core.h
@@ -3016,9 +2969,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 }  // namespace gteitelbaum
 
 
-// =============================================================================
-// SECTION: tktrie_insert_probe.h
-// =============================================================================
+// === tktrie_insert_probe.h ===
 
 // This file contains speculative insert probing for concurrent operations
 // It should only be included from tktrie_insert.h
@@ -3718,9 +3669,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 }  // namespace gteitelbaum
 
 
-// =============================================================================
-// SECTION: tktrie_erase_probe.h
-// =============================================================================
+// === tktrie_erase_probe.h ===
 
 // This file contains speculative erase probing and allocation
 // It should only be included from tktrie_insert_probe.h
@@ -4115,9 +4064,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
 }  // namespace gteitelbaum
 
 
-// =============================================================================
-// SECTION: tktrie_erase.h
-// =============================================================================
+// === tktrie_erase.h ===
 
 // This file contains erase implementation
 // It should only be included from tktrie_erase_probe.h
@@ -4472,3 +4419,4 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
 #undef TKTRIE_CLASS
 
 }  // namespace gteitelbaum
+

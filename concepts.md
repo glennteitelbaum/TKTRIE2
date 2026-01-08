@@ -131,14 +131,14 @@ This is dramatically shallower than a standard trie (which would be 8 levels for
 
 ## Sentinels
 
-A **sentinel** is a special marker value used to signal exceptional conditions without null checks.
+A **sentinel** is a special marker value used to signal exceptional conditions without crashing. TKTRIE uses a single sentinel for concurrent node replacement.
 
-### The Problem
+### The Concurrent Replacement Problem
 
-In concurrent programming, a reader might see:
-1. A valid pointer to node A
-2. Writer deletes node A, installs node B
-3. Reader dereferences stale pointer → **use-after-free**
+In concurrent programming, a reader might:
+1. Load a pointer to node A
+2. Writer replaces A with B, frees A
+3. Reader dereferences stale pointer → **use-after-free crash**
 
 ### Traditional Solutions
 
@@ -146,32 +146,29 @@ In concurrent programming, a reader might see:
 2. **RCU**: Readers enter critical sections (Linux kernel style)
 3. **Hazard pointers**: Readers publish what they're accessing (complex)
 
-### TKTRIE's Sentinel Approach
+### TKTRIE's RETRY Sentinel
 
 We use a **self-referential sentinel node** that is safe to dereference:
 
 ```cpp
-// Static sentinel - one per template instantiation
-template <typename T, bool THREADED, typename Allocator>
-node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept {
-    static full_node<T, THREADED, Allocator> sentinel;
-    static bool initialized = []() {
-        sentinel.set_header(SENTINEL_HEADER);  // Marked as poisoned
-        // All 256 children point back to sentinel itself
-        for (int i = 0; i < 256; ++i) {
-            sentinel.children[i].store(&sentinel);
-        }
-        return true;
-    }();
-    return &sentinel;
-}
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    bitmap256 valid{};                       // All bits can be set
+    std::array<void*, 256> dummy_children{}; // All point to self
+    
+    constexpr retry_storage() noexcept 
+        : node_with_skip<...>(RETRY_SENTINEL_HEADER) {}  // FLAG_POISON set
+};
 ```
+
+The RETRY sentinel has `FLAG_POISON` set, marking it as "logically deleted."
 
 ### How It Works
 
 1. **Writer wants to replace node A with node B**:
    ```cpp
    slot->store(get_retry_sentinel());  // Briefly install sentinel
+   retire_node(old_node);              // Mark old node for deletion
    slot->store(new_node);              // Install actual new node
    ```
 
@@ -187,11 +184,37 @@ node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept {
    - No locks needed for readers
    - Writers briefly "block" readers via retry
 
+### Self-Referential Safety
+
+If a reader accidentally follows children of the RETRY sentinel:
+
+```
+Reader at RETRY sentinel
+  → get_child('a') returns RETRY sentinel (self)
+  → get_child('b') returns RETRY sentinel (self)
+  → Eventually hits is_poisoned() check → retries from root
+```
+
+The self-reference creates a **safe infinite loop** that's broken by poison checks. This is safer than nullptr (which would crash) or a dangling pointer (use-after-free).
+
+### Static Initialization
+
+The sentinel uses C++20 `constinit` for safe static initialization:
+
+```cpp
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct sentinel_holder {
+    static constinit retry_storage<...> retry;
+};
+```
+
+This guarantees the sentinel exists before any trie operations, avoiding static initialization order issues.
+
 ### Sentinel Header
 
 ```cpp
 static constexpr uint64_t FLAG_POISON = 1ULL << 60;
-static constexpr uint64_t SENTINEL_HEADER = FLAG_POISON;  // Interior FULL + poisoned
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // Interior FULL + poisoned
 ```
 
 ---

@@ -20,10 +20,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
 
-// Forward declare sentinel getters
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept;
-
+// Forward declare retry sentinel getter
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept;
 
@@ -70,7 +67,7 @@ struct skip_string<0> {
 };
 
 // =============================================================================
-// ATOMIC_NODE_PTR - defaults to NOT_FOUND sentinel
+// ATOMIC_NODE_PTR - defaults to nullptr
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -80,7 +77,7 @@ struct atomic_node_ptr {
     
     std::atomic<ptr_t> ptr_;
     
-    atomic_node_ptr() noexcept : ptr_(get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>()) {}
+    atomic_node_ptr() noexcept : ptr_(nullptr) {}
     explicit atomic_node_ptr(ptr_t p) noexcept : ptr_(p) {}
     
     ptr_t load() const noexcept { return ptr_.load(std::memory_order_acquire); }
@@ -731,17 +728,8 @@ void list_node<T, THREADED, Allocator, 0, false>::copy_interior_to_full(
 }
 
 // =============================================================================
-// SENTINEL STORAGE TYPES - constinit compatible
+// RETRY SENTINEL STORAGE - constinit compatible
 // =============================================================================
-
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct not_found_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
-    small_list<THREADED> chars{};
-    std::array<void*, 7> dummy_children{};
-    
-    constexpr not_found_storage() noexcept 
-        : node_with_skip<T, THREADED, Allocator, FIXED_LEN>(NOT_FOUND_SENTINEL_HEADER) {}
-};
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
@@ -754,27 +742,12 @@ struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct sentinel_holder {
-    static constinit not_found_storage<T, THREADED, Allocator, FIXED_LEN> not_found;
     static constinit retry_storage<T, THREADED, Allocator, FIXED_LEN> retry;
 };
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-constinit not_found_storage<T, THREADED, Allocator, FIXED_LEN> 
-    sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found{};
-
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 constinit retry_storage<T, THREADED, Allocator, FIXED_LEN> 
     sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::retry{};
-
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-node_base<T, THREADED, Allocator, FIXED_LEN>* get_not_found_sentinel() noexcept {
-    if constexpr (!THREADED) {
-        return nullptr;
-    } else {
-        return reinterpret_cast<node_base<T, THREADED, Allocator, FIXED_LEN>*>(
-            &sentinel_holder<T, THREADED, Allocator, FIXED_LEN>::not_found);
-    }
-}
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept {
@@ -797,16 +770,6 @@ public:
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
-    // not_found_sentinel: nullptr for non-threaded, actual sentinel for threaded
-    // retry_sentinel: threaded-only
-    static constexpr bool is_not_found_sentinel(ptr_t n) noexcept {
-        if constexpr (!THREADED) {
-            return n == nullptr;  // not_found IS nullptr for non-threaded
-        } else {
-            return n == get_not_found_sentinel<T, THREADED, Allocator, FIXED_LEN>();
-        }
-    }
-    
     static constexpr bool is_retry_sentinel(ptr_t n) noexcept {
         if constexpr (!THREADED) {
             (void)n;
@@ -816,12 +779,9 @@ public:
         }
     }
     
+    // is_sentinel is now just is_retry_sentinel (no more not_found sentinel)
     static constexpr bool is_sentinel(ptr_t n) noexcept {
-        if constexpr (!THREADED) {
-            return n == nullptr;  // Only not_found (which is nullptr)
-        } else {
-            return is_not_found_sentinel(n) || is_retry_sentinel(n);
-        }
+        return is_retry_sentinel(n);
     }
     
     static void delete_node(ptr_t n) {
