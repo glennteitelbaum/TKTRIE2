@@ -208,6 +208,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t old_child = builder_.make_leaf_skip(skip.substr(m + 1), old_value);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         interior->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+        interior->template as_list<false>()->update_capacity_flags();
 
         interior->poison();
         old_child->poison();
@@ -231,6 +232,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         }
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), old_value);
         interior->template as_list<false>()->add_child(old_c, child);
+        interior->template as_list<false>()->update_capacity_flags();
 
         interior->poison();
         child->poison();
@@ -252,6 +254,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         }
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
         interior->template as_list<false>()->add_child(new_c, child);
+        interior->template as_list<false>()->update_capacity_flags();
 
         interior->poison();
         child->poison();
@@ -271,19 +274,24 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         if (info.target->is_binary()) {
             old_child = builder_.make_leaf_binary(skip.substr(m + 1));
             info.target->template as_binary<true>()->copy_values_to(old_child->template as_binary<true>());
+            old_child->template as_binary<true>()->update_capacity_flags();
         } else if (info.target->is_list()) {
             old_child = builder_.make_leaf_list(skip.substr(m + 1));
             info.target->template as_list<true>()->copy_values_to(old_child->template as_list<true>());
+            old_child->template as_list<true>()->update_capacity_flags();
         } else if (info.target->is_pop()) {
             old_child = builder_.make_leaf_pop(skip.substr(m + 1));
             info.target->template as_pop<true>()->copy_values_to(old_child->template as_pop<true>());
+            old_child->template as_pop<true>()->update_capacity_flags();
         } else {
             old_child = builder_.make_leaf_full(skip.substr(m + 1));
             info.target->template as_full<true>()->copy_values_to(old_child->template as_full<true>());
+            old_child->template as_full<true>()->update_capacity_flags();
         }
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         interior->template as_binary<false>()->add_child(old_c, old_child);
         interior->template as_binary<false>()->add_child(new_c, new_child);
+        interior->template as_binary<false>()->update_capacity_flags();
 
         interior->poison();
         old_child->poison();
@@ -306,17 +314,22 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         if (info.target->is_binary()) {
             old_child = builder_.make_leaf_binary(skip.substr(m + 1));
             info.target->template as_binary<true>()->copy_values_to(old_child->template as_binary<true>());
+            old_child->template as_binary<true>()->update_capacity_flags();
         } else if (info.target->is_list()) {
             old_child = builder_.make_leaf_list(skip.substr(m + 1));
             info.target->template as_list<true>()->copy_values_to(old_child->template as_list<true>());
+            old_child->template as_list<true>()->update_capacity_flags();
         } else if (info.target->is_pop()) {
             old_child = builder_.make_leaf_pop(skip.substr(m + 1));
             info.target->template as_pop<true>()->copy_values_to(old_child->template as_pop<true>());
+            old_child->template as_pop<true>()->update_capacity_flags();
         } else {
             old_child = builder_.make_leaf_full(skip.substr(m + 1));
             info.target->template as_full<true>()->copy_values_to(old_child->template as_full<true>());
+            old_child->template as_full<true>()->update_capacity_flags();
         }
         interior->template as_binary<false>()->add_child(old_c, old_child);
+        interior->template as_binary<false>()->update_capacity_flags();
 
         interior->poison();
         old_child->poison();
@@ -336,6 +349,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             dst->add_value(src->chars[i], val);
         }
         dst->add_value(info.c, value);
+        dst->update_capacity_flags();
         
         list->poison();
         
@@ -354,6 +368,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             dst->add_value(ch, val);
         }
         dst->add_value(info.c, value);
+        dst->update_capacity_flags();
         
         pop->poison();
         
@@ -373,6 +388,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             ++slot;
         });
         dst->add_value(info.c, value);
+        dst->update_capacity_flags();
         
         full->poison();
         
@@ -392,15 +408,19 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         if (info.target->is_binary()) {
             old_child = builder_.make_interior_binary(skip.substr(m + 1));
             info.target->template as_binary<false>()->copy_interior_to(old_child->template as_binary<false>());
+            old_child->template as_binary<false>()->update_capacity_flags();
         } else if (info.target->is_list()) {
             old_child = builder_.make_interior_list(skip.substr(m + 1));
             info.target->template as_list<false>()->copy_interior_to(old_child->template as_list<false>());
+            old_child->template as_list<false>()->update_capacity_flags();
         } else if (info.target->is_pop()) {
             old_child = builder_.make_interior_pop(skip.substr(m + 1));
             info.target->template as_pop<false>()->copy_interior_to(old_child->template as_pop<false>());
+            old_child->template as_pop<false>()->update_capacity_flags();
         } else {
             old_child = builder_.make_interior_full(skip.substr(m + 1));
             info.target->template as_full<false>()->copy_interior_to(old_child->template as_full<false>());
+            old_child->template as_full<false>()->update_capacity_flags();
         }
         if constexpr (FIXED_LEN == 0) {
             if (had_eos) old_child->set_eos_flag();  // Preserve EOS flag
@@ -408,6 +428,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
         new_int->template as_binary<false>()->add_child(old_c, old_child);
         new_int->template as_binary<false>()->add_child(new_c, new_child);
+        new_int->template as_binary<false>()->update_capacity_flags();
 
         new_int->poison();
         old_child->poison();
@@ -432,20 +453,25 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         if (info.target->is_binary()) {
             old_child = builder_.make_interior_binary(skip.substr(m + 1));
             info.target->template as_binary<false>()->copy_interior_to(old_child->template as_binary<false>());
+            old_child->template as_binary<false>()->update_capacity_flags();
         } else if (info.target->is_list()) {
             old_child = builder_.make_interior_list(skip.substr(m + 1));
             info.target->template as_list<false>()->copy_interior_to(old_child->template as_list<false>());
+            old_child->template as_list<false>()->update_capacity_flags();
         } else if (info.target->is_pop()) {
             old_child = builder_.make_interior_pop(skip.substr(m + 1));
             info.target->template as_pop<false>()->copy_interior_to(old_child->template as_pop<false>());
+            old_child->template as_pop<false>()->update_capacity_flags();
         } else {
             old_child = builder_.make_interior_full(skip.substr(m + 1));
             info.target->template as_full<false>()->copy_interior_to(old_child->template as_full<false>());
+            old_child->template as_full<false>()->update_capacity_flags();
         }
         if constexpr (FIXED_LEN == 0) {
             if (had_eos) old_child->set_eos_flag();  // Preserve EOS flag
         }
         new_int->template as_binary<false>()->add_child(old_c, old_child);
+        new_int->template as_binary<false>()->update_capacity_flags();
 
         new_int->poison();
         old_child->poison();
@@ -472,6 +498,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
         dst->add_child(info.c, child);
+        dst->update_capacity_flags();
         
         list->poison();
         child->poison();
@@ -499,6 +526,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
         dst->add_child(info.c, child);
+        dst->update_capacity_flags();
         
         pop->poison();
         child->poison();
@@ -521,6 +549,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         }
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
         full->template as_full<false>()->add_child(info.c, child);
+        full->template as_full<false>()->update_capacity_flags();
         
         full->poison();
         child->poison();
@@ -713,6 +742,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     epoch_.fetch_add(1, std::memory_order_release);
                     n->bump_version();
                     bn->add_entry(c, value);
+                    bn->update_capacity_flags();
                 } else if (n->is_list()) {
                     auto* ln = n->template as_list<true>();
                     if (ln->has(c)) continue;
@@ -720,6 +750,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     epoch_.fetch_add(1, std::memory_order_release);
                     n->bump_version();
                     ln->add_value(c, value);
+                    ln->update_capacity_flags();
                 } else if (n->is_pop()) {
                     auto* pn = n->template as_pop<true>();
                     if (pn->has(c)) continue;
@@ -727,12 +758,14 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     epoch_.fetch_add(1, std::memory_order_release);
                     n->bump_version();
                     pn->add_value(c, value);
+                    pn->update_capacity_flags();
                 } else {
                     auto* fn = n->template as_full<true>();
                     if (fn->has(c)) continue;
                     epoch_.fetch_add(1, std::memory_order_release);
                     n->bump_version();
                     fn->add_value_atomic(c, value);
+                    fn->update_capacity_flags();
                 }
                 size_.fetch_add(1);
                 stat_success(retry);
@@ -780,6 +813,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         bn->add_child(c, child);
+                        bn->update_capacity_flags();
                     } else if (n->is_list()) {
                         auto* ln = n->template as_list<false>();
                         if (ln->has(c)) { builder_.dealloc_node(child); continue; }
@@ -790,6 +824,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         ln->add_child(c, child);
+                        ln->update_capacity_flags();
                     } else if (n->is_pop()) {
                         auto* pn = n->template as_pop<false>();
                         if (pn->has(c)) { builder_.dealloc_node(child); continue; }
@@ -800,12 +835,14 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         pn->add_child(c, child);
+                        pn->update_capacity_flags();
                     } else if (n->is_full()) {
                         auto* fn = n->template as_full<false>();
                         if (fn->has(c)) { builder_.dealloc_node(child); continue; }
                         epoch_.fetch_add(1, std::memory_order_release);
                         n->bump_version();
                         fn->add_child_atomic(c, child);
+                        fn->update_capacity_flags();
                     } else {
                         builder_.dealloc_node(child);
                         continue;

@@ -239,6 +239,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
                 new_bn->add_entry(ch, val);
                 ++src_idx;
             }
+            new_bn->update_capacity_flags();
             res.new_node = bn;
             res.old_nodes.push_back(leaf);
             res.erased = true;
@@ -247,6 +248,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         
         leaf->bump_version();
         ln->remove_value(c);
+        ln->update_capacity_flags();
         res.erased = true;
         return res;
     }
@@ -267,6 +269,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
                 pn->read_value(ch, val);
                 new_ln->add_value(ch, val);
             });
+            new_ln->update_capacity_flags();
             res.new_node = ln;
             res.old_nodes.push_back(leaf);
             res.erased = true;
@@ -275,6 +278,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         
         leaf->bump_version();
         pn->remove_value(c);
+        pn->update_capacity_flags();
         res.erased = true;
         return res;
     }
@@ -294,6 +298,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
             fn->read_value(ch, val);
             new_pn->add_value(ch, val);
         });
+        new_pn->update_capacity_flags();
         res.new_node = pn;
         res.old_nodes.push_back(leaf);
         res.erased = true;
@@ -302,6 +307,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     
     leaf->bump_version();
     fn->remove_value(c);
+    fn->update_capacity_flags();
     res.erased = true;
     return res;
 }
@@ -432,6 +438,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (bn->has(removed_c)) {
             n->bump_version();
             bn->remove_child(bn->find(removed_c));
+            bn->update_capacity_flags();
         }
     } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
@@ -454,6 +461,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                         new_bn->set_eos_flag();  // Update header flag
                     }
                 }
+                dest->update_capacity_flags();
                 res.new_node = new_bn;
                 res.old_nodes.push_back(n);
                 
@@ -470,6 +478,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
             }
             n->bump_version();
             ln->remove_child(removed_c);
+            ln->update_capacity_flags();
         }
     } else if (n->is_pop()) {
         auto* pn = n->template as_pop<false>();
@@ -492,12 +501,14 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                         new_ln->set_eos_flag();  // Update header flag
                     }
                 }
+                dest->update_capacity_flags();
                 res.new_node = new_ln;
                 res.old_nodes.push_back(n);
                 return res;
             }
             n->bump_version();
             pn->remove_child(removed_c);
+            pn->update_capacity_flags();
         }
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
@@ -519,12 +530,14 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                         new_pn->set_eos_flag();  // Update header flag
                     }
                 }
+                dest->update_capacity_flags();
                 res.new_node = new_pn;
                 res.old_nodes.push_back(n);
                 return res;
             }
             n->bump_version();
             fn->remove_child(removed_c);
+            fn->update_capacity_flags();
         }
     }
 
@@ -579,20 +592,25 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
         } else if (child->is_binary()) {
             merged = builder_.make_leaf_binary(new_skip);
             child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
+            merged->template as_binary<true>()->update_capacity_flags();
         } else if (child->is_list()) [[likely]] {
             merged = builder_.make_leaf_list(new_skip);
             child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
+            merged->template as_list<true>()->update_capacity_flags();
         } else if (child->is_pop()) {
             merged = builder_.make_leaf_pop(new_skip);
             child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
+            merged->template as_pop<true>()->update_capacity_flags();
         } else {
             merged = builder_.make_leaf_full(new_skip);
             child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
+            merged->template as_full<true>()->update_capacity_flags();
         }
     } else {
         if (child->is_binary()) {
             merged = builder_.make_interior_binary(new_skip);
             child->template as_binary<false>()->move_children_to(merged->template as_binary<false>());
+            merged->template as_binary<false>()->update_capacity_flags();
             if constexpr (FIXED_LEN == 0) {
                 if (child->has_eos()) {
                     T val{};
@@ -603,9 +621,11 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
         } else if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
             child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
+            merged->template as_list<false>()->update_capacity_flags();
         } else if (child->is_pop()) {
             merged = builder_.make_interior_pop(new_skip);
             child->template as_pop<false>()->move_children_to(merged->template as_pop<false>());
+            merged->template as_pop<false>()->update_capacity_flags();
             if constexpr (FIXED_LEN == 0) {
                 if (child->has_eos()) {
                     T val{};
@@ -616,6 +636,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
         } else {
             merged = builder_.make_interior_full(new_skip);
             child->template as_full<false>()->move_interior_to(merged->template as_full<false>());
+            merged->template as_full<false>()->update_capacity_flags();
         }
     }
 

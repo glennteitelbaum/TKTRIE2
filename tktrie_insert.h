@@ -229,20 +229,24 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_leaf_with_skip(ptr_t leaf, std:
     if (leaf->is_binary()) {
         ptr_t n = builder_.make_leaf_binary(new_skip);
         leaf->template as_binary<true>()->copy_values_to(n->template as_binary<true>());
+        n->template as_binary<true>()->update_capacity_flags();
         return n;
     }
     if (leaf->is_list()) {
         ptr_t n = builder_.make_leaf_list(new_skip);
         leaf->template as_list<true>()->copy_values_to(n->template as_list<true>());
+        n->template as_list<true>()->update_capacity_flags();
         return n;
     }
     if (leaf->is_pop()) {
         ptr_t n = builder_.make_leaf_pop(new_skip);
         leaf->template as_pop<true>()->copy_values_to(n->template as_pop<true>());
+        n->template as_pop<true>()->update_capacity_flags();
         return n;
     }
     ptr_t n = builder_.make_leaf_full(new_skip);
     leaf->template as_full<true>()->copy_values_to(n->template as_full<true>());
+    n->template as_full<true>()->update_capacity_flags();
     return n;
 }
 
@@ -265,6 +269,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_binary<false>()->add_child(src->chars[i], child);
             }
+            interior->template as_binary<false>()->update_capacity_flags();
             res.new_node = interior;
         } else if (leaf->is_list()) [[likely]] {
             auto* src = leaf->template as_list<true>();
@@ -278,6 +283,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_list<false>()->add_child(c, child);
             }
+            interior->template as_list<false>()->update_capacity_flags();
             res.new_node = interior;
         } else if (leaf->is_pop()) {
             auto* src = leaf->template as_pop<true>();
@@ -291,6 +297,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
                 interior->template as_pop<false>()->add_child(c, child);
                 ++slot;
             });
+            interior->template as_pop<false>()->update_capacity_flags();
             res.new_node = interior;
         } else {
             auto* src = leaf->template as_full<true>();
@@ -302,6 +309,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_full<false>()->add_child(c, child);
             });
+            interior->template as_full<false>()->update_capacity_flags();
             res.new_node = interior;
         }
 
@@ -323,6 +331,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
         if (bn->count() < BINARY_MAX) {
             bn->add_entry(c, value);
+            bn->update_capacity_flags();
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -337,6 +346,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
             ln->add_value(bn->chars[i], val);
         }
         ln->add_value(c, value);
+        ln->update_capacity_flags();
 
         res.new_node = list;
         res.old_nodes.push_back(leaf);
@@ -351,6 +361,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
         if (ln->count() < LIST_MAX) {
             ln->add_value(c, value);
+            ln->update_capacity_flags();
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -367,6 +378,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
             pn->add_value(ch, val);
         }
         pn->add_value(c, value);
+        pn->update_capacity_flags();
 
         res.new_node = pop;
         res.old_nodes.push_back(leaf);
@@ -381,6 +393,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 
         if (pn->count() < POP_MAX) {
             pn->add_value(c, value);
+            pn->update_capacity_flags();
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -396,6 +409,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
             fn->add_value(ch, val);
         });
         fn->add_value(c, value);
+        fn->update_capacity_flags();
 
         res.new_node = full;
         res.old_nodes.push_back(leaf);
@@ -407,6 +421,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
     auto* fn = leaf->template as_full<true>();
     if (fn->has(c)) return res;
     fn->add_value_atomic(c, value);
+    fn->update_capacity_flags();
     res.in_place = true;
     res.inserted = true;
     return res;
@@ -446,6 +461,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
                 ptr_t child = create_leaf_for_key(key.substr(1), value);
                 dst->add_child(first_c, child);
             }
+            dst->update_capacity_flags();
             res.new_node = interior;
         } else {
             // Adding 3rd child: BINARY -> LIST
@@ -459,6 +475,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             }
             ptr_t child = create_leaf_for_key(key.substr(1), value);
             dst->add_child(first_c, child);
+            dst->update_capacity_flags();
             res.new_node = interior;
         }
     } else if (leaf->is_list()) [[likely]] {
@@ -481,6 +498,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             }
             ptr_t child = create_leaf_for_key(key.substr(1), value);
             dst->add_child(first_c, child);
+            dst->update_capacity_flags();
             res.new_node = interior;
         } else {
             ptr_t interior = builder_.make_interior_list(leaf_skip);
@@ -504,6 +522,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
                 ptr_t child = create_leaf_for_key(key.substr(1), value);
                 dst->add_child(first_c, child);
             }
+            dst->update_capacity_flags();
             res.new_node = interior;
         }
     } else if (leaf->is_pop()) {
@@ -526,6 +545,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             });
             ptr_t child = create_leaf_for_key(key.substr(1), value);
             dst->add_child(first_c, child);
+            dst->update_capacity_flags();
             res.new_node = interior;
         } else {
             ptr_t interior = builder_.make_interior_pop(leaf_skip);
@@ -550,6 +570,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
                 ptr_t child = create_leaf_for_key(key.substr(1), value);
                 dst->add_child(first_c, child);
             }
+            dst->update_capacity_flags();
             res.new_node = interior;
         }
     } else {
@@ -574,6 +595,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             ptr_t child = create_leaf_for_key(key.substr(1), value);
             dst->add_child(first_c, child);
         }
+        dst->update_capacity_flags();
         res.new_node = interior;
     }
 
@@ -617,6 +639,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
         } else {
             n->template as_binary<false>()->move_children_to(clone->template as_binary<false>());
         }
+        clone->template as_binary<false>()->update_capacity_flags();
         return clone;
     }
     if (n->is_list()) [[likely]] {
@@ -625,6 +648,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
         if constexpr (FIXED_LEN == 0) {
             if (had_eos) clone->set_eos_flag();  // Preserve EOS flag
         }
+        clone->template as_list<false>()->update_capacity_flags();
         return clone;
     }
     if (n->is_pop()) {
@@ -635,6 +659,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
         } else {
             n->template as_pop<false>()->move_children_to(clone->template as_pop<false>());
         }
+        clone->template as_pop<false>()->update_capacity_flags();
         return clone;
     }
     ptr_t clone = builder_.make_interior_full(new_skip);
@@ -642,6 +667,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
     if constexpr (FIXED_LEN == 0) {
         if (had_eos) clone->set_eos_flag();  // Preserve EOS flag
     }
+    clone->template as_full<false>()->update_capacity_flags();
     return clone;
 }
 
@@ -691,6 +717,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         auto* bn = n->template as_binary<false>();
         if (bn->count() < BINARY_MAX) {
             bn->add_child(c, child);
+            bn->update_capacity_flags();
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -710,6 +737,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
             }
         }
         ln->add_child(c, child);
+        ln->update_capacity_flags();
         res.new_node = list;
         res.old_nodes.push_back(n);
         res.inserted = true;
@@ -720,6 +748,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         auto* ln = n->template as_list<false>();
         if (ln->count() < LIST_MAX) {
             ln->add_child(c, child);
+            ln->update_capacity_flags();
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -744,6 +773,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
                 fn->eos.set(eos_val);
                 full->set_eos_flag();  // Update header flag
                 fn->add_child(c, child);
+                fn->update_capacity_flags();
                 builder_.delete_node(pop);
                 res.new_node = full;
                 res.old_nodes.push_back(n);
@@ -752,6 +782,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
             }
         }
         pn->add_child(c, child);
+        pn->update_capacity_flags();
         res.new_node = pop;
         res.old_nodes.push_back(n);
         res.inserted = true;
@@ -762,6 +793,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         auto* pn = n->template as_pop<false>();
         if (pn->count() < POP_MAX) {
             pn->add_child(c, child);
+            pn->update_capacity_flags();
             res.in_place = true;
             res.inserted = true;
             return res;
@@ -770,6 +802,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         ptr_t full = builder_.make_interior_full(n->skip_str());
         pn->move_children_to_full(full->template as_full<false>());
         full->template as_full<false>()->add_child(c, child);
+        full->template as_full<false>()->update_capacity_flags();
         res.new_node = full;
         res.old_nodes.push_back(n);
         res.inserted = true;
@@ -778,6 +811,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 
     if (n->is_full()) {
         n->template as_full<false>()->add_child_atomic(c, child);
+        n->template as_full<false>()->update_capacity_flags();
         res.in_place = true;
         res.inserted = true;
         return res;
@@ -786,6 +820,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     // Shouldn't reach here for normal nodes, but handle gracefully
     ptr_t binary = builder_.make_interior_binary(n->skip_str());
     binary->template as_binary<false>()->add_child(c, child);
+    binary->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = binary;
     res.old_nodes.push_back(n);

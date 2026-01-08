@@ -247,30 +247,38 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
             } else if (child->is_binary()) {
                 merged = builder_.make_leaf_binary(new_skip);
                 child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
+                merged->template as_binary<true>()->update_capacity_flags();
             } else if (child->is_list()) {
                 merged = builder_.make_leaf_list(new_skip);
                 child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
+                merged->template as_list<true>()->update_capacity_flags();
             } else if (child->is_pop()) {
                 merged = builder_.make_leaf_pop(new_skip);
                 child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
+                merged->template as_pop<true>()->update_capacity_flags();
             } else {
                 merged = builder_.make_leaf_full(new_skip);
                 child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
+                merged->template as_full<true>()->update_capacity_flags();
             }
         } else {
             bool had_eos = child->has_eos();  // Capture before copy
             if (child->is_binary()) {
                 merged = builder_.make_interior_binary(new_skip);
                 child->template as_binary<false>()->copy_interior_to(merged->template as_binary<false>());
+                merged->template as_binary<false>()->update_capacity_flags();
             } else if (child->is_list()) {
                 merged = builder_.make_interior_list(new_skip);
                 child->template as_list<false>()->copy_interior_to(merged->template as_list<false>());
+                merged->template as_list<false>()->update_capacity_flags();
             } else if (child->is_pop()) {
                 merged = builder_.make_interior_pop(new_skip);
                 child->template as_pop<false>()->copy_interior_to(merged->template as_pop<false>());
+                merged->template as_pop<false>()->update_capacity_flags();
             } else {
                 merged = builder_.make_interior_full(new_skip);
                 child->template as_full<false>()->copy_interior_to(merged->template as_full<false>());
+                merged->template as_full<false>()->update_capacity_flags();
             }
             if constexpr (FIXED_LEN == 0) {
                 if (had_eos) merged->set_eos_flag();  // Preserve EOS flag
@@ -465,6 +473,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint6
 
     leaf->bump_version();
     ln->remove_value(c);
+    ln->update_capacity_flags();
     return true;
 }
 
@@ -476,6 +485,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_pop_erase(ptr_t leaf, unsigned char c, uint64
 
     leaf->bump_version();
     pn->remove_value(c);
+    pn->update_capacity_flags();
     return true;
 }
 
@@ -486,6 +496,7 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
     if (!fn->has(c)) return false;
     leaf->bump_version();
     fn->remove_value(c);
+    fn->update_capacity_flags();
     return true;
 }
 

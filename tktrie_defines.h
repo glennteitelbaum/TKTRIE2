@@ -142,7 +142,6 @@ static constexpr int LIST_MAX = 7;
 static constexpr int POP_MIN = 8;
 static constexpr int POP_MAX = 32;
 static constexpr int FULL_MIN = 33;
-static constexpr int FULL_MIN = 33;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
 static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON | FLAG_FULL;
