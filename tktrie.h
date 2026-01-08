@@ -59,6 +59,19 @@ template <typename Key, typename T, bool THREADED, typename Allocator>
 class tktrie_iterator;
 
 // =============================================================================
+// RETIRE_ENTRY - External wrapper for retired nodes (saves 16 bytes per node)
+// =============================================================================
+
+template <typename NodePtr>
+struct retire_entry {
+    NodePtr node;
+    uint64_t epoch;
+    retire_entry* next;
+    
+    retire_entry(NodePtr n, uint64_t e) noexcept : node(n), epoch(e), next(nullptr) {}
+};
+
+// =============================================================================
 // TKTRIE CLASS DECLARATION
 // =============================================================================
 
@@ -75,6 +88,7 @@ public:
     using data_t = dataptr<T, THREADED, Allocator>;
     using iterator = tktrie_iterator<Key, T, THREADED, Allocator>;
     using mutex_t = std::conditional_t<THREADED, std::mutex, empty_mutex>;
+    using retire_entry_t = retire_entry<ptr_t>;
 
     // -------------------------------------------------------------------------
     // Result types
@@ -265,8 +279,8 @@ private:
         std::array<PaddedReaderSlot, EBR_PADDED_SLOTS>,
         std::array<uint64_t, 1>> reader_epochs_{};
     
-    // Lock-free retired list using embedded fields in nodes (MPSC)
-    std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
+    // External retired list - wrapper allocated only when retiring (saves 16 bytes/node)
+    std::conditional_t<THREADED, std::atomic<retire_entry_t*>, retire_entry_t*> retired_head_{nullptr};
     std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
     mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for cleanup
     

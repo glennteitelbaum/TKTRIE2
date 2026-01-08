@@ -38,13 +38,13 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
-    // Lock-free push using embedded fields in node
+    // Lock-free push using external retire_entry wrapper (saves 16 bytes per node)
     if constexpr (THREADED) {
-        n->retire_epoch_ = epoch;
-        ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
+        auto* entry = new retire_entry_t(n, epoch);
+        retire_entry_t* old_head = retired_head_.load(std::memory_order_relaxed);
         do {
-            n->retire_next_ = old_head;
-        } while (!retired_head_.compare_exchange_weak(old_head, n,
+            entry->next = old_head;
+        } while (!retired_head_.compare_exchange_weak(old_head, entry,
                     std::memory_order_release, std::memory_order_relaxed));
         retired_count_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -92,26 +92,27 @@ void TKTRIE_CLASS::ebr_cleanup() {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         
         // Atomically take ownership of entire retired list
-        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
         if (!list) return;
         
         uint64_t min_epoch = min_reader_epoch();
         
         // Partition into freeable and still-retired
-        ptr_t still_head = nullptr;
+        retire_entry_t* still_head = nullptr;
         size_t still_count = 0;
         
         while (list) {
-            ptr_t curr = list;
-            list = list->retire_next_;
+            retire_entry_t* curr = list;
+            list = list->next;
             
             // Safe if retired at least 2 epochs before min reader epoch
-            if (curr->retire_epoch_ + 2 <= min_epoch) {
-                node_deleter(curr);
+            if (curr->epoch + 2 <= min_epoch) {
+                node_deleter(curr->node);
+                delete curr;
             } else {
                 // Still needs protection - prepend to still list
-                curr->retire_next_ = still_head;
+                curr->next = still_head;
                 still_head = curr;
                 ++still_count;
             }
@@ -120,12 +121,12 @@ void TKTRIE_CLASS::ebr_cleanup() {
         // Push still-retired back (other threads may have added more)
         if (still_head) {
             // Find tail of still list
-            ptr_t still_tail = still_head;
-            while (still_tail->retire_next_) still_tail = still_tail->retire_next_;
+            retire_entry_t* still_tail = still_head;
+            while (still_tail->next) still_tail = still_tail->next;
             
-            ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
+            retire_entry_t* old_head = retired_head_.load(std::memory_order_relaxed);
             do {
-                still_tail->retire_next_ = old_head;
+                still_tail->next = old_head;
             } while (!retired_head_.compare_exchange_weak(old_head, still_head,
                         std::memory_order_release, std::memory_order_relaxed));
             retired_count_.fetch_add(still_count, std::memory_order_relaxed);
@@ -342,7 +343,13 @@ inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexce
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
-TKTRIE_CLASS::tktrie() : root_(nullptr) {}
+TKTRIE_CLASS::tktrie() : root_(nullptr) {
+    // For fixed-length keys, create permanent interior root node
+    // This ensures all skips are at most (FIXED_LEN - 1) bytes
+    if constexpr (FIXED_LEN > 0) {
+        root_.store(builder_.make_interior_list(""));
+    }
+}
 
 TKTRIE_TEMPLATE
 TKTRIE_CLASS::~tktrie() { clear(); }
@@ -390,7 +397,14 @@ TKTRIE_CLASS& TKTRIE_CLASS::operator=(tktrie&& other) noexcept {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
-    root_.store(nullptr);
+    
+    if constexpr (FIXED_LEN > 0) {
+        // For fixed-length keys, reset to empty permanent root
+        root_.store(builder_.make_interior_list(""));
+    } else {
+        root_.store(nullptr);
+    }
+    
     if (r && !builder_t::is_sentinel(r)) {
         builder_.dealloc_node(r);
     }
@@ -398,12 +412,13 @@ void TKTRIE_CLASS::clear() {
     if constexpr (THREADED) {
         // Drain and delete entire retired list
         std::lock_guard<std::mutex> lock(ebr_mutex_);
-        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
         while (list) {
-            ptr_t curr = list;
-            list = list->retire_next_;
-            node_deleter(curr);
+            retire_entry_t* curr = list;
+            list = list->next;
+            node_deleter(curr->node);
+            delete curr;
         }
     }
 }
@@ -534,13 +549,14 @@ void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         // Take ownership of entire list
-        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
-        // Free everything
+        // Free everything (both nodes and entries)
         while (list) {
-            ptr_t curr = list;
-            list = list->retire_next_;
-            node_deleter(curr);
+            retire_entry_t* curr = list;
+            list = list->next;
+            node_deleter(curr->node);
+            delete curr;
         }
     }
 }

@@ -99,21 +99,24 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][SKIP:1][LIST:1][POISON:1][VERSION:60]
+// Header: [LEAF:1][SKIP:1][LIST:1][POP:1][POISON:1][VERSION:59]
 // SKIP: FLAG_SKIP set (always leaf)
-// LIST: FLAG_LIST set
-// FULL: neither SKIP nor LIST set
+// LIST: FLAG_LIST set (1-7 children)
+// POP: FLAG_POP set (8-32 children, popcount indexing)
+// FULL: none of SKIP/LIST/POP set (33+ children)
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
 static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
-static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior
-static constexpr uint64_t FLAG_POISON = 1ULL << 60;
-static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POISON;
+static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior, 1-7 children
+static constexpr uint64_t FLAG_POP    = 1ULL << 60;  // interior only, 8-32 children
+static constexpr uint64_t FLAG_POISON = 1ULL << 59;
+static constexpr uint64_t VERSION_MASK = (1ULL << 59) - 1;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POP | FLAG_POISON;
 
 static constexpr int LIST_MAX = 7;
+static constexpr int POP_MAX = 32;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST/POP) + poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
@@ -235,6 +238,7 @@ public:
     bool test(unsigned char c) const noexcept { return (bits_[c >> 6] & (1ULL << (c & 63))) != 0; }
     void set(unsigned char c) noexcept { bits_[c >> 6] |= (1ULL << (c & 63)); }
     void clear(unsigned char c) noexcept { bits_[c >> 6] &= ~(1ULL << (c & 63)); }
+    uint64_t word(int w) const noexcept { return bits_[w]; }  // Access individual 64-bit word
     int count() const noexcept {
         return std::popcount(bits_[0]) + std::popcount(bits_[1]) +
                std::popcount(bits_[2]) + std::popcount(bits_[3]);
@@ -290,6 +294,89 @@ struct empty_mutex {
     void lock() noexcept {}
     void unlock() noexcept {}
 };
+
+// =============================================================================
+// INLINE_SKIP - compact skip storage for fixed-length keys
+// =============================================================================
+
+template <size_t MAX_LEN>
+class inline_skip {
+    // Layout: bytes 0..(MAX_LEN-1) = data, last byte = length
+    // For MAX_LEN=8: 7 bytes data max + 1 byte length (supports 0-7 length)
+    static_assert(MAX_LEN > 0 && MAX_LEN <= 16, "MAX_LEN must be 1-16");
+    
+    char data_[MAX_LEN] = {};
+    
+public:
+    inline_skip() noexcept = default;
+    
+    inline_skip(std::string_view sv) noexcept { assign(sv); }
+    
+    void assign(std::string_view sv) noexcept {
+        size_t n = sv.size() < MAX_LEN ? sv.size() : MAX_LEN - 1;
+        std::memset(data_, 0, MAX_LEN);
+        std::memcpy(data_, sv.data(), n);
+        data_[MAX_LEN - 1] = static_cast<char>(n);
+    }
+    
+    void assign(const char* s, size_t len) noexcept {
+        assign(std::string_view(s, len));
+    }
+    
+    inline_skip& operator=(std::string_view sv) noexcept {
+        assign(sv);
+        return *this;
+    }
+    
+    size_t size() const noexcept { 
+        return static_cast<unsigned char>(data_[MAX_LEN - 1]); 
+    }
+    
+    bool empty() const noexcept { return size() == 0; }
+    
+    const char* data() const noexcept { return data_; }
+    
+    char operator[](size_t i) const noexcept { return data_[i]; }
+    
+    std::string_view view() const noexcept { return std::string_view(data_, size()); }
+    
+    operator std::string_view() const noexcept { return view(); }
+    
+    // For substr operations - returns a string_view (doesn't modify this)
+    std::string_view substr(size_t pos, size_t len = std::string_view::npos) const noexcept {
+        return view().substr(pos, len);
+    }
+    
+    void clear() noexcept {
+        std::memset(data_, 0, MAX_LEN);
+    }
+    
+    // Append a character (used in collapse operations)
+    void push_back(char c) noexcept {
+        size_t n = size();
+        if (n < MAX_LEN - 1) {
+            data_[n] = c;
+            data_[MAX_LEN - 1] = static_cast<char>(n + 1);
+        }
+    }
+    
+    // Append another skip's contents
+    void append(std::string_view sv) noexcept {
+        size_t n = size();
+        size_t add = sv.size();
+        if (n + add > MAX_LEN - 1) add = MAX_LEN - 1 - n;
+        std::memcpy(data_ + n, sv.data(), add);
+        data_[MAX_LEN - 1] = static_cast<char>(n + add);
+    }
+};
+
+// Type selector for skip storage
+template <size_t FIXED_KEY_LEN>
+using skip_storage_t = std::conditional_t<
+    FIXED_KEY_LEN == 0,
+    std::string,
+    inline_skip<FIXED_KEY_LEN>
+>;
 
 // =============================================================================
 // SKIP MATCHING

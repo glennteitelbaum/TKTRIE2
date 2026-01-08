@@ -17,6 +17,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struc
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_with_skip;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct skip_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct pop_node;  // 8-32 children, interior only
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
 
@@ -26,28 +27,34 @@ node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept;
 
 // =============================================================================
 // SKIP_STRING - fixed or variable length skip storage
+// For FIXED_LEN > 0: stores length in last byte, data in first (FIXED_LEN-1) bytes
+// For FIXED_LEN = 0: uses std::string (variable length)
 // =============================================================================
 
 template <size_t FIXED_LEN>
 struct skip_string {
-    std::array<char, FIXED_LEN> data{};
-    uint8_t len = 0;
+    // Compact storage: last byte is length, first (FIXED_LEN-1) bytes are data
+    // For FIXED_LEN=8: 7 bytes data + 1 byte len = 8 bytes total
+    static constexpr size_t MAX_DATA = FIXED_LEN - 1;
+    char storage_[FIXED_LEN] = {};
     
     skip_string() = default;
-    skip_string(std::string_view sv) : len(static_cast<uint8_t>(sv.size())) {
-        std::memcpy(data.data(), sv.data(), sv.size());
-    }
-    
-    std::string_view view() const noexcept { return {data.data(), len}; }
-    size_t size() const noexcept { return len; }
-    bool empty() const noexcept { return len == 0; }
-    char operator[](size_t i) const noexcept { return data[i]; }
+    skip_string(std::string_view sv) { assign(sv); }
     
     void assign(std::string_view sv) {
-        len = static_cast<uint8_t>(sv.size());
-        std::memcpy(data.data(), sv.data(), sv.size());
+        size_t n = sv.size() <= MAX_DATA ? sv.size() : MAX_DATA;
+        std::memset(storage_, 0, FIXED_LEN);
+        std::memcpy(storage_, sv.data(), n);
+        storage_[FIXED_LEN - 1] = static_cast<char>(n);
     }
-    void clear() noexcept { len = 0; }
+    
+    std::string_view view() const noexcept { 
+        return {storage_, static_cast<unsigned char>(storage_[FIXED_LEN - 1])}; 
+    }
+    size_t size() const noexcept { return static_cast<unsigned char>(storage_[FIXED_LEN - 1]); }
+    bool empty() const noexcept { return storage_[FIXED_LEN - 1] == 0; }
+    char operator[](size_t i) const noexcept { return storage_[i]; }
+    void clear() noexcept { std::memset(storage_, 0, FIXED_LEN); }
 };
 
 template <>
@@ -100,10 +107,6 @@ struct node_base {
     
     atomic_storage<uint64_t, THREADED> header_;
     
-    // EBR retire fields - only used when node is poisoned/retired
-    uint64_t retire_epoch_ = 0;
-    self_t* retire_next_ = nullptr;
-    
     constexpr node_base() noexcept = default;
     constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     
@@ -126,7 +129,8 @@ struct node_base {
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
-    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST)); }
+    bool is_pop() const noexcept { return header() & FLAG_POP; }
+    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST | FLAG_POP)); }
     
     // Downcasts
     skip_node<T, THREADED, Allocator, FIXED_LEN>* as_skip() noexcept {
@@ -135,6 +139,9 @@ struct node_base {
     template <bool IS_LEAF>
     list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() noexcept {
         return static_cast<list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() noexcept {
+        return static_cast<pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
     full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() noexcept {
@@ -147,6 +154,9 @@ struct node_base {
     template <bool IS_LEAF>
     const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() const noexcept {
         return static_cast<const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    const pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() const noexcept {
+        return static_cast<const pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
     const full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() const noexcept {
@@ -167,6 +177,9 @@ struct node_base {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
         }
+        if (is_pop()) {
+            return as_pop()->get_child(c);
+        }
         return as_full<false>()->get_child(c);
     }
     
@@ -174,11 +187,15 @@ struct node_base {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child_slot(c);
         }
+        if (is_pop()) {
+            return as_pop()->get_child_slot(c);
+        }
         return as_full<false>()->get_child_slot(c);
     }
     
     int child_count() const noexcept {
         if (is_list()) [[likely]] return as_list<false>()->count();
+        if (is_pop()) return as_pop()->count();
         return as_full<false>()->count();
     }
     
@@ -500,6 +517,121 @@ struct list_node<T, THREADED, Allocator, 0, false>
 };
 
 // =============================================================================
+// POP_NODE - Interior node with 8-32 children using popcount indexing
+// Uses bitmap256 for presence tracking, compact children array indexed by popcount
+// Size: header(8) + skip(8) + bitmap(32) + 32*ptr(256) = 304 bytes (vs 2096 for full)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    
+    static constexpr int MAX_CHILDREN = POP_MAX;  // 32
+    
+    bitmap256 valid;
+    std::array<atomic_ptr, MAX_CHILDREN> children;
+    
+    pop_node() = default;
+    ~pop_node() = default;
+    
+    // Get slot index for character c using popcount
+    int slot_for(unsigned char c) const noexcept {
+        // Count bits set before position c
+        int word = c >> 6;
+        int bit = c & 63;
+        int slot = 0;
+        // Sum popcounts of all words before this one
+        for (int w = 0; w < word; ++w) {
+            slot += std::popcount(valid.word(w));
+        }
+        // Add popcount of bits before position in current word
+        uint64_t mask = (1ULL << bit) - 1;
+        slot += std::popcount(valid.word(word) & mask);
+        return slot;
+    }
+    
+    // Unified interface
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        if (!valid.test(c)) return nullptr;
+        return children[slot_for(c)].load();
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        if (!valid.test(c)) return nullptr;
+        return &children[slot_for(c)];
+    }
+    
+    // Add child - caller must ensure count() < MAX_CHILDREN and !has(c)
+    void add_child(unsigned char c, ptr_t child) {
+        int slot = slot_for(c);
+        // Shift children up to make room
+        for (int i = count(); i > slot; --i) {
+            children[i].store(children[i-1].load());
+        }
+        children[slot].store(child);
+        valid.set(c);
+    }
+    
+    // Remove child - caller must ensure has(c)
+    void remove_child(unsigned char c) {
+        int slot = slot_for(c);
+        valid.clear(c);
+        int new_count = count();
+        // Shift children down
+        for (int i = slot; i < new_count; ++i) {
+            children[i].store(children[i+1].load());
+        }
+        children[new_count].store(nullptr);
+    }
+    
+    // Move all children to a full_node
+    void move_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            children[idx].store(nullptr);
+            ++idx;
+        });
+    }
+    
+    // Copy all children to a full_node
+    void copy_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            ++idx;
+        });
+    }
+    
+    // Move all children to another pop_node
+    void move_children_to(pop_node* dest) {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    // Get first child character
+    unsigned char first_char() const noexcept {
+        return valid.first();
+    }
+    
+    // Get child at slot index (for iteration)
+    ptr_t child_at_slot(int slot) const noexcept {
+        return children[slot].load();
+    }
+};
+
+// =============================================================================
 // FULL_NODE - LEAF specialization (stores values)
 // =============================================================================
 
@@ -771,6 +903,7 @@ public:
     using skip_t = skip_node<T, THREADED, Allocator, FIXED_LEN>;
     using leaf_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, false>;
+    using pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN>;
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
@@ -795,6 +928,8 @@ public:
         } else if (n->is_list()) [[likely]] {
             if (n->is_leaf()) delete n->template as_list<true>();
             else delete n->template as_list<false>();
+        } else if (n->is_pop()) {
+            delete n->as_pop();
         } else {
             if (n->is_leaf()) delete n->template as_full<true>();
             else delete n->template as_full<false>();
@@ -830,6 +965,13 @@ public:
         return n;
     }
     
+    ptr_t make_interior_pop(std::string_view sk) {
+        auto* n = new pop_t();
+        n->set_header(make_header(false, FLAG_POP));
+        n->skip.assign(sk);
+        return n;
+    }
+    
     ptr_t make_interior_full(std::string_view sk) {
         auto* n = new interior_full_t();
         n->set_header(make_header(false, 0));
@@ -852,6 +994,12 @@ public:
                 int cnt = ln->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
+                }
+            } else if (n->is_pop()) {
+                auto* pn = n->as_pop();
+                int cnt = pn->count();
+                for (int i = 0; i < cnt; ++i) {
+                    dealloc_node(pn->children[i].load());
                 }
             } else {
                 auto* fn = n->template as_full<false>();
@@ -901,6 +1049,18 @@ public:
             if constexpr (FIXED_LEN == 0) {
                 d->eos.deep_copy_from(s->eos);
             }
+            int cnt = s->count();
+            for (int i = 0; i < cnt; ++i) {
+                d->children[i].store(deep_copy(s->children[i].load()));
+            }
+            return d;
+        }
+        if (src->is_pop()) {
+            auto* s = src->as_pop();
+            auto* d = new pop_t();
+            d->set_header(s->header());
+            d->skip = s->skip;
+            d->valid = s->valid;
             int cnt = s->count();
             for (int i = 0; i < cnt; ++i) {
                 d->children[i].store(deep_copy(s->children[i].load()));

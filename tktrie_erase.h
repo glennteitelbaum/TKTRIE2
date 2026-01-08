@@ -239,6 +239,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
         auto* ln = n->template as_list<false>();
         c = ln->chars.char_at(0);
         child = ln->children[0].load();
+    } else if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        c = pn->first_char();
+        child = pn->child_at_slot(0);
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         c = fn->valid.first();
@@ -262,6 +266,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->has(removed_c)) remaining--;
+    } else if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        if (pn->has(removed_c)) remaining--;
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         if (fn->has(removed_c)) remaining--;
@@ -278,6 +285,12 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (ln->has(removed_c)) {
             n->bump_version();
             ln->remove_child(removed_c);
+        }
+    } else if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        if (pn->has(removed_c)) {
+            n->bump_version();
+            pn->remove_child(removed_c);
         }
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
@@ -296,6 +309,13 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (ln->count() == 1 && !eos_exists) {
             c = ln->chars.char_at(0);
             child = ln->children[0].load();
+            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+        }
+    } else if (n->is_pop() && !eos_exists) {
+        auto* pn = n->as_pop();
+        if (pn->count() == 1) {
+            c = pn->first_char();
+            child = pn->child_at_slot(0);
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
     } else if (n->is_full() && !eos_exists) {
@@ -337,6 +357,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
         if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
             child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
+        } else if (child->is_pop()) {
+            merged = builder_.make_interior_pop(new_skip);
+            child->as_pop()->move_children_to(merged->as_pop());
         } else {
             merged = builder_.make_interior_full(new_skip);
             child->template as_full<false>()->move_interior_to(merged->template as_full<false>());

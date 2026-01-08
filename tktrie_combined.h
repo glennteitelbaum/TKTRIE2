@@ -1,8 +1,14 @@
-// TKTRIE - Combined single-header version
-// Auto-generated - do not edit
+// ============================================================================
+// TKTRIE - SINGLE HEADER COMBINED FILE
+// Auto-generated - do not edit directly
+// ============================================================================
+
 #pragma once
 
-// === tktrie_defines.h ===
+// ============================================================================
+// FILE: tktrie_defines.h
+// ============================================================================
+
 
 #include <array>
 #include <atomic>
@@ -103,21 +109,24 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][SKIP:1][LIST:1][POISON:1][VERSION:60]
+// Header: [LEAF:1][SKIP:1][LIST:1][POP:1][POISON:1][VERSION:59]
 // SKIP: FLAG_SKIP set (always leaf)
-// LIST: FLAG_LIST set
-// FULL: neither SKIP nor LIST set
+// LIST: FLAG_LIST set (1-7 children)
+// POP: FLAG_POP set (8-32 children, popcount indexing)
+// FULL: none of SKIP/LIST/POP set (33+ children)
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
 static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
-static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior
-static constexpr uint64_t FLAG_POISON = 1ULL << 60;
-static constexpr uint64_t VERSION_MASK = (1ULL << 60) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POISON;
+static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior, 1-7 children
+static constexpr uint64_t FLAG_POP    = 1ULL << 60;  // interior only, 8-32 children
+static constexpr uint64_t FLAG_POISON = 1ULL << 59;
+static constexpr uint64_t VERSION_MASK = (1ULL << 59) - 1;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POP | FLAG_POISON;
 
 static constexpr int LIST_MAX = 7;
+static constexpr int POP_MAX = 32;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST) + poison
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST/POP) + poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
@@ -239,6 +248,7 @@ public:
     bool test(unsigned char c) const noexcept { return (bits_[c >> 6] & (1ULL << (c & 63))) != 0; }
     void set(unsigned char c) noexcept { bits_[c >> 6] |= (1ULL << (c & 63)); }
     void clear(unsigned char c) noexcept { bits_[c >> 6] &= ~(1ULL << (c & 63)); }
+    uint64_t word(int w) const noexcept { return bits_[w]; }  // Access individual 64-bit word
     int count() const noexcept {
         return std::popcount(bits_[0]) + std::popcount(bits_[1]) +
                std::popcount(bits_[2]) + std::popcount(bits_[3]);
@@ -296,6 +306,89 @@ struct empty_mutex {
 };
 
 // =============================================================================
+// INLINE_SKIP - compact skip storage for fixed-length keys
+// =============================================================================
+
+template <size_t MAX_LEN>
+class inline_skip {
+    // Layout: bytes 0..(MAX_LEN-1) = data, last byte = length
+    // For MAX_LEN=8: 7 bytes data max + 1 byte length (supports 0-7 length)
+    static_assert(MAX_LEN > 0 && MAX_LEN <= 16, "MAX_LEN must be 1-16");
+    
+    char data_[MAX_LEN] = {};
+    
+public:
+    inline_skip() noexcept = default;
+    
+    inline_skip(std::string_view sv) noexcept { assign(sv); }
+    
+    void assign(std::string_view sv) noexcept {
+        size_t n = sv.size() < MAX_LEN ? sv.size() : MAX_LEN - 1;
+        std::memset(data_, 0, MAX_LEN);
+        std::memcpy(data_, sv.data(), n);
+        data_[MAX_LEN - 1] = static_cast<char>(n);
+    }
+    
+    void assign(const char* s, size_t len) noexcept {
+        assign(std::string_view(s, len));
+    }
+    
+    inline_skip& operator=(std::string_view sv) noexcept {
+        assign(sv);
+        return *this;
+    }
+    
+    size_t size() const noexcept { 
+        return static_cast<unsigned char>(data_[MAX_LEN - 1]); 
+    }
+    
+    bool empty() const noexcept { return size() == 0; }
+    
+    const char* data() const noexcept { return data_; }
+    
+    char operator[](size_t i) const noexcept { return data_[i]; }
+    
+    std::string_view view() const noexcept { return std::string_view(data_, size()); }
+    
+    operator std::string_view() const noexcept { return view(); }
+    
+    // For substr operations - returns a string_view (doesn't modify this)
+    std::string_view substr(size_t pos, size_t len = std::string_view::npos) const noexcept {
+        return view().substr(pos, len);
+    }
+    
+    void clear() noexcept {
+        std::memset(data_, 0, MAX_LEN);
+    }
+    
+    // Append a character (used in collapse operations)
+    void push_back(char c) noexcept {
+        size_t n = size();
+        if (n < MAX_LEN - 1) {
+            data_[n] = c;
+            data_[MAX_LEN - 1] = static_cast<char>(n + 1);
+        }
+    }
+    
+    // Append another skip's contents
+    void append(std::string_view sv) noexcept {
+        size_t n = size();
+        size_t add = sv.size();
+        if (n + add > MAX_LEN - 1) add = MAX_LEN - 1 - n;
+        std::memcpy(data_ + n, sv.data(), add);
+        data_[MAX_LEN - 1] = static_cast<char>(n + add);
+    }
+};
+
+// Type selector for skip storage
+template <size_t FIXED_KEY_LEN>
+using skip_storage_t = std::conditional_t<
+    FIXED_KEY_LEN == 0,
+    std::string,
+    inline_skip<FIXED_KEY_LEN>
+>;
+
+// =============================================================================
 // SKIP MATCHING
 // =============================================================================
 
@@ -318,7 +411,10 @@ inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexc
 
 }  // namespace gteitelbaum
 
-// === tktrie_dataptr.h ===
+// ============================================================================
+// FILE: tktrie_dataptr.h
+// ============================================================================
+
 
 #include <atomic>
 #include <cstring>
@@ -495,7 +591,10 @@ private:
 
 }  // namespace gteitelbaum
 
-// === tktrie_node.h ===
+// ============================================================================
+// FILE: tktrie_node.h
+// ============================================================================
+
 
 #include <atomic>
 #include <array>
@@ -512,6 +611,7 @@ template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struc
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_with_skip;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct skip_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct pop_node;  // 8-32 children, interior only
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
 
@@ -521,28 +621,34 @@ node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept;
 
 // =============================================================================
 // SKIP_STRING - fixed or variable length skip storage
+// For FIXED_LEN > 0: stores length in last byte, data in first (FIXED_LEN-1) bytes
+// For FIXED_LEN = 0: uses std::string (variable length)
 // =============================================================================
 
 template <size_t FIXED_LEN>
 struct skip_string {
-    std::array<char, FIXED_LEN> data{};
-    uint8_t len = 0;
+    // Compact storage: last byte is length, first (FIXED_LEN-1) bytes are data
+    // For FIXED_LEN=8: 7 bytes data + 1 byte len = 8 bytes total
+    static constexpr size_t MAX_DATA = FIXED_LEN - 1;
+    char storage_[FIXED_LEN] = {};
     
     skip_string() = default;
-    skip_string(std::string_view sv) : len(static_cast<uint8_t>(sv.size())) {
-        std::memcpy(data.data(), sv.data(), sv.size());
-    }
-    
-    std::string_view view() const noexcept { return {data.data(), len}; }
-    size_t size() const noexcept { return len; }
-    bool empty() const noexcept { return len == 0; }
-    char operator[](size_t i) const noexcept { return data[i]; }
+    skip_string(std::string_view sv) { assign(sv); }
     
     void assign(std::string_view sv) {
-        len = static_cast<uint8_t>(sv.size());
-        std::memcpy(data.data(), sv.data(), sv.size());
+        size_t n = sv.size() <= MAX_DATA ? sv.size() : MAX_DATA;
+        std::memset(storage_, 0, FIXED_LEN);
+        std::memcpy(storage_, sv.data(), n);
+        storage_[FIXED_LEN - 1] = static_cast<char>(n);
     }
-    void clear() noexcept { len = 0; }
+    
+    std::string_view view() const noexcept { 
+        return {storage_, static_cast<unsigned char>(storage_[FIXED_LEN - 1])}; 
+    }
+    size_t size() const noexcept { return static_cast<unsigned char>(storage_[FIXED_LEN - 1]); }
+    bool empty() const noexcept { return storage_[FIXED_LEN - 1] == 0; }
+    char operator[](size_t i) const noexcept { return storage_[i]; }
+    void clear() noexcept { std::memset(storage_, 0, FIXED_LEN); }
 };
 
 template <>
@@ -595,10 +701,6 @@ struct node_base {
     
     atomic_storage<uint64_t, THREADED> header_;
     
-    // EBR retire fields - only used when node is poisoned/retired
-    uint64_t retire_epoch_ = 0;
-    self_t* retire_next_ = nullptr;
-    
     constexpr node_base() noexcept = default;
     constexpr explicit node_base(uint64_t initial_header) noexcept : header_(initial_header) {}
     
@@ -621,7 +723,8 @@ struct node_base {
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
-    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST)); }
+    bool is_pop() const noexcept { return header() & FLAG_POP; }
+    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST | FLAG_POP)); }
     
     // Downcasts
     skip_node<T, THREADED, Allocator, FIXED_LEN>* as_skip() noexcept {
@@ -630,6 +733,9 @@ struct node_base {
     template <bool IS_LEAF>
     list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() noexcept {
         return static_cast<list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() noexcept {
+        return static_cast<pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
     full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() noexcept {
@@ -642,6 +748,9 @@ struct node_base {
     template <bool IS_LEAF>
     const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() const noexcept {
         return static_cast<const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    const pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() const noexcept {
+        return static_cast<const pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
     const full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() const noexcept {
@@ -662,6 +771,9 @@ struct node_base {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
         }
+        if (is_pop()) {
+            return as_pop()->get_child(c);
+        }
         return as_full<false>()->get_child(c);
     }
     
@@ -669,11 +781,15 @@ struct node_base {
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child_slot(c);
         }
+        if (is_pop()) {
+            return as_pop()->get_child_slot(c);
+        }
         return as_full<false>()->get_child_slot(c);
     }
     
     int child_count() const noexcept {
         if (is_list()) [[likely]] return as_list<false>()->count();
+        if (is_pop()) return as_pop()->count();
         return as_full<false>()->count();
     }
     
@@ -995,6 +1111,121 @@ struct list_node<T, THREADED, Allocator, 0, false>
 };
 
 // =============================================================================
+// POP_NODE - Interior node with 8-32 children using popcount indexing
+// Uses bitmap256 for presence tracking, compact children array indexed by popcount
+// Size: header(8) + skip(8) + bitmap(32) + 32*ptr(256) = 304 bytes (vs 2096 for full)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    
+    static constexpr int MAX_CHILDREN = POP_MAX;  // 32
+    
+    bitmap256 valid;
+    std::array<atomic_ptr, MAX_CHILDREN> children;
+    
+    pop_node() = default;
+    ~pop_node() = default;
+    
+    // Get slot index for character c using popcount
+    int slot_for(unsigned char c) const noexcept {
+        // Count bits set before position c
+        int word = c >> 6;
+        int bit = c & 63;
+        int slot = 0;
+        // Sum popcounts of all words before this one
+        for (int w = 0; w < word; ++w) {
+            slot += std::popcount(valid.word(w));
+        }
+        // Add popcount of bits before position in current word
+        uint64_t mask = (1ULL << bit) - 1;
+        slot += std::popcount(valid.word(word) & mask);
+        return slot;
+    }
+    
+    // Unified interface
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        if (!valid.test(c)) return nullptr;
+        return children[slot_for(c)].load();
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        if (!valid.test(c)) return nullptr;
+        return &children[slot_for(c)];
+    }
+    
+    // Add child - caller must ensure count() < MAX_CHILDREN and !has(c)
+    void add_child(unsigned char c, ptr_t child) {
+        int slot = slot_for(c);
+        // Shift children up to make room
+        for (int i = count(); i > slot; --i) {
+            children[i].store(children[i-1].load());
+        }
+        children[slot].store(child);
+        valid.set(c);
+    }
+    
+    // Remove child - caller must ensure has(c)
+    void remove_child(unsigned char c) {
+        int slot = slot_for(c);
+        valid.clear(c);
+        int new_count = count();
+        // Shift children down
+        for (int i = slot; i < new_count; ++i) {
+            children[i].store(children[i+1].load());
+        }
+        children[new_count].store(nullptr);
+    }
+    
+    // Move all children to a full_node
+    void move_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            children[idx].store(nullptr);
+            ++idx;
+        });
+    }
+    
+    // Copy all children to a full_node
+    void copy_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            ++idx;
+        });
+    }
+    
+    // Move all children to another pop_node
+    void move_children_to(pop_node* dest) {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    // Get first child character
+    unsigned char first_char() const noexcept {
+        return valid.first();
+    }
+    
+    // Get child at slot index (for iteration)
+    ptr_t child_at_slot(int slot) const noexcept {
+        return children[slot].load();
+    }
+};
+
+// =============================================================================
 // FULL_NODE - LEAF specialization (stores values)
 // =============================================================================
 
@@ -1266,6 +1497,7 @@ public:
     using skip_t = skip_node<T, THREADED, Allocator, FIXED_LEN>;
     using leaf_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, false>;
+    using pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN>;
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
@@ -1290,6 +1522,8 @@ public:
         } else if (n->is_list()) [[likely]] {
             if (n->is_leaf()) delete n->template as_list<true>();
             else delete n->template as_list<false>();
+        } else if (n->is_pop()) {
+            delete n->as_pop();
         } else {
             if (n->is_leaf()) delete n->template as_full<true>();
             else delete n->template as_full<false>();
@@ -1325,6 +1559,13 @@ public:
         return n;
     }
     
+    ptr_t make_interior_pop(std::string_view sk) {
+        auto* n = new pop_t();
+        n->set_header(make_header(false, FLAG_POP));
+        n->skip.assign(sk);
+        return n;
+    }
+    
     ptr_t make_interior_full(std::string_view sk) {
         auto* n = new interior_full_t();
         n->set_header(make_header(false, 0));
@@ -1347,6 +1588,12 @@ public:
                 int cnt = ln->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
+                }
+            } else if (n->is_pop()) {
+                auto* pn = n->as_pop();
+                int cnt = pn->count();
+                for (int i = 0; i < cnt; ++i) {
+                    dealloc_node(pn->children[i].load());
                 }
             } else {
                 auto* fn = n->template as_full<false>();
@@ -1402,6 +1649,18 @@ public:
             }
             return d;
         }
+        if (src->is_pop()) {
+            auto* s = src->as_pop();
+            auto* d = new pop_t();
+            d->set_header(s->header());
+            d->skip = s->skip;
+            d->valid = s->valid;
+            int cnt = s->count();
+            for (int i = 0; i < cnt; ++i) {
+                d->children[i].store(deep_copy(s->children[i].load()));
+            }
+            return d;
+        }
         auto* s = src->template as_full<false>();
         auto* d = new interior_full_t();
         d->set_header(s->header());
@@ -1419,7 +1678,10 @@ public:
 
 }  // namespace gteitelbaum
 
-// === tktrie_ebr.h ===
+// ============================================================================
+// FILE: tktrie_ebr.h
+// ============================================================================
+
 
 // =============================================================================
 // TKTRIE EBR - Epoch-Based Reclamation (fully per-trie, no globals)
@@ -1455,7 +1717,10 @@ inline size_t thread_slot_hash(size_t max_slots) noexcept {
 
 }  // namespace gteitelbaum
 
-// === tktrie.h ===
+// ============================================================================
+// FILE: tktrie.h
+// ============================================================================
+
 
 #include <cstring>
 #include <mutex>
@@ -1513,6 +1778,19 @@ template <typename Key, typename T, bool THREADED, typename Allocator>
 class tktrie_iterator;
 
 // =============================================================================
+// RETIRE_ENTRY - External wrapper for retired nodes (saves 16 bytes per node)
+// =============================================================================
+
+template <typename NodePtr>
+struct retire_entry {
+    NodePtr node;
+    uint64_t epoch;
+    retire_entry* next;
+    
+    retire_entry(NodePtr n, uint64_t e) noexcept : node(n), epoch(e), next(nullptr) {}
+};
+
+// =============================================================================
 // TKTRIE CLASS DECLARATION
 // =============================================================================
 
@@ -1529,6 +1807,7 @@ public:
     using data_t = dataptr<T, THREADED, Allocator>;
     using iterator = tktrie_iterator<Key, T, THREADED, Allocator>;
     using mutex_t = std::conditional_t<THREADED, std::mutex, empty_mutex>;
+    using retire_entry_t = retire_entry<ptr_t>;
 
     // -------------------------------------------------------------------------
     // Result types
@@ -1719,8 +1998,8 @@ private:
         std::array<PaddedReaderSlot, EBR_PADDED_SLOTS>,
         std::array<uint64_t, 1>> reader_epochs_{};
     
-    // Lock-free retired list using embedded fields in nodes (MPSC)
-    std::conditional_t<THREADED, std::atomic<ptr_t>, ptr_t> retired_head_{nullptr};
+    // External retired list - wrapper allocated only when retiring (saves 16 bytes/node)
+    std::conditional_t<THREADED, std::atomic<retire_entry_t*>, retire_entry_t*> retired_head_{nullptr};
     std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
     mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for cleanup
     
@@ -1926,7 +2205,10 @@ using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator>;
 }  // namespace gteitelbaum
 
 
-// === tktrie_core.h ===
+// ============================================================================
+// FILE: tktrie_core.h
+// ============================================================================
+
 
 // This file contains implementation details for tktrie
 // It should only be included from tktrie.h
@@ -1966,13 +2248,13 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
-    // Lock-free push using embedded fields in node
+    // Lock-free push using external retire_entry wrapper (saves 16 bytes per node)
     if constexpr (THREADED) {
-        n->retire_epoch_ = epoch;
-        ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
+        auto* entry = new retire_entry_t(n, epoch);
+        retire_entry_t* old_head = retired_head_.load(std::memory_order_relaxed);
         do {
-            n->retire_next_ = old_head;
-        } while (!retired_head_.compare_exchange_weak(old_head, n,
+            entry->next = old_head;
+        } while (!retired_head_.compare_exchange_weak(old_head, entry,
                     std::memory_order_release, std::memory_order_relaxed));
         retired_count_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2020,26 +2302,27 @@ void TKTRIE_CLASS::ebr_cleanup() {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         
         // Atomically take ownership of entire retired list
-        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
         if (!list) return;
         
         uint64_t min_epoch = min_reader_epoch();
         
         // Partition into freeable and still-retired
-        ptr_t still_head = nullptr;
+        retire_entry_t* still_head = nullptr;
         size_t still_count = 0;
         
         while (list) {
-            ptr_t curr = list;
-            list = list->retire_next_;
+            retire_entry_t* curr = list;
+            list = list->next;
             
             // Safe if retired at least 2 epochs before min reader epoch
-            if (curr->retire_epoch_ + 2 <= min_epoch) {
-                node_deleter(curr);
+            if (curr->epoch + 2 <= min_epoch) {
+                node_deleter(curr->node);
+                delete curr;
             } else {
                 // Still needs protection - prepend to still list
-                curr->retire_next_ = still_head;
+                curr->next = still_head;
                 still_head = curr;
                 ++still_count;
             }
@@ -2048,12 +2331,12 @@ void TKTRIE_CLASS::ebr_cleanup() {
         // Push still-retired back (other threads may have added more)
         if (still_head) {
             // Find tail of still list
-            ptr_t still_tail = still_head;
-            while (still_tail->retire_next_) still_tail = still_tail->retire_next_;
+            retire_entry_t* still_tail = still_head;
+            while (still_tail->next) still_tail = still_tail->next;
             
-            ptr_t old_head = retired_head_.load(std::memory_order_relaxed);
+            retire_entry_t* old_head = retired_head_.load(std::memory_order_relaxed);
             do {
-                still_tail->retire_next_ = old_head;
+                still_tail->next = old_head;
             } while (!retired_head_.compare_exchange_weak(old_head, still_head,
                         std::memory_order_release, std::memory_order_relaxed));
             retired_count_.fetch_add(still_count, std::memory_order_relaxed);
@@ -2270,7 +2553,13 @@ inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexce
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
-TKTRIE_CLASS::tktrie() : root_(nullptr) {}
+TKTRIE_CLASS::tktrie() : root_(nullptr) {
+    // For fixed-length keys, create permanent interior root node
+    // This ensures all skips are at most (FIXED_LEN - 1) bytes
+    if constexpr (FIXED_LEN > 0) {
+        root_.store(builder_.make_interior_list(""));
+    }
+}
 
 TKTRIE_TEMPLATE
 TKTRIE_CLASS::~tktrie() { clear(); }
@@ -2318,7 +2607,14 @@ TKTRIE_CLASS& TKTRIE_CLASS::operator=(tktrie&& other) noexcept {
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
-    root_.store(nullptr);
+    
+    if constexpr (FIXED_LEN > 0) {
+        // For fixed-length keys, reset to empty permanent root
+        root_.store(builder_.make_interior_list(""));
+    } else {
+        root_.store(nullptr);
+    }
+    
     if (r && !builder_t::is_sentinel(r)) {
         builder_.dealloc_node(r);
     }
@@ -2326,12 +2622,13 @@ void TKTRIE_CLASS::clear() {
     if constexpr (THREADED) {
         // Drain and delete entire retired list
         std::lock_guard<std::mutex> lock(ebr_mutex_);
-        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
         while (list) {
-            ptr_t curr = list;
-            list = list->retire_next_;
-            node_deleter(curr);
+            retire_entry_t* curr = list;
+            list = list->next;
+            node_deleter(curr->node);
+            delete curr;
         }
     }
 }
@@ -2462,13 +2759,14 @@ void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         // Take ownership of entire list
-        ptr_t list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
-        // Free everything
+        // Free everything (both nodes and entries)
         while (list) {
-            ptr_t curr = list;
-            list = list->retire_next_;
-            node_deleter(curr);
+            retire_entry_t* curr = list;
+            list = list->next;
+            node_deleter(curr->node);
+            delete curr;
         }
     }
 }
@@ -2479,7 +2777,10 @@ void TKTRIE_CLASS::reclaim_retired() noexcept {
 }  // namespace gteitelbaum
 
 
-// === tktrie_insert.h ===
+// ============================================================================
+// FILE: tktrie_insert.h
+// ============================================================================
+
 
 // This file contains implementation details for tktrie (insert operations)
 // It should only be included from tktrie_core.h
@@ -2789,11 +3090,12 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
         int leaf_count = src->count();
         [[assume(leaf_count >= 0 && leaf_count <= 7)]];
         int existing_idx = src->chars.find(first_c);
-        bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
+        bool need_pop = (existing_idx < 0) && (leaf_count >= LIST_MAX);
         
-        if (need_full) {
-            ptr_t interior = builder_.make_interior_full(leaf_skip);
-            auto* dst = interior->template as_full<false>();
+        if (need_pop) {
+            // LIST at capacity -> convert to POP
+            ptr_t interior = builder_.make_interior_pop(leaf_skip);
+            auto* dst = interior->as_pop();
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = src->chars.char_at(i);
                 T val;
@@ -2886,6 +3188,11 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
         n->template as_list<false>()->move_interior_to(clone->template as_list<false>());
         return clone;
     }
+    if (n->is_pop()) {
+        ptr_t clone = builder_.make_interior_pop(new_skip);
+        n->as_pop()->move_children_to(clone->as_pop());
+        return clone;
+    }
     ptr_t clone = builder_.make_interior_full(new_skip);
     n->template as_full<false>()->move_interior_to(clone->template as_full<false>());
     return clone;
@@ -2940,10 +3247,51 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
             res.inserted = true;
             return res;
         }
-        ptr_t full = builder_.make_interior_full(n->skip_str());
-        ln->move_interior_to_full(full->template as_full<false>());
-        full->template as_full<false>()->add_child(c, child);
+        // LIST at capacity -> convert to POP
+        ptr_t pop = builder_.make_interior_pop(n->skip_str());
+        auto* pn = pop->as_pop();
+        // Copy children from list to pop
+        for (int i = 0; i < ln->count(); ++i) {
+            unsigned char ch = ln->chars.char_at(i);
+            pn->add_child(ch, ln->children[i].load());
+            ln->children[i].store(nullptr);
+        }
+        if constexpr (FIXED_LEN == 0) {
+            // Move EOS if present
+            T eos_val;
+            if (ln->eos.try_read(eos_val)) {
+                // POP doesn't have EOS - need FULL instead
+                ptr_t full = builder_.make_interior_full(n->skip_str());
+                auto* fn = full->template as_full<false>();
+                pn->move_children_to_full(fn);
+                fn->eos.set(eos_val);
+                fn->add_child(c, child);
+                builder_.delete_node(pop);
+                res.new_node = full;
+                res.old_nodes.push_back(n);
+                res.inserted = true;
+                return res;
+            }
+        }
+        pn->add_child(c, child);
+        res.new_node = pop;
+        res.old_nodes.push_back(n);
+        res.inserted = true;
+        return res;
+    }
 
+    if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        if (pn->count() < POP_MAX) {
+            pn->add_child(c, child);
+            res.in_place = true;
+            res.inserted = true;
+            return res;
+        }
+        // POP at capacity -> convert to FULL
+        ptr_t full = builder_.make_interior_full(n->skip_str());
+        pn->move_children_to_full(full->template as_full<false>());
+        full->template as_full<false>()->add_child(c, child);
         res.new_node = full;
         res.old_nodes.push_back(n);
         res.inserted = true;
@@ -2972,7 +3320,10 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 }  // namespace gteitelbaum
 
 
-// === tktrie_insert_probe.h ===
+// ============================================================================
+// FILE: tktrie_insert_probe.h
+// ============================================================================
+
 
 // This file contains speculative insert probing for concurrent operations
 // It should only be included from tktrie_insert.h
@@ -3671,7 +4022,10 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 }  // namespace gteitelbaum
 
 
-// === tktrie_erase_probe.h ===
+// ============================================================================
+// FILE: tktrie_erase_probe.h
+// ============================================================================
+
 
 // This file contains speculative erase probing and allocation
 // It should only be included from tktrie_insert_probe.h
@@ -4066,7 +4420,10 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
 }  // namespace gteitelbaum
 
 
-// === tktrie_erase.h ===
+// ============================================================================
+// FILE: tktrie_erase.h
+// ============================================================================
+
 
 // This file contains erase implementation
 // It should only be included from tktrie_erase_probe.h
@@ -4307,6 +4664,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
         auto* ln = n->template as_list<false>();
         c = ln->chars.char_at(0);
         child = ln->children[0].load();
+    } else if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        c = pn->first_char();
+        child = pn->child_at_slot(0);
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         c = fn->valid.first();
@@ -4330,6 +4691,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->has(removed_c)) remaining--;
+    } else if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        if (pn->has(removed_c)) remaining--;
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         if (fn->has(removed_c)) remaining--;
@@ -4346,6 +4710,12 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (ln->has(removed_c)) {
             n->bump_version();
             ln->remove_child(removed_c);
+        }
+    } else if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        if (pn->has(removed_c)) {
+            n->bump_version();
+            pn->remove_child(removed_c);
         }
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
@@ -4364,6 +4734,13 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         if (ln->count() == 1 && !eos_exists) {
             c = ln->chars.char_at(0);
             child = ln->children[0].load();
+            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+        }
+    } else if (n->is_pop() && !eos_exists) {
+        auto* pn = n->as_pop();
+        if (pn->count() == 1) {
+            c = pn->first_char();
+            child = pn->child_at_slot(0);
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
     } else if (n->is_full() && !eos_exists) {
@@ -4405,6 +4782,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
         if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
             child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
+        } else if (child->is_pop()) {
+            merged = builder_.make_interior_pop(new_skip);
+            child->as_pop()->move_children_to(merged->as_pop());
         } else {
             merged = builder_.make_interior_full(new_skip);
             child->template as_full<false>()->move_interior_to(merged->template as_full<false>());

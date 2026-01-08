@@ -308,11 +308,12 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
         int leaf_count = src->count();
         [[assume(leaf_count >= 0 && leaf_count <= 7)]];
         int existing_idx = src->chars.find(first_c);
-        bool need_full = (existing_idx < 0) && (leaf_count >= LIST_MAX);
+        bool need_pop = (existing_idx < 0) && (leaf_count >= LIST_MAX);
         
-        if (need_full) {
-            ptr_t interior = builder_.make_interior_full(leaf_skip);
-            auto* dst = interior->template as_full<false>();
+        if (need_pop) {
+            // LIST at capacity -> convert to POP
+            ptr_t interior = builder_.make_interior_pop(leaf_skip);
+            auto* dst = interior->as_pop();
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = src->chars.char_at(i);
                 T val;
@@ -405,6 +406,11 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
         n->template as_list<false>()->move_interior_to(clone->template as_list<false>());
         return clone;
     }
+    if (n->is_pop()) {
+        ptr_t clone = builder_.make_interior_pop(new_skip);
+        n->as_pop()->move_children_to(clone->as_pop());
+        return clone;
+    }
     ptr_t clone = builder_.make_interior_full(new_skip);
     n->template as_full<false>()->move_interior_to(clone->template as_full<false>());
     return clone;
@@ -459,10 +465,51 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
             res.inserted = true;
             return res;
         }
-        ptr_t full = builder_.make_interior_full(n->skip_str());
-        ln->move_interior_to_full(full->template as_full<false>());
-        full->template as_full<false>()->add_child(c, child);
+        // LIST at capacity -> convert to POP
+        ptr_t pop = builder_.make_interior_pop(n->skip_str());
+        auto* pn = pop->as_pop();
+        // Copy children from list to pop
+        for (int i = 0; i < ln->count(); ++i) {
+            unsigned char ch = ln->chars.char_at(i);
+            pn->add_child(ch, ln->children[i].load());
+            ln->children[i].store(nullptr);
+        }
+        if constexpr (FIXED_LEN == 0) {
+            // Move EOS if present
+            T eos_val;
+            if (ln->eos.try_read(eos_val)) {
+                // POP doesn't have EOS - need FULL instead
+                ptr_t full = builder_.make_interior_full(n->skip_str());
+                auto* fn = full->template as_full<false>();
+                pn->move_children_to_full(fn);
+                fn->eos.set(eos_val);
+                fn->add_child(c, child);
+                builder_.delete_node(pop);
+                res.new_node = full;
+                res.old_nodes.push_back(n);
+                res.inserted = true;
+                return res;
+            }
+        }
+        pn->add_child(c, child);
+        res.new_node = pop;
+        res.old_nodes.push_back(n);
+        res.inserted = true;
+        return res;
+    }
 
+    if (n->is_pop()) {
+        auto* pn = n->as_pop();
+        if (pn->count() < POP_MAX) {
+            pn->add_child(c, child);
+            res.in_place = true;
+            res.inserted = true;
+            return res;
+        }
+        // POP at capacity -> convert to FULL
+        ptr_t full = builder_.make_interior_full(n->skip_str());
+        pn->move_children_to_full(full->template as_full<false>());
+        full->template as_full<false>()->add_child(c, child);
         res.new_node = full;
         res.old_nodes.push_back(n);
         res.inserted = true;
