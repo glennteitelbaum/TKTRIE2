@@ -59,7 +59,7 @@ template <typename Key, typename T, bool THREADED, typename Allocator>
 class tktrie_iterator;
 
 // =============================================================================
-// RETIRE_ENTRY - External wrapper for retired nodes (saves 16 bytes per node)
+// RETIRE_ENTRY - External wrapper for retired nodes
 // =============================================================================
 
 template <typename NodePtr>
@@ -280,6 +280,7 @@ private:
         std::array<uint64_t, 1>> reader_epochs_{};
     
     // External retired list - wrapper allocated only when retiring (saves 16 bytes/node)
+    // External retired list - wrapper allocated only when retiring
     std::conditional_t<THREADED, std::atomic<retire_entry_t*>, retire_entry_t*> retired_head_{nullptr};
     std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
     mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for cleanup

@@ -38,7 +38,7 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
-    // Lock-free push using external retire_entry wrapper (saves 16 bytes per node)
+    // Lock-free push using external retire_entry wrapper
     if constexpr (THREADED) {
         auto* entry = new retire_entry_t(n, epoch);
         retire_entry_t* old_head = retired_head_.load(std::memory_order_relaxed);
@@ -384,7 +384,25 @@ TKTRIE_CLASS::tktrie() : root_(nullptr) {
 }
 
 TKTRIE_TEMPLATE
-TKTRIE_CLASS::~tktrie() { clear(); }
+TKTRIE_CLASS::~tktrie() {
+    // Clean up without recreating permanent root
+    ptr_t r = root_.load();
+    root_.store(nullptr);
+    if (r && !builder_t::is_sentinel(r)) {
+        builder_.dealloc_node(r);
+    }
+    if constexpr (THREADED) {
+        // Drain retired list
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        while (list) {
+            retire_entry_t* curr = list;
+            list = list->next;
+            node_deleter(curr->node);
+            delete curr;
+        }
+    }
+}
 
 TKTRIE_TEMPLATE
 TKTRIE_CLASS::tktrie(const tktrie& other) : root_(nullptr) {
