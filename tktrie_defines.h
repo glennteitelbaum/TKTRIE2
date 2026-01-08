@@ -135,9 +135,13 @@ static constexpr uint64_t VERSION_MASK = (1ULL << 53) - 1;
 static constexpr uint64_t FLAGS_MASK = ~VERSION_MASK;
 static constexpr uint64_t TYPE_FLAGS_MASK = FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP | FLAG_FULL;
 
+static constexpr int BINARY_MIN = 1;
 static constexpr int BINARY_MAX = 2;
+static constexpr int LIST_MIN = 3;
 static constexpr int LIST_MAX = 7;
+static constexpr int POP_MIN = 8;
 static constexpr int POP_MAX = 32;
+static constexpr int FULL_MIN = 33;
 static constexpr int FULL_MIN = 33;
 
 // Interior FULL node header with poison flag set - used for retry sentinel

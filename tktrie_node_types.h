@@ -71,6 +71,12 @@ struct binary_node<T, THREADED, Allocator, FIXED_LEN, true>
             dest->values[i].deep_copy_from(values[i]);
         }
     }
+    
+    void update_capacity_flags() noexcept {
+        // BINARY: floor=1, ceil=2
+        if (count_ <= BINARY_MIN) this->set_floor(); else this->clear_floor();
+        if (count_ >= BINARY_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -153,6 +159,12 @@ struct binary_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     void copy_interior_to(binary_node* dest) const {
         copy_children_to(dest);
+    }
+    
+    void update_capacity_flags() noexcept {
+        // BINARY: floor=1, ceil=2
+        if (count_ <= BINARY_MIN) this->set_floor(); else this->clear_floor();
+        if (count_ >= BINARY_MAX) this->set_ceil(); else this->clear_ceil();
     }
 };
 
@@ -248,6 +260,12 @@ struct binary_node<T, THREADED, Allocator, 0, false>
         dest->eos.deep_copy_from(eos);
         copy_children_to(dest);
     }
+    
+    void update_capacity_flags() noexcept {
+        // BINARY: floor=1, ceil=2 (based on child count only, EOS doesn't count)
+        if (count_ <= BINARY_MIN) this->set_floor(); else this->clear_floor();
+        if (count_ >= BINARY_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -314,6 +332,13 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, true>
         for (int i = 0; i < cnt; ++i) {
             dest->values[i].deep_copy_from(values[i]);
         }
+    }
+    
+    void update_capacity_flags() noexcept {
+        // LIST: floor=3, ceil=7
+        int cnt = chars.count();
+        if (cnt <= LIST_MIN) this->set_floor(); else this->clear_floor();
+        if (cnt >= LIST_MAX) this->set_ceil(); else this->clear_ceil();
     }
 };
 
@@ -403,6 +428,13 @@ struct list_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     void move_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest);
     void copy_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const;
+    
+    void update_capacity_flags() noexcept {
+        // LIST: floor=3, ceil=7
+        int cnt = chars.count();
+        if (cnt <= LIST_MIN) this->set_floor(); else this->clear_floor();
+        if (cnt >= LIST_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -496,6 +528,13 @@ struct list_node<T, THREADED, Allocator, 0, false>
     
     void move_interior_to_full(full_node<T, THREADED, Allocator, 0, false>* dest);
     void copy_interior_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) const;
+    
+    void update_capacity_flags() noexcept {
+        // LIST: floor=3, ceil=7 (based on child count only, EOS doesn't count)
+        int cnt = chars.count();
+        if (cnt <= LIST_MIN) this->set_floor(); else this->clear_floor();
+        if (cnt >= LIST_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -572,6 +611,13 @@ struct pop_node<T, THREADED, Allocator, FIXED_LEN, true>
     }
     
     unsigned char first_char() const noexcept { return valid.first(); }
+    
+    void update_capacity_flags() noexcept {
+        // POP: floor=8, ceil=32
+        int cnt = count();
+        if (cnt <= POP_MIN) this->set_floor(); else this->clear_floor();
+        if (cnt >= POP_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -683,6 +729,13 @@ struct pop_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     unsigned char first_char() const noexcept { return valid.first(); }
     ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+    
+    void update_capacity_flags() noexcept {
+        // POP: floor=8, ceil=32
+        int cnt = count();
+        if (cnt <= POP_MIN) this->set_floor(); else this->clear_floor();
+        if (cnt >= POP_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -803,6 +856,13 @@ struct pop_node<T, THREADED, Allocator, 0, false>
     
     unsigned char first_char() const noexcept { return valid.first(); }
     ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+    
+    void update_capacity_flags() noexcept {
+        // POP: floor=8, ceil=32 (based on child count only, EOS doesn't count)
+        int cnt = count();
+        if (cnt <= POP_MIN) this->set_floor(); else this->clear_floor();
+        if (cnt >= POP_MAX) this->set_ceil(); else this->clear_ceil();
+    }
 };
 
 // =============================================================================
@@ -855,6 +915,13 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true>
         valid.for_each_set([this, dest](unsigned char c) {
             dest->values[c].deep_copy_from(values[c]);
         });
+    }
+    
+    void update_capacity_flags() noexcept {
+        // FULL: floor=33, no ceil (256 is max)
+        int cnt = count();
+        if (cnt <= FULL_MIN) this->set_floor(); else this->clear_floor();
+        this->clear_ceil();  // FULL never at ceiling
     }
 };
 
@@ -915,6 +982,13 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
         valid.for_each_set([this, dest](unsigned char c) {
             dest->children[c].store(children[c].load());
         });
+    }
+    
+    void update_capacity_flags() noexcept {
+        // FULL: floor=33, no ceil
+        int cnt = count();
+        if (cnt <= FULL_MIN) this->set_floor(); else this->clear_floor();
+        this->clear_ceil();  // FULL never at ceiling
     }
 };
 
@@ -980,6 +1054,13 @@ struct full_node<T, THREADED, Allocator, 0, false>
         valid.for_each_set([this, dest](unsigned char c) {
             dest->children[c].store(children[c].load());
         });
+    }
+    
+    void update_capacity_flags() noexcept {
+        // FULL: floor=33, no ceil (based on child count only, EOS doesn't count)
+        int cnt = count();
+        if (cnt <= FULL_MIN) this->set_floor(); else this->clear_floor();
+        this->clear_ceil();  // FULL never at ceiling
     }
 };
 
