@@ -48,7 +48,8 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
         if (bn->count() == 1) {
             info.op = erase_op::DELETE_LAST_LEAF_ENTRY;
         } else {
-            info.op = erase_op::IN_PLACE_LEAF_BINARY;
+            // count == 2: need to convert to SKIP (structural change)
+            info.op = erase_op::BINARY_TO_SKIP;
         }
         return info;
     }
@@ -206,6 +207,26 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     case erase_op::DELETE_LAST_LEAF_ENTRY:
     case erase_op::DELETE_CHILD_NO_COLLAPSE:
         break;
+    
+    case erase_op::BINARY_TO_SKIP: {
+        // BINARY leaf with count=2 -> SKIP with the remaining value
+        auto* bn = info.target->template as_binary<true>();
+        int idx = bn->find(info.c);
+        int other_idx = 1 - idx;  // The other entry (0 or 1)
+        unsigned char other_c = bn->chars[other_idx];
+        T other_val{};
+        bn->values[other_idx].try_read(other_val);
+        
+        // New skip = old skip + remaining char
+        std::string new_skip_str(info.target_skip);
+        new_skip_str.push_back(static_cast<char>(other_c));
+        
+        ptr_t new_skip = builder_.make_leaf_skip(new_skip_str, other_val);
+        new_skip->poison();
+        alloc.replacement = new_skip;
+        alloc.add(new_skip);
+        break;
+    }
         
     case erase_op::DELETE_EOS_INTERIOR:
     case erase_op::DELETE_CHILD_COLLAPSE: {
@@ -261,7 +282,6 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     }
     
     case erase_op::NOT_FOUND:
-    case erase_op::IN_PLACE_LEAF_BINARY:
     case erase_op::IN_PLACE_LEAF_LIST:
     case erase_op::IN_PLACE_LEAF_POP:
     case erase_op::IN_PLACE_LEAF_FULL:
@@ -384,8 +404,25 @@ bool TKTRIE_CLASS::commit_erase_speculative(
         return true;
     }
     
+    case erase_op::BINARY_TO_SKIP: {
+        if (!alloc.replacement) return false;
+        if (!slot || slot->load() != info.target) return false;
+        
+        [[assume(alloc.count >= 0 && alloc.count <= 4)]];
+        for (int i = 0; i < alloc.count; ++i) {
+            if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
+        }
+        if (info.path_len > 1) {
+            info.path[info.path_len - 2].node->bump_version();
+        }
+        if constexpr (THREADED) {
+            slot->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
+        }
+        slot->store(alloc.replacement);
+        return true;
+    }
+    
     case erase_op::NOT_FOUND:
-    case erase_op::IN_PLACE_LEAF_BINARY:
     case erase_op::IN_PLACE_LEAF_LIST:
     case erase_op::IN_PLACE_LEAF_POP:
     case erase_op::IN_PLACE_LEAF_FULL:
@@ -414,19 +451,6 @@ void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
 // -----------------------------------------------------------------------------
 // In-place erase handlers
 // -----------------------------------------------------------------------------
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::do_inplace_leaf_binary_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
-    if (leaf->version() != expected_version) return false;
-    auto* bn = leaf->template as_binary<true>();
-    if (!bn->has(c)) return false;
-    if (bn->count() <= 1) return false;  // Would need structural change
-
-    leaf->bump_version();
-    int idx = bn->find(c);
-    bn->remove_entry(idx);
-    return true;
-}
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {

@@ -221,8 +221,9 @@ public:
     enum class erase_op {
         NOT_FOUND,
         // In-place operations (no structural change)
-        IN_PLACE_LEAF_BINARY, IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_POP, IN_PLACE_LEAF_FULL,
+        IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_POP, IN_PLACE_LEAF_FULL,
         // Structural operations
+        BINARY_TO_SKIP,             // BINARY(2) -> SKIP(1) conversion
         DELETE_SKIP_LEAF,           // Delete entire SKIP leaf
         DELETE_LAST_LEAF_ENTRY,     // Delete last entry from BINARY/LIST/POP/FULL leaf  
         DELETE_EOS_INTERIOR,        // Remove EOS from interior (may collapse)
@@ -367,7 +368,6 @@ private:
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     erase_spec_info probe_interior_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
-    bool do_inplace_leaf_binary_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_pop_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     bool do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);

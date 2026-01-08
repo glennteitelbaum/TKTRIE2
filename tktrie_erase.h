@@ -52,18 +52,6 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             }
 
             // In-place operations - no allocation needed
-            if (info.op == erase_op::IN_PLACE_LEAF_BINARY) {
-                std::lock_guard<mutex_t> lock(mutex_);
-                if (!validate_erase_path(info)) continue;
-                if (do_inplace_leaf_binary_erase(info.target, info.c, info.target_version)) {
-                    epoch_.fetch_add(1, std::memory_order_release);
-                    size_.fetch_sub(1);
-                    reader_exit();
-                    return {true, false};
-                }
-                continue;
-            }
-            
             if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
@@ -112,13 +100,36 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 
                 if (commit_erase_speculative(info, alloc)) {
                     epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
-                    // Retire old nodes
+                    
+                    // Determine if target should be retired based on operation type
+                    bool should_retire_target = false;
+                    switch (info.op) {
+                        case erase_op::DELETE_SKIP_LEAF:
+                        case erase_op::DELETE_LAST_LEAF_ENTRY:
+                        case erase_op::BINARY_TO_SKIP:
+                        case erase_op::DELETE_CHILD_COLLAPSE:
+                            // Node was removed/replaced
+                            should_retire_target = true;
+                            break;
+                        case erase_op::DELETE_EOS_INTERIOR:
+                            // Only retire if we replaced (collapse case), not in-place clear
+                            should_retire_target = (alloc.replacement != nullptr);
+                            break;
+                        case erase_op::DELETE_CHILD_NO_COLLAPSE:
+                            // In-place removal, target stays in tree
+                            should_retire_target = false;
+                            break;
+                        default:
+                            break;
+                    }
+                    
                     bool retired_any = false;
-                    if (info.target) {
+                    if (should_retire_target && info.target) {
                         retire_node(info.target);
                         retired_any = true;
                     }
                     if (info.collapse_child) {
+                        // Collapse child is always retired when set
                         retire_node(info.collapse_child);
                         retired_any = true;
                     }
@@ -223,7 +234,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
                 unsigned char ch = ln->chars.char_at(i);
                 if (i >= count) break;
                 if (ch == c) continue;
-                T val;
+                T val{};
                 ln->values[i].try_read(val);
                 new_bn->add_entry(ch, val);
                 ++src_idx;
@@ -252,7 +263,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
             auto* new_ln = ln->template as_list<true>();
             pn->valid.for_each_set([&](unsigned char ch) {
                 if (ch == c) return;
-                T val;
+                T val{};
                 pn->read_value(ch, val);
                 new_ln->add_value(ch, val);
             });
@@ -279,7 +290,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         auto* new_pn = pn->template as_pop<true>();
         fn->valid.for_each_set([&](unsigned char ch) {
             if (ch == c) return;
-            T val;
+            T val{};
             fn->read_value(ch, val);
             new_pn->add_value(ch, val);
         });
@@ -437,7 +448,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                 }
                 if constexpr (FIXED_LEN == 0) {
                     if (eos_exists) {
-                        T val;
+                        T val{};
                         n->try_read_eos(val);
                         dest->eos.set(val);
                     }
@@ -474,7 +485,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                 });
                 if constexpr (FIXED_LEN == 0) {
                     if (eos_exists) {
-                        T val;
+                        T val{};
                         n->try_read_eos(val);
                         dest->eos.set(val);
                     }
@@ -500,7 +511,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                 });
                 if constexpr (FIXED_LEN == 0) {
                     if (eos_exists) {
-                        T val;
+                        T val{};
                         n->try_read_eos(val);
                         dest->eos.set(val);
                     }
@@ -559,7 +570,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
     ptr_t merged;
     if (child->is_leaf()) {
         if (child->is_skip()) {
-            T val;
+            T val{};
             child->as_skip()->value.try_read(val);
             merged = builder_.make_leaf_skip(new_skip, val);
         } else if (child->is_binary()) {
@@ -581,7 +592,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             child->template as_binary<false>()->move_children_to(merged->template as_binary<false>());
             if constexpr (FIXED_LEN == 0) {
                 if (child->has_eos()) {
-                    T val;
+                    T val{};
                     child->try_read_eos(val);
                     merged->set_eos(val);
                 }
@@ -594,7 +605,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             child->template as_pop<false>()->move_children_to(merged->template as_pop<false>());
             if constexpr (FIXED_LEN == 0) {
                 if (child->has_eos()) {
-                    T val;
+                    T val{};
                     child->try_read_eos(val);
                     merged->set_eos(val);
                 }

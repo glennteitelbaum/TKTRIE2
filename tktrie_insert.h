@@ -260,7 +260,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
             ptr_t interior = builder_.make_interior_binary(leaf_skip);
             interior->set_eos(value);
             for (int i = 0; i < src->count(); ++i) {
-                T val;
+                T val{};
                 src->values[i].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_binary<false>()->add_child(src->chars[i], child);
@@ -273,7 +273,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
             int cnt = src->count();
             for (int i = 0; i < cnt; ++i) {
                 unsigned char c = src->chars.char_at(i);
-                T val;
+                T val{};
                 src->values[i].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_list<false>()->add_child(c, child);
@@ -285,7 +285,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
             interior->set_eos(value);
             int slot = 0;
             src->valid.for_each_set([this, src, interior, &slot](unsigned char c) {
-                T val;
+                T val{};
                 src->values[slot].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_pop<false>()->add_child(c, child);
@@ -297,7 +297,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
             ptr_t interior = builder_.make_interior_full(leaf_skip);
             interior->set_eos(value);
             src->valid.for_each_set([this, src, interior](unsigned char c) {
-                T val;
+                T val{};
                 src->values[c].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_full<false>()->add_child(c, child);
@@ -332,7 +332,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
         ptr_t list = builder_.make_leaf_list(leaf->skip_str());
         auto* ln = list->template as_list<true>();
         for (int i = 0; i < bn->count(); ++i) {
-            T val;
+            T val{};
             bn->values[i].try_read(val);
             ln->add_value(bn->chars[i], val);
         }
@@ -362,7 +362,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
         [[assume(ln->count() == 7)]];  // Must be LIST_MAX to reach here
         for (int i = 0; i < ln->count(); ++i) {
             unsigned char ch = ln->chars.char_at(i);
-            T val;
+            T val{};
             ln->values[i].try_read(val);
             pn->add_value(ch, val);
         }
@@ -391,7 +391,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
         auto* fn = full->template as_full<true>();
         [[assume(pn->count() == 32)]];  // Must be POP_MAX to reach here
         pn->valid.for_each_set([pn, fn](unsigned char ch) {
-            T val;
+            T val{};
             pn->values[pn->find(ch)].try_read(val);
             fn->add_value(ch, val);
         });
@@ -429,7 +429,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             ptr_t interior = builder_.make_interior_binary(leaf_skip);
             auto* dst = interior->template as_binary<false>();
             for (int i = 0; i < leaf_count; ++i) {
-                T val;
+                T val{};
                 src->values[i].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 dst->add_child(src->chars[i], child);
@@ -452,7 +452,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             ptr_t interior = builder_.make_interior_list(leaf_skip);
             auto* dst = interior->template as_list<false>();
             for (int i = 0; i < leaf_count; ++i) {
-                T val;
+                T val{};
                 src->values[i].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 dst->add_child(src->chars[i], child);
@@ -474,7 +474,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             auto* dst = interior->template as_pop<false>();
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = src->chars.char_at(i);
-                T val;
+                T val{};
                 src->values[i].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 dst->add_child(c, child);
@@ -487,7 +487,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             auto* dst = interior->template as_list<false>();
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = src->chars.char_at(i);
-                T val;
+                T val{};
                 src->values[i].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 dst->add_child(c, child);
@@ -518,7 +518,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             auto* dst = interior->template as_full<false>();
             int slot = 0;
             src->valid.for_each_set([this, src, dst, &slot](unsigned char c) {
-                T val;
+                T val{};
                 src->values[slot].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 dst->add_child(c, child);
@@ -532,7 +532,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
             auto* dst = interior->template as_pop<false>();
             int slot = 0;
             src->valid.for_each_set([this, src, dst, &slot](unsigned char c) {
-                T val;
+                T val{};
                 src->values[slot].try_read(val);
                 ptr_t child = builder_.make_leaf_skip("", val);
                 dst->add_child(c, child);
@@ -557,7 +557,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
         ptr_t interior = builder_.make_interior_full(leaf_skip);
         auto* dst = interior->template as_full<false>();
         src->valid.for_each_set([this, src, dst](unsigned char c) {
-            T val;
+            T val{};
             src->values[c].try_read(val);
             ptr_t child = builder_.make_leaf_skip("", val);
             dst->add_child(c, child);
