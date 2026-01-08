@@ -228,74 +228,72 @@ Time 4: Reader R dereferences A → CRASH (use-after-free)
 
 ### TKTRIE's Per-Trie EBR
 
-TKTRIE uses a per-trie epoch and reader tracking:
+Each trie has its **own** epoch and reader tracking - no global state:
 
 ```cpp
-// Per-trie state (in tktrie class)
+// Per-trie state
 alignas(64) std::atomic<uint64_t> epoch_{1};  // Bumped on writes
 
-// Per-trie retired node tracking
-struct retired_entry {
-    ptr_t node;
-    uint64_t epoch;
-    retired_entry* next;
+// 16 reader slots, each padded to 64 bytes (1KB total per trie)
+struct alignas(64) PaddedReaderSlot {
+    std::atomic<uint64_t> epoch{0};  // 0 = inactive
 };
-std::atomic<retired_entry*> retired_head_{nullptr};
-```
+std::array<PaddedReaderSlot, 16> reader_epochs_;
 
-### Global Thread Slots
-
-Reader tracking uses global EBR slots shared across all tries:
-
-```cpp
-class ebr_slot {
-    std::atomic<uint64_t> epoch_{0};   // Current epoch reader holds
-    std::atomic<bool> active_{false};   // Is reader active?
-    std::atomic<bool> valid_{true};     // Is slot still valid?
-};
-
-class ebr_global {
-    std::vector<ebr_slot*> slots_;     // All registered slots
-    // ...
-};
+// Retired node list with external wrapper entries
+std::atomic<retire_entry*> retired_head_{nullptr};
 ```
 
 ### Reader Protocol
 
+Readers hash their thread ID to a slot and record the current epoch:
+
 ```cpp
-void reader_enter() noexcept {
-    // Get thread-local slot
-    ebr_slot& slot = get_ebr_slot();
-    // Record current global epoch
-    uint64_t e = ebr_slot::global_epoch().load();
-    slot.epoch_.store(e);
-    slot.active_.store(true);
+void reader_enter() const noexcept {
+    if constexpr (THREADED) {
+        size_t slot = thread_slot_hash(16);  // Hash thread ID
+        uint64_t e = epoch_.load(std::memory_order_acquire);
+        reader_epochs_[slot].epoch.store(e, std::memory_order_release);
+    }
 }
 
-void reader_exit() noexcept {
-    ebr_slot& slot = get_ebr_slot();
-    slot.active_.store(false);  // Mark inactive
+void reader_exit() const noexcept {
+    if constexpr (THREADED) {
+        size_t slot = thread_slot_hash(16);
+        reader_epochs_[slot].epoch.store(0, std::memory_order_release);  // 0 = inactive
+    }
 }
 ```
 
 ### Finding Safe Epoch
 
 ```cpp
-uint64_t compute_safe_epoch() {
-    uint64_t current = ebr_slot::global_epoch().load();
-    uint64_t safe = current;
+uint64_t min_reader_epoch() const noexcept {
+    uint64_t current = epoch_.load();
+    uint64_t min_e = current;
     
-    for (auto* slot : slots_) {
-        if (slot->is_valid() && slot->is_active()) {
-            uint64_t e = slot->epoch();
-            if (e < safe) safe = e;  // Oldest active reader
+    for (auto& slot : reader_epochs_) {
+        uint64_t e = slot.epoch.load();
+        if (e != 0 && e < min_e) {  // Active reader with older epoch
+            min_e = e;
         }
     }
-    return safe;
+    return min_e;
 }
 
-// Node retired at epoch E can be freed when safe_epoch > E + grace_period
+// Node retired at epoch E can be freed when min_reader_epoch() > E + grace_period
 ```
+
+### Slot Collisions
+
+With 16 slots and potentially many threads, collisions are possible:
+
+```
+Thread 1 (slot 3): epoch=10
+Thread 2 (slot 3): epoch=12  ← overwrites Thread 1's registration
+```
+
+**This is safe**: We see the newer epoch (12), which is conservative. We might delay reclamation slightly, but never free too early.
 
 ### Epoch Validation (Fast Path)
 
@@ -336,9 +334,9 @@ This is faster than path validation because:
 | Aspect | Global EBR | Per-Trie EBR |
 |--------|------------|--------------|
 | Epoch counter | Single global | One per trie |
-| Reader interference | Cross-trie | Isolated |
-| Memory overhead | O(threads) | O(tries × slots) |
-| Scalability | Limited | Per-trie |
+| Reader interference | Cross-trie | **Isolated** |
+| Memory overhead | O(threads) | 1KB per trie |
+| Scalability | Limited | **Per-trie** |
 
 ---
 
@@ -441,10 +439,10 @@ A complete read operation:
 
 ```cpp
 bool contains(const Key& key) const {
-    reader_enter();  // Register with global EBR
+    reader_enter();  // Register with THIS trie's reader slots
     
     for (int attempts = 0; attempts < 10; ++attempts) {
-        uint64_t epoch_before = epoch_.load();  // Per-trie epoch
+        uint64_t epoch_before = epoch_.load();  // This trie's epoch
         
         ptr_t n = root_.load();
         if (!n) { reader_exit(); return false; }
@@ -467,7 +465,7 @@ bool contains(const Key& key) const {
 
 This achieves:
 - **Lock-free reads**: No mutexes on the read path
-- **Safe memory reclamation**: EBR prevents use-after-free
+- **Safe memory reclamation**: Per-trie EBR prevents use-after-free
 - **Progress guarantee**: Sentinel ensures no infinite loops
 - **Per-trie isolation**: Operations on trie A don't affect trie B
 - **Efficient validation**: Epoch check is O(1), not O(path length)

@@ -750,104 +750,108 @@ Writer:                          Reader:
 
 ### EBR Solution
 
-TKTRIE uses a hybrid EBR approach:
-- **Global thread slots** shared across all tries
-- **Per-trie epoch counter** for write tracking
-- **Per-trie retired lists** for node reclamation
+TKTRIE uses **fully per-trie EBR** - no global state:
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│                     EBR ARCHITECTURE                          │
+│                     PER-TRIE EBR ARCHITECTURE                 │
 └───────────────────────────────────────────────────────────────┘
 
-  GLOBAL (ebr_global)              PER-TRIE (tktrie)
-  ┌─────────────────────┐          ┌─────────────────────┐
-  │ global_epoch: 100   │          │ epoch_: 42          │
-  │                     │          │                     │
-  │ slots_:             │          │ retired_:           │
-  │  [slot1] ◄──────────┼──┐       │  [(node1, 40)]      │
-  │  [slot2]            │  │       │  [(node2, 41)]      │
-  │  [slot3]            │  │       │  [(node3, 42)]      │
-  │  ...                │  │       │                     │
-  └─────────────────────┘  │       └─────────────────────┘
-                           │
-  THREAD-LOCAL             │
-  ┌─────────────────────┐  │
-  │ ebr_slot:           │──┘  (auto-registered)
-  │  epoch_: 100        │
-  │  active_: true      │
-  │  valid_: true       │
-  └─────────────────────┘
+                       ┌─────────────────────────────────────┐
+                       │            TKTRIE INSTANCE          │
+                       │                                     │
+                       │  epoch_: 42                         │ ◄── Per-trie epoch
+                       │                                     │
+                       │  reader_epochs_[16]:                │ ◄── Per-trie slots
+                       │    [0]: 42 (active)                 │     (64-byte aligned)
+                       │    [1]: 0  (inactive)               │
+                       │    [2]: 41 (active)                 │
+                       │    ...                              │
+                       │                                     │
+                       │  retired_head_ ──► [entry1]         │ ◄── Per-trie retired list
+                       │                      ↓              │
+                       │                    [entry2]         │
+                       │                      ↓              │
+                       │                    [entry3]         │
+                       │                                     │
+                       └─────────────────────────────────────┘
 
-RECLAMATION: retired_epoch + 2 ≤ min(active reader epochs)
+SAFE TO DELETE: retired_epoch + 2 ≤ min(active reader epochs)
+
+  Current epoch: 42
+  Active readers: slot[0]=42, slot[2]=41
+  Min active: 41
+  
+  entry1 (epoch=39): 39 + 2 = 41 ≤ 41? YES → DELETE
+  entry2 (epoch=40): 40 + 2 = 42 ≤ 41? NO  → Wait
+  entry3 (epoch=41): 41 + 2 = 43 ≤ 41? NO  → Wait
 ```
 
-### Thread-Local Slots
+### Per-Trie State
 
-Each thread has its own slot, automatically registered with the global manager:
+Each trie instance contains:
 
 ```cpp
-class ebr_slot {
-    std::atomic<uint64_t> epoch_{0};   // Epoch when reader started
-    std::atomic<bool> active_{false};   // Is reader in critical section?
-    std::atomic<bool> valid_{true};     // Is slot still valid?
-    
-public:
-    void enter() noexcept {
-        epoch_.store(global_epoch().load());
-        active_.store(true);
-    }
-    
-    void exit() noexcept {
-        active_.store(false);
-    }
-};
+// Epoch counter - bumped on writes, used for read validation AND EBR
+alignas(64) std::atomic<uint64_t> epoch_{1};
 
-// Thread-local slot (auto-registered on first use)
-ebr_slot& get_ebr_slot() {
-    thread_local ebr_slot slot;  // Constructor registers with ebr_global
-    return slot;
+// 16 reader slots, each 64-byte aligned (1KB total per trie)
+struct alignas(64) PaddedReaderSlot {
+    std::atomic<uint64_t> epoch{0};  // 0 = inactive
+};
+std::array<PaddedReaderSlot, 16> reader_epochs_;
+
+// Retired node list with external wrapper entries
+std::atomic<retire_entry*> retired_head_{nullptr};
+```
+
+### Reader Slot Assignment
+
+Threads hash their ID to a slot index:
+
+```cpp
+void reader_enter() const noexcept {
+    size_t slot = thread_slot_hash(16);  // Hash thread ID to 0-15
+    uint64_t e = epoch_.load();
+    reader_epochs_[slot].epoch.store(e);
+}
+
+void reader_exit() const noexcept {
+    size_t slot = thread_slot_hash(16);
+    reader_epochs_[slot].epoch.store(0);  // 0 = inactive
 }
 ```
 
-### Computing Safe Epoch
+### Computing Min Reader Epoch
 
 ```cpp
-uint64_t ebr_global::compute_safe_epoch() {
-    uint64_t current = global_epoch().load();
-    uint64_t safe = current;
+uint64_t min_reader_epoch() const noexcept {
+    uint64_t current = epoch_.load();
+    uint64_t min_e = current;
     
-    for (auto* slot : slots_) {
-        if (slot->is_valid() && slot->is_active()) {
-            uint64_t e = slot->epoch();
-            if (e < safe) safe = e;  // Track oldest active reader
+    for (auto& slot : reader_epochs_) {
+        uint64_t e = slot.epoch.load();
+        if (e != 0 && e < min_e) {  // Active && older
+            min_e = e;
         }
     }
-    return safe;
+    return min_e;
 }
-
-// Reclaim nodes where: retired_epoch + 2 <= safe_epoch
 ```
 
-### Retired Node Tracking
+### Retired Entry Structure
 
-Each trie maintains its own retired list using wrapper entries:
+When a node is retired, a small wrapper is allocated:
 
 ```cpp
-struct retired_entry {
+struct retire_entry {
     ptr_t node;           // The retired node
     uint64_t epoch;       // Epoch when retired  
-    retired_entry* next;  // Linked list
+    retire_entry* next;   // Linked list
 };
-
-void ebr_retire(ptr_t n, uint64_t epoch) {
-    auto* entry = new retired_entry{n, epoch, nullptr};
-    // Add to lock-protected list
-    std::lock_guard lock(ebr_mutex_);
-    entry->next = retired_head_;
-    retired_head_ = entry;
-}
 ```
+
+This adds 24 bytes per retired node but keeps node sizes small (no embedded retire fields).
 
 ---
 
@@ -1054,34 +1058,45 @@ FUNCTION retire_node(node):
         RETURN
     
     node.poison()              // Bumps version + sets poison flag
-    current_epoch = global_epoch.load()
+    current_epoch = epoch_.load()  // Per-trie epoch
     
-    // Add to per-trie retired list with wrapper entry
-    entry = new retired_entry(node, current_epoch)
-    mutex.lock()
-    retired_list.prepend(entry)
-    mutex.unlock()
+    // Allocate wrapper and add to per-trie retired list
+    entry = new retire_entry(node, current_epoch)
+    entry.next = retired_head_.exchange(entry)  // Lock-free push
+    retired_count_.fetch_add(1)
     
-    global_epoch.fetch_add(1)  // Advance global epoch
+    epoch_.fetch_add(1)        // Advance per-trie epoch
 ```
 
-### Try Reclaim
+### Try Reclaim (ebr_cleanup)
 
 ```
-FUNCTION try_reclaim():
-    // Find minimum epoch held by any active reader (global)
-    safe_epoch = ebr_global.compute_safe_epoch()
+FUNCTION ebr_cleanup():
+    // Find minimum epoch held by any active reader IN THIS TRIE
+    min_epoch = min_reader_epoch()  // Scans per-trie reader_epochs_[]
     
-    // Delete nodes retired before safe_epoch - 2
+    // Grab lock for cleanup (writes only, readers don't take this)
     mutex.lock()
-    still_retired = []
-    FOR entry IN retired_list:
-        IF entry.epoch + 2 <= safe_epoch:
-            delete entry.node
-            delete entry
+    
+    // Walk retired list, free what's safe
+    prev = null
+    curr = retired_head_
+    
+    WHILE curr != null:
+        IF curr.epoch + 2 <= min_epoch:
+            // Safe to delete
+            delete curr.node
+            // Remove from list
+            IF prev == null:
+                retired_head_ = curr.next
+            ELSE:
+                prev.next = curr.next
+            delete curr
+            retired_count_.fetch_sub(1)
         ELSE:
-            still_retired.append(entry)
-    retired_list = still_retired
+            prev = curr
+        curr = curr.next
+    
     mutex.unlock()
 ```
 
@@ -1092,7 +1107,7 @@ FUNCTION try_reclaim():
 TKTRIE achieves high concurrent read performance through:
 
 1. **Lock-free reads**: Epoch validation enables optimistic traversal with O(1) consistency check
-2. **Global EBR with per-trie retired lists**: Safe memory reclamation with thread isolation
+2. **Per-trie EBR**: Each trie has its own epoch, reader slots, and retired list - no global state
 3. **Skip compression**: Shallow trees (avg depth ~3) minimize traversal cost
 4. **Adaptive nodes**: SKIP/LIST/FULL minimize memory while maintaining performance
 5. **Poison bits**: Writers mark nodes dead before retiring, readers detect and retry
