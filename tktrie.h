@@ -332,12 +332,12 @@ private:
     insert_result split_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
     insert_result prefix_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
     insert_result extend_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
-    insert_result split_leaf_list(ptr_t leaf, std::string_view key, const T& value, size_t m);
-    insert_result prefix_leaf_list(ptr_t leaf, std::string_view key, const T& value, size_t m);
+    insert_result split_leaf_multi(ptr_t leaf, std::string_view key, const T& value, size_t m);
+    insert_result prefix_leaf_multi(ptr_t leaf, std::string_view key, const T& value, size_t m);
     ptr_t clone_leaf_with_skip(ptr_t leaf, std::string_view new_skip);
-    insert_result add_eos_to_leaf_list(ptr_t leaf, const T& value);
+    insert_result add_eos_to_leaf_multi(ptr_t leaf, const T& value);
     insert_result add_char_to_leaf(ptr_t leaf, unsigned char c, const T& value);
-    insert_result demote_leaf_list(ptr_t leaf, std::string_view key, const T& value);
+    insert_result demote_leaf_multi(ptr_t leaf, std::string_view key, const T& value);
     insert_result split_interior(ptr_t n, std::string_view key, const T& value, size_t m);
     ptr_t clone_interior_with_skip(ptr_t n, std::string_view new_skip);
     insert_result prefix_interior(ptr_t n, std::string_view key, const T& value, size_t m);

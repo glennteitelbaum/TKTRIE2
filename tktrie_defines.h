@@ -99,24 +99,30 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][SKIP:1][LIST:1][POP:1][POISON:1][VERSION:59]
-// SKIP: FLAG_SKIP set (always leaf)
-// LIST: FLAG_LIST set (1-7 children)
-// POP: FLAG_POP set (8-32 children, popcount indexing)
-// FULL: none of SKIP/LIST/POP set (33+ children)
+// Header: [LEAF:1][SKIP:1][BINARY:1][LIST:1][POP:1][POISON:1][VERSION:58]
+// Type determination (mutually exclusive):
+//   SKIP:   FLAG_SKIP set (always leaf, single key-value)
+//   BINARY: FLAG_BINARY set (2 entries, leaf or interior)
+//   LIST:   FLAG_LIST set (3-7 entries, leaf or interior)
+//   POP:    FLAG_POP set (8-32 entries, leaf or interior)
+//   FULL:   none of SKIP/BINARY/LIST/POP set (33+ entries, leaf or interior)
+// Note: For interior with FIXED_LEN==0, entry count includes EOS if present
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
-static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
-static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior, 1-7 children
-static constexpr uint64_t FLAG_POP    = 1ULL << 60;  // interior only, 8-32 children
-static constexpr uint64_t FLAG_POISON = 1ULL << 59;
-static constexpr uint64_t VERSION_MASK = (1ULL << 59) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POP | FLAG_POISON;
+static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf, 1 entry
+static constexpr uint64_t FLAG_BINARY = 1ULL << 61;  // leaf or interior, 2 entries
+static constexpr uint64_t FLAG_LIST   = 1ULL << 60;  // leaf or interior, 3-7 entries
+static constexpr uint64_t FLAG_POP    = 1ULL << 59;  // leaf or interior, 8-32 entries
+static constexpr uint64_t FLAG_POISON = 1ULL << 58;
+static constexpr uint64_t VERSION_MASK = (1ULL << 58) - 1;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP | FLAG_POISON;
+static constexpr uint64_t TYPE_FLAGS_MASK = FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP;
 
+static constexpr int BINARY_MAX = 2;
 static constexpr int LIST_MAX = 7;
 static constexpr int POP_MAX = 32;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST/POP) + poison
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no type flags) + poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;

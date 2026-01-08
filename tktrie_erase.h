@@ -147,25 +147,124 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (key.size() != 1) return res;
     unsigned char c = static_cast<unsigned char>(key[0]);
 
-    if (leaf->is_list()) [[likely]] {
-        auto* ln = leaf->template as_list<true>();
-        if (!ln->has(c)) return res;
-
-        if (ln->count() == 1) {
+    // Handle BINARY leaf
+    if (leaf->is_binary()) {
+        auto* bn = leaf->template as_binary<true>();
+        if (!bn->has(c)) return res;
+        
+        if (bn->count() == 1) {
             res.erased = true;
             res.deleted_subtree = true;
             res.old_nodes.push_back(leaf);
             return res;
         }
+        
+        // Convert BINARY to SKIP when count goes from 2 to 1
+        int idx = bn->find(c);
+        unsigned char other_c = bn->chars[1 - idx];
+        T other_val;
+        bn->values[1 - idx].try_read(other_val);
+        
+        // Build new skip string: existing skip + other_c
+        std::string new_skip_str(leaf->skip_str());
+        new_skip_str.push_back(static_cast<char>(other_c));
+        
+        ptr_t new_skip = builder_.make_leaf_skip(new_skip_str, other_val);
+        
+        res.new_node = new_skip;
+        res.old_nodes.push_back(leaf);
+        res.erased = true;
+        return res;
+    }
 
+    // Handle LIST leaf
+    if (leaf->is_list()) [[likely]] {
+        auto* ln = leaf->template as_list<true>();
+        if (!ln->has(c)) return res;
+        
+        int count = ln->count();
+        if (count == 1) {
+            res.erased = true;
+            res.deleted_subtree = true;
+            res.old_nodes.push_back(leaf);
+            return res;
+        }
+        
+        // Downgrade LIST to BINARY when count goes from 3 to 2
+        if (count == 3) {
+            ptr_t bn = builder_.make_leaf_binary(leaf->skip_str());
+            auto* new_bn = bn->template as_binary<true>();
+            int src_idx = 0;
+            for (int i = 0; i < 7; ++i) {
+                unsigned char ch = ln->chars.char_at(i);
+                if (i >= count) break;
+                if (ch == c) continue;
+                T val;
+                ln->values[i].try_read(val);
+                new_bn->add_entry(ch, val);
+                ++src_idx;
+            }
+            res.new_node = bn;
+            res.old_nodes.push_back(leaf);
+            res.erased = true;
+            return res;
+        }
+        
         leaf->bump_version();
         ln->remove_value(c);
         res.erased = true;
         return res;
     }
 
+    // Handle POP leaf
+    if (leaf->is_pop()) {
+        auto* pn = leaf->template as_pop<true>();
+        if (!pn->has(c)) return res;
+        
+        int count = pn->count();
+        // Downgrade to LIST when count goes from 8 to 7
+        if (count == 8) {
+            ptr_t ln = builder_.make_leaf_list(leaf->skip_str());
+            auto* new_ln = ln->template as_list<true>();
+            pn->valid.for_each_set([&](unsigned char ch) {
+                if (ch == c) return;
+                T val;
+                pn->read_value(ch, val);
+                new_ln->add_value(ch, val);
+            });
+            res.new_node = ln;
+            res.old_nodes.push_back(leaf);
+            res.erased = true;
+            return res;
+        }
+        
+        leaf->bump_version();
+        pn->remove_value(c);
+        res.erased = true;
+        return res;
+    }
+
+    // Handle FULL leaf
     auto* fn = leaf->template as_full<true>();
     if (!fn->has(c)) return res;
+    
+    int count = fn->count();
+    // Downgrade to POP when count goes from 33 to 32
+    if (count == 33) {
+        ptr_t pn = builder_.make_leaf_pop(leaf->skip_str());
+        auto* new_pn = pn->template as_pop<true>();
+        fn->valid.for_each_set([&](unsigned char ch) {
+            if (ch == c) return;
+            T val;
+            fn->read_value(ch, val);
+            new_pn->add_value(ch, val);
+        });
+        res.new_node = pn;
+        res.old_nodes.push_back(leaf);
+        res.erased = true;
+        return res;
+    }
+    
     leaf->bump_version();
     fn->remove_value(c);
     res.erased = true;
@@ -235,12 +334,16 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
 
     unsigned char c = 0;
     ptr_t child = nullptr;
-    if (n->is_list()) {
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        c = bn->first_char();
+        child = bn->child_at_slot(0);
+    } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         c = ln->chars.char_at(0);
         child = ln->children[0].load();
     } else if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         c = pn->first_char();
         child = pn->child_at_slot(0);
     } else if (n->is_full()) {
@@ -262,65 +365,154 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 
     bool eos_exists = n->has_eos();
     int remaining = n->child_count();
+    int eos_count = eos_exists ? 1 : 0;
 
-    if (n->is_list()) {
+    // Count remaining children (excluding the one being removed)
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        if (bn->has(removed_c)) remaining--;
+    } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->has(removed_c)) remaining--;
     } else if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         if (pn->has(removed_c)) remaining--;
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         if (fn->has(removed_c)) remaining--;
     }
 
-    if ((!eos_exists) & (remaining == 0)) {
+    int total_remaining = remaining + eos_count;
+
+    // Delete if empty
+    if (total_remaining == 0) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
         return res;
     }
 
-    if (n->is_list()) {
+    // Actually remove the child and potentially downgrade
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        if (bn->has(removed_c)) {
+            n->bump_version();
+            bn->remove_child(bn->find(removed_c));
+        }
+    } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->has(removed_c)) {
+            // Downgrade LIST to BINARY when remaining + eos = 2
+            if (total_remaining == 2 && remaining > 0) {
+                ptr_t new_bn = builder_.make_interior_binary(n->skip_str());
+                auto* dest = new_bn->template as_binary<false>();
+                for (int i = 0; i < ln->count(); ++i) {
+                    unsigned char ch = ln->chars.char_at(i);
+                    if (ch == removed_c) continue;
+                    dest->add_child(ch, ln->children[i].load());
+                    ln->children[i].store(nullptr);
+                }
+                if constexpr (FIXED_LEN == 0) {
+                    if (eos_exists) {
+                        T val;
+                        n->try_read_eos(val);
+                        dest->eos.set(val);
+                    }
+                }
+                res.new_node = new_bn;
+                res.old_nodes.push_back(n);
+                
+                // Check if we can collapse the new BINARY node
+                if (dest->count() == 1 && !eos_exists) {
+                    unsigned char c = dest->first_char();
+                    ptr_t child = dest->child_at_slot(0);
+                    if (child && !builder_t::is_sentinel(child)) {
+                        auto collapse_res = collapse_single_child(new_bn, c, child, res);
+                        return collapse_res;
+                    }
+                }
+                return res;
+            }
             n->bump_version();
             ln->remove_child(removed_c);
         }
     } else if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         if (pn->has(removed_c)) {
+            // Downgrade POP to LIST when remaining + eos <= 7
+            if (total_remaining <= 7) {
+                ptr_t new_ln = builder_.make_interior_list(n->skip_str());
+                auto* dest = new_ln->template as_list<false>();
+                pn->valid.for_each_set([&](unsigned char ch) {
+                    if (ch == removed_c) return;
+                    int slot = pn->slot_for(ch);
+                    dest->add_child(ch, pn->children[slot].load());
+                    pn->children[slot].store(nullptr);
+                });
+                if constexpr (FIXED_LEN == 0) {
+                    if (eos_exists) {
+                        T val;
+                        n->try_read_eos(val);
+                        dest->eos.set(val);
+                    }
+                }
+                res.new_node = new_ln;
+                res.old_nodes.push_back(n);
+                return res;
+            }
             n->bump_version();
             pn->remove_child(removed_c);
         }
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         if (fn->has(removed_c)) {
+            // Downgrade FULL to POP when remaining + eos <= 32
+            if (total_remaining <= POP_MAX) {
+                ptr_t new_pn = builder_.make_interior_pop(n->skip_str());
+                auto* dest = new_pn->template as_pop<false>();
+                fn->valid.for_each_set([&](unsigned char ch) {
+                    if (ch == removed_c) return;
+                    dest->add_child(ch, fn->children[ch].load());
+                    fn->children[ch].store(nullptr);
+                });
+                if constexpr (FIXED_LEN == 0) {
+                    if (eos_exists) {
+                        T val;
+                        n->try_read_eos(val);
+                        dest->eos.set(val);
+                    }
+                }
+                res.new_node = new_pn;
+                res.old_nodes.push_back(n);
+                return res;
+            }
             n->bump_version();
             fn->remove_child(removed_c);
         }
     }
 
+    // Check for collapse opportunity (1 child, no EOS)
     bool can_collapse = false;
     unsigned char c = 0;
     ptr_t child = nullptr;
 
-    if (n->is_list()) {
-        auto* ln = n->template as_list<false>();
-        if (ln->count() == 1 && !eos_exists) {
+    if (!eos_exists && remaining == 1) {
+        if (n->is_binary()) {
+            auto* bn = n->template as_binary<false>();
+            c = bn->first_char();
+            child = bn->child_at_slot(0);
+            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+        } else if (n->is_list()) {
+            auto* ln = n->template as_list<false>();
             c = ln->chars.char_at(0);
             child = ln->children[0].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        }
-    } else if (n->is_pop() && !eos_exists) {
-        auto* pn = n->as_pop();
-        if (pn->count() == 1) {
+        } else if (n->is_pop()) {
+            auto* pn = n->template as_pop<false>();
             c = pn->first_char();
             child = pn->child_at_slot(0);
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        }
-    } else if (n->is_full() && !eos_exists) {
-        auto* fn = n->template as_full<false>();
-        if (fn->count() == 1) {
+        } else if (n->is_full()) {
+            auto* fn = n->template as_full<false>();
             c = fn->valid.first();
             child = fn->children[c].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
@@ -346,20 +538,43 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             T val;
             child->as_skip()->value.try_read(val);
             merged = builder_.make_leaf_skip(new_skip, val);
+        } else if (child->is_binary()) {
+            merged = builder_.make_leaf_binary(new_skip);
+            child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
         } else if (child->is_list()) [[likely]] {
             merged = builder_.make_leaf_list(new_skip);
             child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
+        } else if (child->is_pop()) {
+            merged = builder_.make_leaf_pop(new_skip);
+            child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
         } else {
             merged = builder_.make_leaf_full(new_skip);
             child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
         }
     } else {
-        if (child->is_list()) [[likely]] {
+        if (child->is_binary()) {
+            merged = builder_.make_interior_binary(new_skip);
+            child->template as_binary<false>()->move_children_to(merged->template as_binary<false>());
+            if constexpr (FIXED_LEN == 0) {
+                if (child->has_eos()) {
+                    T val;
+                    child->try_read_eos(val);
+                    merged->set_eos(val);
+                }
+            }
+        } else if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
             child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
         } else if (child->is_pop()) {
             merged = builder_.make_interior_pop(new_skip);
-            child->as_pop()->move_children_to(merged->as_pop());
+            child->template as_pop<false>()->move_children_to(merged->template as_pop<false>());
+            if constexpr (FIXED_LEN == 0) {
+                if (child->has_eos()) {
+                    T val;
+                    child->try_read_eos(val);
+                    merged->set_eos(val);
+                }
+            }
         } else {
             merged = builder_.make_interior_full(new_skip);
             child->template as_full<false>()->move_interior_to(merged->template as_full<false>());

@@ -176,15 +176,25 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
         return n->as_skip()->value.try_read(out);
     }
     
-    // LIST or FULL leaf - need exactly 1 char remaining
+    // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<true>();
+        int idx = bn->find(c);
+        if (idx < 0) return false;
+        return bn->values[idx].try_read(out);
+    }
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
         return ln->read_value(idx, out);
+    }
+    if (n->is_pop()) {
+        auto* pn = n->template as_pop<true>();
+        return pn->read_value(c, out);
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
@@ -228,12 +238,18 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
         return key.empty();
     }
     
-    // LIST or FULL leaf - need exactly 1 char remaining
+    // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        return n->template as_binary<true>()->has(c);
+    }
     if (n->is_list()) [[likely]] {
         return n->template as_list<true>()->has(c);
+    }
+    if (n->is_pop()) {
+        return n->template as_pop<true>()->has(c);
     }
     return n->template as_full<true>()->has(c);
 }
@@ -270,15 +286,25 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
         return n->as_skip()->value.try_read(out);
     }
     
-    // LIST or FULL leaf
+    // BINARY, LIST, POP, or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<true>();
+        int idx = bn->find(c);
+        if (idx < 0) return false;
+        return bn->values[idx].try_read(out);
+    }
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
         return ln->read_value(idx, out);
+    }
+    if (n->is_pop()) {
+        auto* pn = n->template as_pop<true>();
+        return pn->read_value(c, out);
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
@@ -316,12 +342,18 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
         return key.empty();
     }
     
-    // LIST or FULL leaf
+    // BINARY, LIST, POP, or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        return n->template as_binary<true>()->has(c);
+    }
     if (n->is_list()) [[likely]] {
         return n->template as_list<true>()->has(c);
+    }
+    if (n->is_pop()) {
+        return n->template as_pop<true>()->has(c);
     }
     return n->template as_full<true>()->has(c);
 }

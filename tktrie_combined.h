@@ -1,14 +1,10 @@
-// ============================================================================
-// TKTRIE - SINGLE HEADER COMBINED FILE
-// Auto-generated - do not edit directly
-// ============================================================================
-
 #pragma once
+// TKTRIE - Combined single-header version
+// Auto-generated from individual header files
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_defines.h
-// ============================================================================
-
+// =============================================================================
 
 #include <array>
 #include <atomic>
@@ -109,24 +105,30 @@ using atomic_counter = atomic_storage<size_t, THREADED>;
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
 
-// Header: [LEAF:1][SKIP:1][LIST:1][POP:1][POISON:1][VERSION:59]
-// SKIP: FLAG_SKIP set (always leaf)
-// LIST: FLAG_LIST set (1-7 children)
-// POP: FLAG_POP set (8-32 children, popcount indexing)
-// FULL: none of SKIP/LIST/POP set (33+ children)
+// Header: [LEAF:1][SKIP:1][BINARY:1][LIST:1][POP:1][POISON:1][VERSION:58]
+// Type determination (mutually exclusive):
+//   SKIP:   FLAG_SKIP set (always leaf, single key-value)
+//   BINARY: FLAG_BINARY set (2 entries, leaf or interior)
+//   LIST:   FLAG_LIST set (3-7 entries, leaf or interior)
+//   POP:    FLAG_POP set (8-32 entries, leaf or interior)
+//   FULL:   none of SKIP/BINARY/LIST/POP set (33+ entries, leaf or interior)
+// Note: For interior with FIXED_LEN==0, entry count includes EOS if present
 static constexpr uint64_t FLAG_LEAF   = 1ULL << 63;
-static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf
-static constexpr uint64_t FLAG_LIST   = 1ULL << 61;  // leaf or interior, 1-7 children
-static constexpr uint64_t FLAG_POP    = 1ULL << 60;  // interior only, 8-32 children
-static constexpr uint64_t FLAG_POISON = 1ULL << 59;
-static constexpr uint64_t VERSION_MASK = (1ULL << 59) - 1;
-static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_LIST | FLAG_POP | FLAG_POISON;
+static constexpr uint64_t FLAG_SKIP   = 1ULL << 62;  // always leaf, 1 entry
+static constexpr uint64_t FLAG_BINARY = 1ULL << 61;  // leaf or interior, 2 entries
+static constexpr uint64_t FLAG_LIST   = 1ULL << 60;  // leaf or interior, 3-7 entries
+static constexpr uint64_t FLAG_POP    = 1ULL << 59;  // leaf or interior, 8-32 entries
+static constexpr uint64_t FLAG_POISON = 1ULL << 58;
+static constexpr uint64_t VERSION_MASK = (1ULL << 58) - 1;
+static constexpr uint64_t FLAGS_MASK = FLAG_LEAF | FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP | FLAG_POISON;
+static constexpr uint64_t TYPE_FLAGS_MASK = FLAG_SKIP | FLAG_BINARY | FLAG_LIST | FLAG_POP;
 
+static constexpr int BINARY_MAX = 2;
 static constexpr int LIST_MAX = 7;
 static constexpr int POP_MAX = 32;
 
 // Interior FULL node header with poison flag set - used for retry sentinel
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no SKIP/LIST/POP) + poison
+static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // FULL (no type flags) + poison
 
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
@@ -411,10 +413,9 @@ inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexc
 
 }  // namespace gteitelbaum
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_dataptr.h
-// ============================================================================
-
+// =============================================================================
 
 #include <atomic>
 #include <cstring>
@@ -591,10 +592,47 @@ private:
 
 }  // namespace gteitelbaum
 
-// ============================================================================
-// FILE: tktrie_node.h
-// ============================================================================
+// =============================================================================
+// FILE: tktrie_ebr.h
+// =============================================================================
 
+// =============================================================================
+// TKTRIE EBR - Epoch-Based Reclamation (fully per-trie, no globals)
+// =============================================================================
+//
+// Each tktrie instance has its own:
+//   - epoch_ : incremented on writes
+//   - reader_epochs_[MAX_SLOTS] : tracks active reader epochs (0 = inactive)
+//   - retired list : nodes waiting to be freed
+//
+// Reader protocol:
+//   enter() - hash thread to slot, store current epoch
+//   exit()  - clear slot (store 0)
+//
+// Reclamation:
+//   Compute min_reader_epoch across slots, free nodes retired before that
+//
+// Slot collisions (two threads hash to same slot):
+//   Conservative - we see older epoch, delay reclamation. Safe.
+//
+// =============================================================================
+
+#include <atomic>
+#include <thread>
+
+namespace gteitelbaum {
+
+// Hash thread ID to slot index
+inline size_t thread_slot_hash(size_t max_slots) noexcept {
+    std::hash<std::thread::id> hasher;
+    return hasher(std::this_thread::get_id()) % max_slots;
+}
+
+}  // namespace gteitelbaum
+
+// =============================================================================
+// FILE: tktrie_node.h
+// =============================================================================
 
 #include <atomic>
 #include <array>
@@ -610,9 +648,10 @@ namespace gteitelbaum {
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_base;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_with_skip;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct skip_node;
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct pop_node;  // 8-32 children, interior only
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct binary_node;  // 2 entries
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;    // 3-7 entries
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct pop_node;     // 8-32 entries
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;    // 33+ entries
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
 
 // Forward declare retry sentinel getter
@@ -722,20 +761,26 @@ struct node_base {
     // Type queries
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
+    bool is_binary() const noexcept { return header() & FLAG_BINARY; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
     bool is_pop() const noexcept { return header() & FLAG_POP; }
-    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST | FLAG_POP)); }
+    bool is_full() const noexcept { return !(header() & TYPE_FLAGS_MASK); }
     
     // Downcasts
     skip_node<T, THREADED, Allocator, FIXED_LEN>* as_skip() noexcept {
         return static_cast<skip_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
+    binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_binary() noexcept {
+        return static_cast<binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    template <bool IS_LEAF>
     list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() noexcept {
         return static_cast<list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
-    pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() noexcept {
-        return static_cast<pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
+    template <bool IS_LEAF>
+    pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_pop() noexcept {
+        return static_cast<pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
     template <bool IS_LEAF>
     full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() noexcept {
@@ -746,11 +791,16 @@ struct node_base {
         return static_cast<const skip_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
+    const binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_binary() const noexcept {
+        return static_cast<const binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    template <bool IS_LEAF>
     const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() const noexcept {
         return static_cast<const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
-    const pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() const noexcept {
-        return static_cast<const pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
+    template <bool IS_LEAF>
+    const pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_pop() const noexcept {
+        return static_cast<const pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
     template <bool IS_LEAF>
     const full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() const noexcept {
@@ -768,28 +818,35 @@ struct node_base {
     
     // Child access (interior nodes only)
     ptr_t get_child(unsigned char c) const noexcept {
+        if (is_binary()) {
+            return as_binary<false>()->get_child(c);
+        }
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
         }
         if (is_pop()) {
-            return as_pop()->get_child(c);
+            return as_pop<false>()->get_child(c);
         }
         return as_full<false>()->get_child(c);
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        if (is_binary()) {
+            return as_binary<false>()->get_child_slot(c);
+        }
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child_slot(c);
         }
         if (is_pop()) {
-            return as_pop()->get_child_slot(c);
+            return as_pop<false>()->get_child_slot(c);
         }
         return as_full<false>()->get_child_slot(c);
     }
     
     int child_count() const noexcept {
+        if (is_binary()) return as_binary<false>()->count();
         if (is_list()) [[likely]] return as_list<false>()->count();
-        if (is_pop()) return as_pop()->count();
+        if (is_pop()) return as_pop<false>()->count();
         return as_full<false>()->count();
     }
     
@@ -798,7 +855,9 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             return false;
         } else {
+            if (is_binary()) return as_binary<false>()->eos.has_data();
             if (is_list()) [[likely]] return as_list<false>()->eos.has_data();
+            if (is_pop()) return as_pop<false>()->eos.has_data();
             return as_full<false>()->eos.has_data();
         }
     }
@@ -808,7 +867,9 @@ struct node_base {
             (void)out;
             return false;
         } else {
+            if (is_binary()) return as_binary<false>()->eos.try_read(out);
             if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
+            if (is_pop()) return as_pop<false>()->eos.try_read(out);
             return as_full<false>()->eos.try_read(out);
         }
     }
@@ -817,7 +878,9 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             (void)value;
         } else {
-            if (is_list()) [[likely]] as_list<false>()->eos.set(value);
+            if (is_binary()) as_binary<false>()->eos.set(value);
+            else if (is_list()) [[likely]] as_list<false>()->eos.set(value);
+            else if (is_pop()) as_pop<false>()->eos.set(value);
             else as_full<false>()->eos.set(value);
         }
     }
@@ -826,7 +889,9 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             // No EOS for fixed-length keys
         } else {
-            if (is_list()) [[likely]] as_list<false>()->eos.clear();
+            if (is_binary()) as_binary<false>()->eos.clear();
+            else if (is_list()) [[likely]] as_list<false>()->eos.clear();
+            else if (is_pop()) as_pop<false>()->eos.clear();
             else as_full<false>()->eos.clear();
         }
     }
@@ -860,6 +925,232 @@ struct skip_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     
     skip_node() = default;
     ~skip_node() = default;
+};
+
+// =============================================================================
+// BINARY_NODE - LEAF specialization (stores 2 values)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct binary_node<T, THREADED, Allocator, FIXED_LEN, true> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using data_t = typename base_t::data_t;
+    
+    static constexpr int MAX_ENTRIES = 2;
+    
+    unsigned char chars[2] = {};
+    int count_ = 0;
+    std::array<data_t, 2> values;
+    
+    binary_node() = default;
+    ~binary_node() = default;
+    
+    int count() const noexcept { return count_; }
+    bool has(unsigned char c) const noexcept { 
+        return (count_ > 0 && chars[0] == c) || (count_ > 1 && chars[1] == c); 
+    }
+    
+    int find(unsigned char c) const noexcept {
+        if (count_ > 0 && chars[0] == c) return 0;
+        if (count_ > 1 && chars[1] == c) return 1;
+        return -1;
+    }
+    
+    void add_entry(unsigned char c, const T& value) {
+        chars[count_] = c;
+        values[count_].set(value);
+        ++count_;
+    }
+    
+    void remove_entry(int idx) {
+        if (idx == 0 && count_ == 2) {
+            chars[0] = chars[1];
+            values[0] = std::move(values[1]);
+        }
+        --count_;
+    }
+    
+    void copy_values_to(binary_node* dest) const {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->values[i].deep_copy_from(values[i]);
+        }
+    }
+};
+
+// =============================================================================
+// BINARY_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+    requires (FIXED_LEN > 0)
+struct binary_node<T, THREADED, Allocator, FIXED_LEN, false> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    
+    static constexpr int MAX_CHILDREN = 2;
+    
+    unsigned char chars[2] = {};
+    int count_ = 0;
+    std::array<atomic_ptr, 2> children;
+    
+    binary_node() = default;
+    ~binary_node() = default;
+    
+    int count() const noexcept { return count_; }
+    bool has(unsigned char c) const noexcept { 
+        return (count_ > 0 && chars[0] == c) || (count_ > 1 && chars[1] == c); 
+    }
+    
+    int find(unsigned char c) const noexcept {
+        if (count_ > 0 && chars[0] == c) return 0;
+        if (count_ > 1 && chars[1] == c) return 1;
+        return -1;
+    }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        int idx = find(c);
+        return idx >= 0 ? children[idx].load() : nullptr;
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        int idx = find(c);
+        return idx >= 0 ? &children[idx] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
+        chars[count_] = c;
+        children[count_].store(child);
+        ++count_;
+    }
+    
+    void remove_child(int idx) {
+        if (idx == 0 && count_ == 2) {
+            chars[0] = chars[1];
+            children[0].store(children[1].load());
+        }
+        children[count_ - 1].store(nullptr);
+        --count_;
+    }
+    
+    unsigned char first_char() const noexcept { return chars[0]; }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+    
+    void move_children_to(binary_node* dest) {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+        count_ = 0;
+    }
+    
+    void copy_children_to(binary_node* dest) const {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+        }
+    }
+};
+
+// =============================================================================
+// BINARY_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// Entry count = child_count + (has_eos ? 1 : 0), supports 1-2 entries
+// Examples: 1 child + EOS = 2, 2 children = 2, 1 child alone = 1
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator>
+struct binary_node<T, THREADED, Allocator, 0, false> 
+    : node_with_skip<T, THREADED, Allocator, 0> {
+    using base_t = node_with_skip<T, THREADED, Allocator, 0>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    using eos_data_t = typename base_t::eos_data_t;
+    
+    static constexpr int MAX_CHILDREN = 2;
+    
+    eos_data_t eos;
+    unsigned char chars[2] = {};
+    int count_ = 0;  // child count (0-2), entry count = count_ + eos.has_data()
+    std::array<atomic_ptr, 2> children;
+    
+    binary_node() = default;
+    ~binary_node() = default;
+    
+    int count() const noexcept { return count_; }  // child count
+    int entry_count() const noexcept { return count_ + (eos.has_data() ? 1 : 0); }
+    
+    bool has(unsigned char c) const noexcept { 
+        return (count_ > 0 && chars[0] == c) || (count_ > 1 && chars[1] == c); 
+    }
+    
+    int find(unsigned char c) const noexcept {
+        if (count_ > 0 && chars[0] == c) return 0;
+        if (count_ > 1 && chars[1] == c) return 1;
+        return -1;
+    }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        int idx = find(c);
+        return idx >= 0 ? children[idx].load() : nullptr;
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        int idx = find(c);
+        return idx >= 0 ? &children[idx] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
+        chars[count_] = c;
+        children[count_].store(child);
+        ++count_;
+    }
+    
+    void remove_child(int idx) {
+        if (idx == 0 && count_ == 2) {
+            chars[0] = chars[1];
+            children[0].store(children[1].load());
+        }
+        children[count_ - 1].store(nullptr);
+        --count_;
+    }
+    
+    unsigned char first_char() const noexcept { return chars[0]; }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+    
+    void move_children_to(binary_node* dest) {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+        count_ = 0;
+    }
+    
+    void copy_children_to(binary_node* dest) const {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
+    void move_interior_to(binary_node* dest) {
+        dest->eos = std::move(eos);
+        move_children_to(dest);
+    }
+    
+    void copy_interior_to(binary_node* dest) const {
+        dest->eos.deep_copy_from(eos);
+        copy_children_to(dest);
+    }
 };
 
 // =============================================================================
@@ -1111,13 +1402,90 @@ struct list_node<T, THREADED, Allocator, 0, false>
 };
 
 // =============================================================================
-// POP_NODE - Interior node with 8-32 children using popcount indexing
-// Uses bitmap256 for presence tracking, compact children array indexed by popcount
-// Size: header(8) + skip(8) + bitmap(32) + 32*ptr(256) = 304 bytes (vs 2096 for full)
+// POP_NODE - LEAF specialization (8-32 values using popcount indexing)
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+struct pop_node<T, THREADED, Allocator, FIXED_LEN, true> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using data_t = typename base_t::data_t;
+    
+    static constexpr int MAX_ENTRIES = POP_MAX;  // 32
+    
+    bitmap256 valid;
+    std::array<data_t, MAX_ENTRIES> values;
+    
+    pop_node() = default;
+    ~pop_node() = default;
+    
+    // Get slot index for character c using popcount
+    int slot_for(unsigned char c) const noexcept {
+        int word = c >> 6;
+        int bit = c & 63;
+        int slot = 0;
+        for (int w = 0; w < word; ++w) {
+            slot += std::popcount(valid.word(w));
+        }
+        uint64_t mask = (1ULL << bit) - 1;
+        slot += std::popcount(valid.word(word) & mask);
+        return slot;
+    }
+    
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
+    
+    int find(unsigned char c) const noexcept {
+        return valid.test(c) ? slot_for(c) : -1;
+    }
+    
+    bool read_value(unsigned char c, T& out) const noexcept {
+        if (!valid.test(c)) return false;
+        return values[slot_for(c)].try_read(out);
+    }
+    
+    void add_value(unsigned char c, const T& val) {
+        int slot = slot_for(c);
+        int cnt = count();
+        // Shift values up to make room
+        for (int i = cnt; i > slot; --i) {
+            values[i] = std::move(values[i-1]);
+        }
+        values[slot].set(val);
+        valid.set(c);
+    }
+    
+    void remove_value(unsigned char c) {
+        int slot = slot_for(c);
+        valid.clear(c);
+        int new_count = count();
+        // Shift values down
+        for (int i = slot; i < new_count; ++i) {
+            values[i] = std::move(values[i+1]);
+        }
+        values[new_count].clear();
+    }
+    
+    void copy_values_to(pop_node* dest) const {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->values[i].deep_copy_from(values[i]);
+        }
+    }
+    
+    unsigned char first_char() const noexcept { return valid.first(); }
+};
+
+// =============================================================================
+// POP_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
+// 8-32 children using popcount indexing
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+    requires (FIXED_LEN > 0)
+struct pop_node<T, THREADED, Allocator, FIXED_LEN, false> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
     using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
@@ -1132,21 +1500,17 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     
     // Get slot index for character c using popcount
     int slot_for(unsigned char c) const noexcept {
-        // Count bits set before position c
         int word = c >> 6;
         int bit = c & 63;
         int slot = 0;
-        // Sum popcounts of all words before this one
         for (int w = 0; w < word; ++w) {
             slot += std::popcount(valid.word(w));
         }
-        // Add popcount of bits before position in current word
         uint64_t mask = (1ULL << bit) - 1;
         slot += std::popcount(valid.word(word) & mask);
         return slot;
     }
     
-    // Unified interface
     int count() const noexcept { return valid.count(); }
     bool has(unsigned char c) const noexcept { return valid.test(c); }
     
@@ -1160,30 +1524,26 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         return &children[slot_for(c)];
     }
     
-    // Add child - caller must ensure count() < MAX_CHILDREN and !has(c)
     void add_child(unsigned char c, ptr_t child) {
         int slot = slot_for(c);
-        // Shift children up to make room
-        for (int i = count(); i > slot; --i) {
+        int cnt = count();
+        for (int i = cnt; i > slot; --i) {
             children[i].store(children[i-1].load());
         }
         children[slot].store(child);
         valid.set(c);
     }
     
-    // Remove child - caller must ensure has(c)
     void remove_child(unsigned char c) {
         int slot = slot_for(c);
         valid.clear(c);
         int new_count = count();
-        // Shift children down
         for (int i = slot; i < new_count; ++i) {
             children[i].store(children[i+1].load());
         }
         children[new_count].store(nullptr);
     }
     
-    // Move all children to a full_node
     void move_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
         int idx = 0;
         valid.for_each_set([&](unsigned char c) {
@@ -1194,7 +1554,6 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         });
     }
     
-    // Copy all children to a full_node
     void copy_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
         int idx = 0;
         valid.for_each_set([&](unsigned char c) {
@@ -1204,7 +1563,6 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         });
     }
     
-    // Move all children to another pop_node
     void move_children_to(pop_node* dest) {
         dest->valid = valid;
         int cnt = count();
@@ -1214,15 +1572,128 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         }
     }
     
-    // Get first child character
-    unsigned char first_char() const noexcept {
-        return valid.first();
+    unsigned char first_char() const noexcept { return valid.first(); }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+};
+
+// =============================================================================
+// POP_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// Entry count = child_count + (has_eos ? 1 : 0), supports 8-32 entries
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator>
+struct pop_node<T, THREADED, Allocator, 0, false> 
+    : node_with_skip<T, THREADED, Allocator, 0> {
+    using base_t = node_with_skip<T, THREADED, Allocator, 0>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    using eos_data_t = typename base_t::eos_data_t;
+    
+    static constexpr int MAX_CHILDREN = POP_MAX;  // 32
+    
+    eos_data_t eos;
+    bitmap256 valid;
+    std::array<atomic_ptr, MAX_CHILDREN> children;
+    
+    pop_node() = default;
+    ~pop_node() = default;
+    
+    int slot_for(unsigned char c) const noexcept {
+        int word = c >> 6;
+        int bit = c & 63;
+        int slot = 0;
+        for (int w = 0; w < word; ++w) {
+            slot += std::popcount(valid.word(w));
+        }
+        uint64_t mask = (1ULL << bit) - 1;
+        slot += std::popcount(valid.word(word) & mask);
+        return slot;
     }
     
-    // Get child at slot index (for iteration)
-    ptr_t child_at_slot(int slot) const noexcept {
-        return children[slot].load();
+    int count() const noexcept { return valid.count(); }  // child count
+    int entry_count() const noexcept { return count() + (eos.has_data() ? 1 : 0); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        if (!valid.test(c)) return nullptr;
+        return children[slot_for(c)].load();
     }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        if (!valid.test(c)) return nullptr;
+        return &children[slot_for(c)];
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
+        int slot = slot_for(c);
+        int cnt = count();
+        for (int i = cnt; i > slot; --i) {
+            children[i].store(children[i-1].load());
+        }
+        children[slot].store(child);
+        valid.set(c);
+    }
+    
+    void remove_child(unsigned char c) {
+        int slot = slot_for(c);
+        valid.clear(c);
+        int new_count = count();
+        for (int i = slot; i < new_count; ++i) {
+            children[i].store(children[i+1].load());
+        }
+        children[new_count].store(nullptr);
+    }
+    
+    void move_children_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            children[idx].store(nullptr);
+            ++idx;
+        });
+    }
+    
+    void copy_children_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) const {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            ++idx;
+        });
+    }
+    
+    void move_interior_to(pop_node* dest) {
+        dest->eos = std::move(eos);
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    void copy_interior_to(pop_node* dest) const {
+        dest->eos.deep_copy_from(eos);
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
+    // Alias for code that doesn't need to move eos
+    void move_children_to(pop_node* dest) {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    unsigned char first_char() const noexcept { return valid.first(); }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
 };
 
 // =============================================================================
@@ -1495,9 +1966,12 @@ public:
     using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
     using ptr_t = base_t*;
     using skip_t = skip_node<T, THREADED, Allocator, FIXED_LEN>;
+    using leaf_binary_t = binary_node<T, THREADED, Allocator, FIXED_LEN, true>;
+    using interior_binary_t = binary_node<T, THREADED, Allocator, FIXED_LEN, false>;
     using leaf_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, false>;
-    using pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN>;
+    using leaf_pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN, true>;
+    using interior_pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN, false>;
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
@@ -1519,11 +1993,15 @@ public:
         if (!n || is_sentinel(n)) return;
         if (n->is_skip()) {
             delete n->as_skip();
+        } else if (n->is_binary()) {
+            if (n->is_leaf()) delete n->template as_binary<true>();
+            else delete n->template as_binary<false>();
         } else if (n->is_list()) [[likely]] {
             if (n->is_leaf()) delete n->template as_list<true>();
             else delete n->template as_list<false>();
         } else if (n->is_pop()) {
-            delete n->as_pop();
+            if (n->is_leaf()) delete n->template as_pop<true>();
+            else delete n->template as_pop<false>();
         } else {
             if (n->is_leaf()) delete n->template as_full<true>();
             else delete n->template as_full<false>();
@@ -1538,6 +2016,13 @@ public:
         return n;
     }
     
+    ptr_t make_leaf_binary(std::string_view sk) {
+        auto* n = new leaf_binary_t();
+        n->set_header(make_header(true, FLAG_BINARY));
+        n->skip.assign(sk);
+        return n;
+    }
+    
     ptr_t make_leaf_list(std::string_view sk) {
         auto* n = new leaf_list_t();
         n->set_header(make_header(true, FLAG_LIST));
@@ -1545,9 +2030,23 @@ public:
         return n;
     }
     
+    ptr_t make_leaf_pop(std::string_view sk) {
+        auto* n = new leaf_pop_t();
+        n->set_header(make_header(true, FLAG_POP));
+        n->skip.assign(sk);
+        return n;
+    }
+    
     ptr_t make_leaf_full(std::string_view sk) {
         auto* n = new leaf_full_t();
         n->set_header(make_header(true, 0));
+        n->skip.assign(sk);
+        return n;
+    }
+    
+    ptr_t make_interior_binary(std::string_view sk) {
+        auto* n = new interior_binary_t();
+        n->set_header(make_header(false, FLAG_BINARY));
         n->skip.assign(sk);
         return n;
     }
@@ -1560,7 +2059,7 @@ public:
     }
     
     ptr_t make_interior_pop(std::string_view sk) {
-        auto* n = new pop_t();
+        auto* n = new interior_pop_t();
         n->set_header(make_header(false, FLAG_POP));
         n->skip.assign(sk);
         return n;
@@ -1583,14 +2082,20 @@ public:
         }
         
         if (!n->is_leaf()) {
-            if (n->is_list()) [[likely]] {
+            if (n->is_binary()) {
+                auto* bn = n->template as_binary<false>();
+                int cnt = bn->count();
+                for (int i = 0; i < cnt; ++i) {
+                    dealloc_node(bn->children[i].load());
+                }
+            } else if (n->is_list()) [[likely]] {
                 auto* ln = n->template as_list<false>();
                 int cnt = ln->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
                 }
             } else if (n->is_pop()) {
-                auto* pn = n->as_pop();
+                auto* pn = n->template as_pop<false>();
                 int cnt = pn->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(pn->children[i].load());
@@ -1617,9 +2122,25 @@ public:
                 d->value.deep_copy_from(s->value);
                 return d;
             }
+            if (src->is_binary()) {
+                auto* s = src->template as_binary<true>();
+                auto* d = new leaf_binary_t();
+                d->set_header(s->header());
+                d->skip = s->skip;
+                s->copy_values_to(d);
+                return d;
+            }
             if (src->is_list()) [[likely]] {
                 auto* s = src->template as_list<true>();
                 auto* d = new leaf_list_t();
+                d->set_header(s->header());
+                d->skip = s->skip;
+                s->copy_values_to(d);
+                return d;
+            }
+            if (src->is_pop()) {
+                auto* s = src->template as_pop<true>();
+                auto* d = new leaf_pop_t();
                 d->set_header(s->header());
                 d->skip = s->skip;
                 s->copy_values_to(d);
@@ -1634,6 +2155,20 @@ public:
         }
         
         // Interior
+        if (src->is_binary()) {
+            auto* s = src->template as_binary<false>();
+            auto* d = new interior_binary_t();
+            d->set_header(s->header());
+            d->skip = s->skip;
+            if constexpr (FIXED_LEN == 0) {
+                d->eos.deep_copy_from(s->eos);
+            }
+            s->copy_children_to(d);
+            for (int i = 0; i < d->count_; ++i) {
+                d->children[i].store(deep_copy(d->children[i].load()));
+            }
+            return d;
+        }
         if (src->is_list()) [[likely]] {
             auto* s = src->template as_list<false>();
             auto* d = new interior_list_t();
@@ -1650,11 +2185,14 @@ public:
             return d;
         }
         if (src->is_pop()) {
-            auto* s = src->as_pop();
-            auto* d = new pop_t();
+            auto* s = src->template as_pop<false>();
+            auto* d = new interior_pop_t();
             d->set_header(s->header());
             d->skip = s->skip;
             d->valid = s->valid;
+            if constexpr (FIXED_LEN == 0) {
+                d->eos.deep_copy_from(s->eos);
+            }
             int cnt = s->count();
             for (int i = 0; i < cnt; ++i) {
                 d->children[i].store(deep_copy(s->children[i].load()));
@@ -1678,49 +2216,9 @@ public:
 
 }  // namespace gteitelbaum
 
-// ============================================================================
-// FILE: tktrie_ebr.h
-// ============================================================================
-
-
 // =============================================================================
-// TKTRIE EBR - Epoch-Based Reclamation (fully per-trie, no globals)
-// =============================================================================
-//
-// Each tktrie instance has its own:
-//   - epoch_ : incremented on writes
-//   - reader_epochs_[MAX_SLOTS] : tracks active reader epochs (0 = inactive)
-//   - retired list : nodes waiting to be freed
-//
-// Reader protocol:
-//   enter() - hash thread to slot, store current epoch
-//   exit()  - clear slot (store 0)
-//
-// Reclamation:
-//   Compute min_reader_epoch across slots, free nodes retired before that
-//
-// Slot collisions (two threads hash to same slot):
-//   Conservative - we see older epoch, delay reclamation. Safe.
-//
-// =============================================================================
-
-#include <atomic>
-#include <thread>
-
-namespace gteitelbaum {
-
-// Hash thread ID to slot index
-inline size_t thread_slot_hash(size_t max_slots) noexcept {
-    std::hash<std::thread::id> hasher;
-    return hasher(std::this_thread::get_id()) % max_slots;
-}
-
-}  // namespace gteitelbaum
-
-// ============================================================================
 // FILE: tktrie.h
-// ============================================================================
-
+// =============================================================================
 
 #include <cstring>
 #include <mutex>
@@ -2051,12 +2549,12 @@ private:
     insert_result split_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
     insert_result prefix_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
     insert_result extend_leaf_skip(ptr_t leaf, std::string_view key, const T& value, size_t m);
-    insert_result split_leaf_list(ptr_t leaf, std::string_view key, const T& value, size_t m);
-    insert_result prefix_leaf_list(ptr_t leaf, std::string_view key, const T& value, size_t m);
+    insert_result split_leaf_multi(ptr_t leaf, std::string_view key, const T& value, size_t m);
+    insert_result prefix_leaf_multi(ptr_t leaf, std::string_view key, const T& value, size_t m);
     ptr_t clone_leaf_with_skip(ptr_t leaf, std::string_view new_skip);
-    insert_result add_eos_to_leaf_list(ptr_t leaf, const T& value);
+    insert_result add_eos_to_leaf_multi(ptr_t leaf, const T& value);
     insert_result add_char_to_leaf(ptr_t leaf, unsigned char c, const T& value);
-    insert_result demote_leaf_list(ptr_t leaf, std::string_view key, const T& value);
+    insert_result demote_leaf_multi(ptr_t leaf, std::string_view key, const T& value);
     insert_result split_interior(ptr_t n, std::string_view key, const T& value, size_t m);
     ptr_t clone_interior_with_skip(ptr_t n, std::string_view new_skip);
     insert_result prefix_interior(ptr_t n, std::string_view key, const T& value, size_t m);
@@ -2205,10 +2703,9 @@ using concurrent_int64_trie = tktrie<int64_t, T, true, Allocator>;
 }  // namespace gteitelbaum
 
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_core.h
-// ============================================================================
-
+// =============================================================================
 
 // This file contains implementation details for tktrie
 // It should only be included from tktrie.h
@@ -2386,15 +2883,25 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
         return n->as_skip()->value.try_read(out);
     }
     
-    // LIST or FULL leaf - need exactly 1 char remaining
+    // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<true>();
+        int idx = bn->find(c);
+        if (idx < 0) return false;
+        return bn->values[idx].try_read(out);
+    }
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
         return ln->read_value(idx, out);
+    }
+    if (n->is_pop()) {
+        auto* pn = n->template as_pop<true>();
+        return pn->read_value(c, out);
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
@@ -2438,12 +2945,18 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
         return key.empty();
     }
     
-    // LIST or FULL leaf - need exactly 1 char remaining
+    // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        return n->template as_binary<true>()->has(c);
+    }
     if (n->is_list()) [[likely]] {
         return n->template as_list<true>()->has(c);
+    }
+    if (n->is_pop()) {
+        return n->template as_pop<true>()->has(c);
     }
     return n->template as_full<true>()->has(c);
 }
@@ -2480,15 +2993,25 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
         return n->as_skip()->value.try_read(out);
     }
     
-    // LIST or FULL leaf
+    // BINARY, LIST, POP, or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<true>();
+        int idx = bn->find(c);
+        if (idx < 0) return false;
+        return bn->values[idx].try_read(out);
+    }
     if (n->is_list()) [[likely]] {
         auto* ln = n->template as_list<true>();
         int idx = ln->find(c);
         if (idx < 0) return false;
         return ln->read_value(idx, out);
+    }
+    if (n->is_pop()) {
+        auto* pn = n->template as_pop<true>();
+        return pn->read_value(c, out);
     }
     auto* fn = n->template as_full<true>();
     if (!fn->has(c)) return false;
@@ -2526,12 +3049,18 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
         return key.empty();
     }
     
-    // LIST or FULL leaf
+    // BINARY, LIST, POP, or FULL leaf
     if (key.size() != 1) return false;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
+    if (n->is_binary()) {
+        return n->template as_binary<true>()->has(c);
+    }
     if (n->is_list()) [[likely]] {
         return n->template as_list<true>()->has(c);
+    }
+    if (n->is_pop()) {
+        return n->template as_pop<true>()->has(c);
     }
     return n->template as_full<true>()->has(c);
 }
@@ -2777,10 +3306,9 @@ void TKTRIE_CLASS::reclaim_retired() noexcept {
 }  // namespace gteitelbaum
 
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_insert.h
-// ============================================================================
-
+// =============================================================================
 
 // This file contains implementation details for tktrie (insert operations)
 // It should only be included from tktrie_core.h
@@ -2823,17 +3351,18 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_leaf(
         return extend_leaf_skip(leaf, key, value, m);
     }
 
+    // BINARY, LIST, POP, or FULL leaf
     size_t m = match_skip_impl(leaf_skip, key);
-    if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_list(leaf, key, value, m);
-    if (m < leaf_skip.size()) return prefix_leaf_list(leaf, key, value, m);
+    if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_multi(leaf, key, value, m);
+    if (m < leaf_skip.size()) return prefix_leaf_multi(leaf, key, value, m);
     key.remove_prefix(m);
 
-    if (key.empty()) return add_eos_to_leaf_list(leaf, value);
+    if (key.empty()) return add_eos_to_leaf_multi(leaf, value);
     if (key.size() == 1) {
         unsigned char c = static_cast<unsigned char>(key[0]);
         return add_char_to_leaf(leaf, c, value);
     }
-    return demote_leaf_list(leaf, key, value);
+    return demote_leaf_multi(leaf, key, value);
 }
 
 TKTRIE_TEMPLATE
@@ -2886,12 +3415,27 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-    ptr_t interior = builder_.make_interior_list(common);
+    // If both keys have exactly 1 char remaining, create a BINARY leaf
+    if (old_skip.size() == m + 1 && key.size() == m + 1) {
+        ptr_t binary = builder_.make_leaf_binary(common);
+        T old_value;
+        leaf->as_skip()->value.try_read(old_value);
+        binary->template as_binary<true>()->add_entry(old_c, old_value);
+        binary->template as_binary<true>()->add_entry(new_c, value);
+        res.new_node = binary;
+        res.old_nodes.push_back(leaf);
+        res.inserted = true;
+        return res;
+    }
+
+    // Otherwise create interior node with children
+    ptr_t interior = builder_.make_interior_binary(common);
     T old_value;
     leaf->as_skip()->value.try_read(old_value);
     ptr_t old_child = builder_.make_leaf_skip(old_skip.substr(m + 1), old_value);
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+    interior->template as_binary<false>()->add_child(old_c, old_child);
+    interior->template as_binary<false>()->add_child(new_c, new_child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -2905,15 +3449,17 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
     insert_result res;
     std::string_view old_skip = leaf->skip_str();
 
-    ptr_t interior = builder_.make_interior_list(std::string(key));
-    if constexpr (FIXED_LEN == 0) {
-        interior->set_eos(value);
-    }
-
     T old_value;
     leaf->as_skip()->value.try_read(old_value);
     ptr_t child = builder_.make_leaf_skip(old_skip.substr(m + 1), old_value);
-    interior->template as_list<false>()->add_child(static_cast<unsigned char>(old_skip[m]), child);
+
+    // For FIXED_LEN==0: 1 child + EOS = 2 entries -> BINARY
+    // For FIXED_LEN>0: 1 child = 1 entry -> still need to store, use BINARY with 1 child
+    ptr_t interior = builder_.make_interior_binary(std::string(key));
+    if constexpr (FIXED_LEN == 0) {
+        interior->set_eos(value);
+    }
+    interior->template as_binary<false>()->add_child(static_cast<unsigned char>(old_skip[m]), child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -2927,7 +3473,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     insert_result res;
     std::string_view old_skip = leaf->skip_str();
 
-    ptr_t interior = builder_.make_interior_list(std::string(old_skip));
+    // For FIXED_LEN==0: EOS + 1 child = 2 entries -> BINARY
+    // For FIXED_LEN>0: 1 child = 1 entry, use BINARY
+    ptr_t interior = builder_.make_interior_binary(std::string(old_skip));
     if constexpr (FIXED_LEN == 0) {
         T old_value;
         leaf->as_skip()->value.try_read(old_value);
@@ -2935,7 +3483,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     }
 
     ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->template as_list<false>()->add_child(static_cast<unsigned char>(key[m]), child);
+    interior->template as_binary<false>()->add_child(static_cast<unsigned char>(key[m]), child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -2944,7 +3492,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
 }
 
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_list(
+typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_multi(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
     std::string_view old_skip = leaf->skip_str();
@@ -2953,10 +3501,11 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_list(
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-    ptr_t interior = builder_.make_interior_list(common);
+    ptr_t interior = builder_.make_interior_binary(common);
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+    interior->template as_binary<false>()->add_child(old_c, old_child);
+    interior->template as_binary<false>()->add_child(new_c, new_child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -2965,18 +3514,19 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_list(
 }
 
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_list(
+typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_multi(
     ptr_t leaf, std::string_view key, const T& value, size_t m) {
     insert_result res;
     std::string_view old_skip = leaf->skip_str();
 
-    ptr_t interior = builder_.make_interior_list(std::string(key));
+    // 1 child (+ EOS for FIXED_LEN==0) -> BINARY
+    ptr_t interior = builder_.make_interior_binary(std::string(key));
     if constexpr (FIXED_LEN == 0) {
         interior->set_eos(value);
     }
 
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
-    interior->template as_list<false>()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
+    interior->template as_binary<false>()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
 
     res.new_node = interior;
     res.old_nodes.push_back(leaf);
@@ -2986,9 +3536,19 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_list(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_leaf_with_skip(ptr_t leaf, std::string_view new_skip) {
+    if (leaf->is_binary()) {
+        ptr_t n = builder_.make_leaf_binary(new_skip);
+        leaf->template as_binary<true>()->copy_values_to(n->template as_binary<true>());
+        return n;
+    }
     if (leaf->is_list()) {
         ptr_t n = builder_.make_leaf_list(new_skip);
         leaf->template as_list<true>()->copy_values_to(n->template as_list<true>());
+        return n;
+    }
+    if (leaf->is_pop()) {
+        ptr_t n = builder_.make_leaf_pop(new_skip);
+        leaf->template as_pop<true>()->copy_values_to(n->template as_pop<true>());
         return n;
     }
     ptr_t n = builder_.make_leaf_full(new_skip);
@@ -2997,7 +3557,7 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_leaf_with_skip(ptr_t leaf, std:
 }
 
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t leaf, const T& value) {
+typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t leaf, const T& value) {
     insert_result res;
     
     if constexpr (FIXED_LEN > 0) {
@@ -3005,7 +3565,18 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
     } else {
         std::string_view leaf_skip = leaf->skip_str();
 
-        if (leaf->is_list()) [[likely]] {
+        if (leaf->is_binary()) {
+            auto* src = leaf->template as_binary<true>();
+            ptr_t interior = builder_.make_interior_binary(leaf_skip);
+            interior->set_eos(value);
+            for (int i = 0; i < src->count(); ++i) {
+                T val;
+                src->values[i].try_read(val);
+                ptr_t child = builder_.make_leaf_skip("", val);
+                interior->template as_binary<false>()->add_child(src->chars[i], child);
+            }
+            res.new_node = interior;
+        } else if (leaf->is_list()) [[likely]] {
             auto* src = leaf->template as_list<true>();
             ptr_t interior = builder_.make_interior_list(leaf_skip);
             interior->set_eos(value);
@@ -3017,6 +3588,19 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_list(ptr_t le
                 ptr_t child = builder_.make_leaf_skip("", val);
                 interior->template as_list<false>()->add_child(c, child);
             }
+            res.new_node = interior;
+        } else if (leaf->is_pop()) {
+            auto* src = leaf->template as_pop<true>();
+            ptr_t interior = builder_.make_interior_pop(leaf_skip);
+            interior->set_eos(value);
+            int slot = 0;
+            src->valid.for_each_set([this, src, interior, &slot](unsigned char c) {
+                T val;
+                src->values[slot].try_read(val);
+                ptr_t child = builder_.make_leaf_skip("", val);
+                interior->template as_pop<false>()->add_child(c, child);
+                ++slot;
+            });
             res.new_node = interior;
         } else {
             auto* src = leaf->template as_full<true>();
@@ -3042,6 +3626,35 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
     ptr_t leaf, unsigned char c, const T& value) {
     insert_result res;
 
+    // BINARY leaf: 2 entries, convert to LIST if adding 3rd
+    if (leaf->is_binary()) {
+        auto* bn = leaf->template as_binary<true>();
+        if (bn->has(c)) return res;  // exists
+
+        if (bn->count() < BINARY_MAX) {
+            bn->add_entry(c, value);
+            res.in_place = true;
+            res.inserted = true;
+            return res;
+        }
+
+        // Convert BINARY → LIST (adding 3rd entry)
+        ptr_t list = builder_.make_leaf_list(leaf->skip_str());
+        auto* ln = list->template as_list<true>();
+        for (int i = 0; i < bn->count(); ++i) {
+            T val;
+            bn->values[i].try_read(val);
+            ln->add_value(bn->chars[i], val);
+        }
+        ln->add_value(c, value);
+
+        res.new_node = list;
+        res.old_nodes.push_back(leaf);
+        res.inserted = true;
+        return res;
+    }
+
+    // LIST leaf: 3-7 entries, convert to POP if adding 8th
     if (leaf->is_list()) {
         auto* ln = leaf->template as_list<true>();
         if (ln->has(c)) return res;
@@ -3053,15 +3666,45 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
             return res;
         }
 
-        ptr_t full = builder_.make_leaf_full(leaf->skip_str());
-        auto* fn = full->template as_full<true>();
+        // Convert LIST → POP (adding 8th entry)
+        ptr_t pop = builder_.make_leaf_pop(leaf->skip_str());
+        auto* pn = pop->template as_pop<true>();
         [[assume(ln->count() == 7)]];  // Must be LIST_MAX to reach here
         for (int i = 0; i < ln->count(); ++i) {
             unsigned char ch = ln->chars.char_at(i);
             T val;
             ln->values[i].try_read(val);
-            fn->add_value(ch, val);
+            pn->add_value(ch, val);
         }
+        pn->add_value(c, value);
+
+        res.new_node = pop;
+        res.old_nodes.push_back(leaf);
+        res.inserted = true;
+        return res;
+    }
+
+    // POP leaf: 8-32 entries, convert to FULL if adding 33rd
+    if (leaf->is_pop()) {
+        auto* pn = leaf->template as_pop<true>();
+        if (pn->has(c)) return res;
+
+        if (pn->count() < POP_MAX) {
+            pn->add_value(c, value);
+            res.in_place = true;
+            res.inserted = true;
+            return res;
+        }
+
+        // Convert POP → FULL (adding 33rd entry)
+        ptr_t full = builder_.make_leaf_full(leaf->skip_str());
+        auto* fn = full->template as_full<true>();
+        [[assume(pn->count() == 32)]];  // Must be POP_MAX to reach here
+        pn->valid.for_each_set([pn, fn](unsigned char ch) {
+            T val;
+            pn->values[pn->find(ch)].try_read(val);
+            fn->add_value(ch, val);
+        });
         fn->add_value(c, value);
 
         res.new_node = full;
@@ -3070,6 +3713,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
         return res;
     }
 
+    // FULL leaf: 33+ entries
     auto* fn = leaf->template as_full<true>();
     if (fn->has(c)) return res;
     fn->add_value_atomic(c, value);
@@ -3079,13 +3723,55 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
 }
 
 TKTRIE_TEMPLATE
-typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
+typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
     ptr_t leaf, std::string_view key, const T& value) {
     insert_result res;
     std::string_view leaf_skip = leaf->skip_str();
     unsigned char first_c = static_cast<unsigned char>(key[0]);
 
-    if (leaf->is_list()) [[likely]] {
+    if (leaf->is_binary()) {
+        auto* src = leaf->template as_binary<true>();
+        int leaf_count = src->count();
+        int existing_idx = src->find(first_c);
+        
+        // BINARY leaf -> BINARY or LIST interior
+        if (existing_idx >= 0 || leaf_count < BINARY_MAX) {
+            ptr_t interior = builder_.make_interior_binary(leaf_skip);
+            auto* dst = interior->template as_binary<false>();
+            for (int i = 0; i < leaf_count; ++i) {
+                T val;
+                src->values[i].try_read(val);
+                ptr_t child = builder_.make_leaf_skip("", val);
+                dst->add_child(src->chars[i], child);
+            }
+            
+            if (existing_idx >= 0) {
+                ptr_t child = dst->children[existing_idx].load();
+                auto child_res = insert_impl(&dst->children[existing_idx], child, key.substr(1), value);
+                if (child_res.new_node) {
+                    dst->children[existing_idx].store(child_res.new_node);
+                }
+                for (auto* old : child_res.old_nodes) res.old_nodes.push_back(old);
+            } else {
+                ptr_t child = create_leaf_for_key(key.substr(1), value);
+                dst->add_child(first_c, child);
+            }
+            res.new_node = interior;
+        } else {
+            // Adding 3rd child: BINARY -> LIST
+            ptr_t interior = builder_.make_interior_list(leaf_skip);
+            auto* dst = interior->template as_list<false>();
+            for (int i = 0; i < leaf_count; ++i) {
+                T val;
+                src->values[i].try_read(val);
+                ptr_t child = builder_.make_leaf_skip("", val);
+                dst->add_child(src->chars[i], child);
+            }
+            ptr_t child = create_leaf_for_key(key.substr(1), value);
+            dst->add_child(first_c, child);
+            res.new_node = interior;
+        }
+    } else if (leaf->is_list()) [[likely]] {
         auto* src = leaf->template as_list<true>();
         int leaf_count = src->count();
         [[assume(leaf_count >= 0 && leaf_count <= 7)]];
@@ -3095,7 +3781,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
         if (need_pop) {
             // LIST at capacity -> convert to POP
             ptr_t interior = builder_.make_interior_pop(leaf_skip);
-            auto* dst = interior->as_pop();
+            auto* dst = interior->template as_pop<false>();
             for (int i = 0; i < leaf_count; ++i) {
                 unsigned char c = src->chars.char_at(i);
                 T val;
@@ -3122,6 +3808,52 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_list(
                 auto child_res = insert_impl(&dst->children[existing_idx], child, key.substr(1), value);
                 if (child_res.new_node) {
                     dst->children[existing_idx].store(child_res.new_node);
+                }
+                for (auto* old : child_res.old_nodes) res.old_nodes.push_back(old);
+            } else {
+                ptr_t child = create_leaf_for_key(key.substr(1), value);
+                dst->add_child(first_c, child);
+            }
+            res.new_node = interior;
+        }
+    } else if (leaf->is_pop()) {
+        auto* src = leaf->template as_pop<true>();
+        int leaf_count = src->count();
+        bool existing = src->has(first_c);
+        bool need_full = !existing && (leaf_count >= POP_MAX);
+        
+        if (need_full) {
+            // POP at capacity -> convert to FULL
+            ptr_t interior = builder_.make_interior_full(leaf_skip);
+            auto* dst = interior->template as_full<false>();
+            int slot = 0;
+            src->valid.for_each_set([this, src, dst, &slot](unsigned char c) {
+                T val;
+                src->values[slot].try_read(val);
+                ptr_t child = builder_.make_leaf_skip("", val);
+                dst->add_child(c, child);
+                ++slot;
+            });
+            ptr_t child = create_leaf_for_key(key.substr(1), value);
+            dst->add_child(first_c, child);
+            res.new_node = interior;
+        } else {
+            ptr_t interior = builder_.make_interior_pop(leaf_skip);
+            auto* dst = interior->template as_pop<false>();
+            int slot = 0;
+            src->valid.for_each_set([this, src, dst, &slot](unsigned char c) {
+                T val;
+                src->values[slot].try_read(val);
+                ptr_t child = builder_.make_leaf_skip("", val);
+                dst->add_child(c, child);
+                ++slot;
+            });
+            
+            if (existing) {
+                ptr_t child = dst->get_child(first_c);
+                auto child_res = insert_impl(dst->get_child_slot(first_c), child, key.substr(1), value);
+                if (child_res.new_node) {
+                    dst->get_child_slot(first_c)->store(child_res.new_node);
                 }
                 for (auto* old : child_res.old_nodes) res.old_nodes.push_back(old);
             } else {
@@ -3170,10 +3902,12 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-    ptr_t new_int = builder_.make_interior_list(common);
+    // 2 children -> BINARY
+    ptr_t new_int = builder_.make_interior_binary(common);
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-    new_int->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+    new_int->template as_binary<false>()->add_child(old_c, old_child);
+    new_int->template as_binary<false>()->add_child(new_c, new_child);
 
     res.new_node = new_int;
     res.old_nodes.push_back(n);
@@ -3183,6 +3917,15 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std::string_view new_skip) {
+    if (n->is_binary()) {
+        ptr_t clone = builder_.make_interior_binary(new_skip);
+        if constexpr (FIXED_LEN == 0) {
+            n->template as_binary<false>()->move_interior_to(clone->template as_binary<false>());
+        } else {
+            n->template as_binary<false>()->move_children_to(clone->template as_binary<false>());
+        }
+        return clone;
+    }
     if (n->is_list()) [[likely]] {
         ptr_t clone = builder_.make_interior_list(new_skip);
         n->template as_list<false>()->move_interior_to(clone->template as_list<false>());
@@ -3190,7 +3933,11 @@ typename TKTRIE_CLASS::ptr_t TKTRIE_CLASS::clone_interior_with_skip(ptr_t n, std
     }
     if (n->is_pop()) {
         ptr_t clone = builder_.make_interior_pop(new_skip);
-        n->as_pop()->move_children_to(clone->as_pop());
+        if constexpr (FIXED_LEN == 0) {
+            n->template as_pop<false>()->move_interior_to(clone->template as_pop<false>());
+        } else {
+            n->template as_pop<false>()->move_children_to(clone->template as_pop<false>());
+        }
         return clone;
     }
     ptr_t clone = builder_.make_interior_full(new_skip);
@@ -3204,13 +3951,14 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
     insert_result res;
     std::string_view old_skip = n->skip_str();
 
-    ptr_t new_int = builder_.make_interior_list(std::string(key));
+    // 1 child + EOS (FIXED_LEN==0) = 2 entries -> BINARY
+    ptr_t new_int = builder_.make_interior_binary(std::string(key));
     if constexpr (FIXED_LEN == 0) {
         new_int->set_eos(value);
     }
 
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
-    new_int->template as_list<false>()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
+    new_int->template as_binary<false>()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
 
     res.new_node = new_int;
     res.old_nodes.push_back(n);
@@ -3239,6 +3987,34 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     insert_result res;
     ptr_t child = create_leaf_for_key(remaining, value);
 
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        if (bn->count() < BINARY_MAX) {
+            bn->add_child(c, child);
+            res.in_place = true;
+            res.inserted = true;
+            return res;
+        }
+        // BINARY at capacity -> convert to LIST
+        ptr_t list = builder_.make_interior_list(n->skip_str());
+        auto* ln = list->template as_list<false>();
+        for (int i = 0; i < bn->count(); ++i) {
+            ln->add_child(bn->chars[i], bn->children[i].load());
+            bn->children[i].store(nullptr);
+        }
+        if constexpr (FIXED_LEN == 0) {
+            T eos_val;
+            if (bn->eos.try_read(eos_val)) {
+                ln->eos.set(eos_val);
+            }
+        }
+        ln->add_child(c, child);
+        res.new_node = list;
+        res.old_nodes.push_back(n);
+        res.inserted = true;
+        return res;
+    }
+
     if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->count() < LIST_MAX) {
@@ -3249,7 +4025,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         }
         // LIST at capacity -> convert to POP
         ptr_t pop = builder_.make_interior_pop(n->skip_str());
-        auto* pn = pop->as_pop();
+        auto* pn = pop->template as_pop<false>();
         // Copy children from list to pop
         for (int i = 0; i < ln->count(); ++i) {
             unsigned char ch = ln->chars.char_at(i);
@@ -3281,7 +4057,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     }
 
     if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         if (pn->count() < POP_MAX) {
             pn->add_child(c, child);
             res.in_place = true;
@@ -3305,10 +4081,11 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
         return res;
     }
 
-    ptr_t list = builder_.make_interior_list(n->skip_str());
-    list->template as_list<false>()->add_child(c, child);
+    // Shouldn't reach here for normal nodes, but handle gracefully
+    ptr_t binary = builder_.make_interior_binary(n->skip_str());
+    binary->template as_binary<false>()->add_child(c, child);
 
-    res.new_node = list;
+    res.new_node = binary;
     res.old_nodes.push_back(n);
     res.inserted = true;
     return res;
@@ -3320,10 +4097,9 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
 }  // namespace gteitelbaum
 
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_insert_probe.h
-// ============================================================================
-
+// =============================================================================
 
 // This file contains speculative insert probing for concurrent operations
 // It should only be included from tktrie_insert.h
@@ -4022,10 +4798,9 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 }  // namespace gteitelbaum
 
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_erase_probe.h
-// ============================================================================
-
+// =============================================================================
 
 // This file contains speculative erase probing and allocation
 // It should only be included from tktrie_insert_probe.h
@@ -4420,10 +5195,9 @@ bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint6
 }  // namespace gteitelbaum
 
 
-// ============================================================================
+// =============================================================================
 // FILE: tktrie_erase.h
-// ============================================================================
-
+// =============================================================================
 
 // This file contains erase implementation
 // It should only be included from tktrie_erase_probe.h
@@ -4572,25 +5346,124 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (key.size() != 1) return res;
     unsigned char c = static_cast<unsigned char>(key[0]);
 
-    if (leaf->is_list()) [[likely]] {
-        auto* ln = leaf->template as_list<true>();
-        if (!ln->has(c)) return res;
-
-        if (ln->count() == 1) {
+    // Handle BINARY leaf
+    if (leaf->is_binary()) {
+        auto* bn = leaf->template as_binary<true>();
+        if (!bn->has(c)) return res;
+        
+        if (bn->count() == 1) {
             res.erased = true;
             res.deleted_subtree = true;
             res.old_nodes.push_back(leaf);
             return res;
         }
+        
+        // Convert BINARY to SKIP when count goes from 2 to 1
+        int idx = bn->find(c);
+        unsigned char other_c = bn->chars[1 - idx];
+        T other_val;
+        bn->values[1 - idx].try_read(other_val);
+        
+        // Build new skip string: existing skip + other_c
+        std::string new_skip_str(leaf->skip_str());
+        new_skip_str.push_back(static_cast<char>(other_c));
+        
+        ptr_t new_skip = builder_.make_leaf_skip(new_skip_str, other_val);
+        
+        res.new_node = new_skip;
+        res.old_nodes.push_back(leaf);
+        res.erased = true;
+        return res;
+    }
 
+    // Handle LIST leaf
+    if (leaf->is_list()) [[likely]] {
+        auto* ln = leaf->template as_list<true>();
+        if (!ln->has(c)) return res;
+        
+        int count = ln->count();
+        if (count == 1) {
+            res.erased = true;
+            res.deleted_subtree = true;
+            res.old_nodes.push_back(leaf);
+            return res;
+        }
+        
+        // Downgrade LIST to BINARY when count goes from 3 to 2
+        if (count == 3) {
+            ptr_t bn = builder_.make_leaf_binary(leaf->skip_str());
+            auto* new_bn = bn->template as_binary<true>();
+            int src_idx = 0;
+            for (int i = 0; i < 7; ++i) {
+                unsigned char ch = ln->chars.char_at(i);
+                if (i >= count) break;
+                if (ch == c) continue;
+                T val;
+                ln->values[i].try_read(val);
+                new_bn->add_entry(ch, val);
+                ++src_idx;
+            }
+            res.new_node = bn;
+            res.old_nodes.push_back(leaf);
+            res.erased = true;
+            return res;
+        }
+        
         leaf->bump_version();
         ln->remove_value(c);
         res.erased = true;
         return res;
     }
 
+    // Handle POP leaf
+    if (leaf->is_pop()) {
+        auto* pn = leaf->template as_pop<true>();
+        if (!pn->has(c)) return res;
+        
+        int count = pn->count();
+        // Downgrade to LIST when count goes from 8 to 7
+        if (count == 8) {
+            ptr_t ln = builder_.make_leaf_list(leaf->skip_str());
+            auto* new_ln = ln->template as_list<true>();
+            pn->valid.for_each_set([&](unsigned char ch) {
+                if (ch == c) return;
+                T val;
+                pn->read_value(ch, val);
+                new_ln->add_value(ch, val);
+            });
+            res.new_node = ln;
+            res.old_nodes.push_back(leaf);
+            res.erased = true;
+            return res;
+        }
+        
+        leaf->bump_version();
+        pn->remove_value(c);
+        res.erased = true;
+        return res;
+    }
+
+    // Handle FULL leaf
     auto* fn = leaf->template as_full<true>();
     if (!fn->has(c)) return res;
+    
+    int count = fn->count();
+    // Downgrade to POP when count goes from 33 to 32
+    if (count == 33) {
+        ptr_t pn = builder_.make_leaf_pop(leaf->skip_str());
+        auto* new_pn = pn->template as_pop<true>();
+        fn->valid.for_each_set([&](unsigned char ch) {
+            if (ch == c) return;
+            T val;
+            fn->read_value(ch, val);
+            new_pn->add_value(ch, val);
+        });
+        res.new_node = pn;
+        res.old_nodes.push_back(leaf);
+        res.erased = true;
+        return res;
+    }
+    
     leaf->bump_version();
     fn->remove_value(c);
     res.erased = true;
@@ -4660,12 +5533,16 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
 
     unsigned char c = 0;
     ptr_t child = nullptr;
-    if (n->is_list()) {
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        c = bn->first_char();
+        child = bn->child_at_slot(0);
+    } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         c = ln->chars.char_at(0);
         child = ln->children[0].load();
     } else if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         c = pn->first_char();
         child = pn->child_at_slot(0);
     } else if (n->is_full()) {
@@ -4687,65 +5564,154 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 
     bool eos_exists = n->has_eos();
     int remaining = n->child_count();
+    int eos_count = eos_exists ? 1 : 0;
 
-    if (n->is_list()) {
+    // Count remaining children (excluding the one being removed)
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        if (bn->has(removed_c)) remaining--;
+    } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->has(removed_c)) remaining--;
     } else if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         if (pn->has(removed_c)) remaining--;
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         if (fn->has(removed_c)) remaining--;
     }
 
-    if ((!eos_exists) & (remaining == 0)) {
+    int total_remaining = remaining + eos_count;
+
+    // Delete if empty
+    if (total_remaining == 0) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
         return res;
     }
 
-    if (n->is_list()) {
+    // Actually remove the child and potentially downgrade
+    if (n->is_binary()) {
+        auto* bn = n->template as_binary<false>();
+        if (bn->has(removed_c)) {
+            n->bump_version();
+            bn->remove_child(bn->find(removed_c));
+        }
+    } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
         if (ln->has(removed_c)) {
+            // Downgrade LIST to BINARY when remaining + eos = 2
+            if (total_remaining == 2 && remaining > 0) {
+                ptr_t new_bn = builder_.make_interior_binary(n->skip_str());
+                auto* dest = new_bn->template as_binary<false>();
+                for (int i = 0; i < ln->count(); ++i) {
+                    unsigned char ch = ln->chars.char_at(i);
+                    if (ch == removed_c) continue;
+                    dest->add_child(ch, ln->children[i].load());
+                    ln->children[i].store(nullptr);
+                }
+                if constexpr (FIXED_LEN == 0) {
+                    if (eos_exists) {
+                        T val;
+                        n->try_read_eos(val);
+                        dest->eos.set(val);
+                    }
+                }
+                res.new_node = new_bn;
+                res.old_nodes.push_back(n);
+                
+                // Check if we can collapse the new BINARY node
+                if (dest->count() == 1 && !eos_exists) {
+                    unsigned char c = dest->first_char();
+                    ptr_t child = dest->child_at_slot(0);
+                    if (child && !builder_t::is_sentinel(child)) {
+                        auto collapse_res = collapse_single_child(new_bn, c, child, res);
+                        return collapse_res;
+                    }
+                }
+                return res;
+            }
             n->bump_version();
             ln->remove_child(removed_c);
         }
     } else if (n->is_pop()) {
-        auto* pn = n->as_pop();
+        auto* pn = n->template as_pop<false>();
         if (pn->has(removed_c)) {
+            // Downgrade POP to LIST when remaining + eos <= 7
+            if (total_remaining <= 7) {
+                ptr_t new_ln = builder_.make_interior_list(n->skip_str());
+                auto* dest = new_ln->template as_list<false>();
+                pn->valid.for_each_set([&](unsigned char ch) {
+                    if (ch == removed_c) return;
+                    int slot = pn->slot_for(ch);
+                    dest->add_child(ch, pn->children[slot].load());
+                    pn->children[slot].store(nullptr);
+                });
+                if constexpr (FIXED_LEN == 0) {
+                    if (eos_exists) {
+                        T val;
+                        n->try_read_eos(val);
+                        dest->eos.set(val);
+                    }
+                }
+                res.new_node = new_ln;
+                res.old_nodes.push_back(n);
+                return res;
+            }
             n->bump_version();
             pn->remove_child(removed_c);
         }
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
         if (fn->has(removed_c)) {
+            // Downgrade FULL to POP when remaining + eos <= 32
+            if (total_remaining <= POP_MAX) {
+                ptr_t new_pn = builder_.make_interior_pop(n->skip_str());
+                auto* dest = new_pn->template as_pop<false>();
+                fn->valid.for_each_set([&](unsigned char ch) {
+                    if (ch == removed_c) return;
+                    dest->add_child(ch, fn->children[ch].load());
+                    fn->children[ch].store(nullptr);
+                });
+                if constexpr (FIXED_LEN == 0) {
+                    if (eos_exists) {
+                        T val;
+                        n->try_read_eos(val);
+                        dest->eos.set(val);
+                    }
+                }
+                res.new_node = new_pn;
+                res.old_nodes.push_back(n);
+                return res;
+            }
             n->bump_version();
             fn->remove_child(removed_c);
         }
     }
 
+    // Check for collapse opportunity (1 child, no EOS)
     bool can_collapse = false;
     unsigned char c = 0;
     ptr_t child = nullptr;
 
-    if (n->is_list()) {
-        auto* ln = n->template as_list<false>();
-        if (ln->count() == 1 && !eos_exists) {
+    if (!eos_exists && remaining == 1) {
+        if (n->is_binary()) {
+            auto* bn = n->template as_binary<false>();
+            c = bn->first_char();
+            child = bn->child_at_slot(0);
+            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+        } else if (n->is_list()) {
+            auto* ln = n->template as_list<false>();
             c = ln->chars.char_at(0);
             child = ln->children[0].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        }
-    } else if (n->is_pop() && !eos_exists) {
-        auto* pn = n->as_pop();
-        if (pn->count() == 1) {
+        } else if (n->is_pop()) {
+            auto* pn = n->template as_pop<false>();
             c = pn->first_char();
             child = pn->child_at_slot(0);
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        }
-    } else if (n->is_full() && !eos_exists) {
-        auto* fn = n->template as_full<false>();
-        if (fn->count() == 1) {
+        } else if (n->is_full()) {
+            auto* fn = n->template as_full<false>();
             c = fn->valid.first();
             child = fn->children[c].load();
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
@@ -4771,20 +5737,43 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
             T val;
             child->as_skip()->value.try_read(val);
             merged = builder_.make_leaf_skip(new_skip, val);
+        } else if (child->is_binary()) {
+            merged = builder_.make_leaf_binary(new_skip);
+            child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
         } else if (child->is_list()) [[likely]] {
             merged = builder_.make_leaf_list(new_skip);
             child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
+        } else if (child->is_pop()) {
+            merged = builder_.make_leaf_pop(new_skip);
+            child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
         } else {
             merged = builder_.make_leaf_full(new_skip);
             child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
         }
     } else {
-        if (child->is_list()) [[likely]] {
+        if (child->is_binary()) {
+            merged = builder_.make_interior_binary(new_skip);
+            child->template as_binary<false>()->move_children_to(merged->template as_binary<false>());
+            if constexpr (FIXED_LEN == 0) {
+                if (child->has_eos()) {
+                    T val;
+                    child->try_read_eos(val);
+                    merged->set_eos(val);
+                }
+            }
+        } else if (child->is_list()) [[likely]] {
             merged = builder_.make_interior_list(new_skip);
             child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
         } else if (child->is_pop()) {
             merged = builder_.make_interior_pop(new_skip);
-            child->as_pop()->move_children_to(merged->as_pop());
+            child->template as_pop<false>()->move_children_to(merged->template as_pop<false>());
+            if constexpr (FIXED_LEN == 0) {
+                if (child->has_eos()) {
+                    T val;
+                    child->try_read_eos(val);
+                    merged->set_eos(val);
+                }
+            }
         } else {
             merged = builder_.make_interior_full(new_skip);
             child->template as_full<false>()->move_interior_to(merged->template as_full<false>());
@@ -4801,4 +5790,3 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
 #undef TKTRIE_CLASS
 
 }  // namespace gteitelbaum
-

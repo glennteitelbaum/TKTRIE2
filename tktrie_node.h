@@ -16,9 +16,10 @@ namespace gteitelbaum {
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_base;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct node_with_skip;
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct skip_node;
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> struct pop_node;  // 8-32 children, interior only
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct binary_node;  // 2 entries
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct list_node;    // 3-7 entries
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct pop_node;     // 8-32 entries
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF> struct full_node;    // 33+ entries
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN> class node_builder;
 
 // Forward declare retry sentinel getter
@@ -128,20 +129,26 @@ struct node_base {
     // Type queries
     bool is_leaf() const noexcept { return gteitelbaum::is_leaf(header()); }
     bool is_skip() const noexcept { return header() & FLAG_SKIP; }
+    bool is_binary() const noexcept { return header() & FLAG_BINARY; }
     bool is_list() const noexcept { return header() & FLAG_LIST; }
     bool is_pop() const noexcept { return header() & FLAG_POP; }
-    bool is_full() const noexcept { return !(header() & (FLAG_SKIP | FLAG_LIST | FLAG_POP)); }
+    bool is_full() const noexcept { return !(header() & TYPE_FLAGS_MASK); }
     
     // Downcasts
     skip_node<T, THREADED, Allocator, FIXED_LEN>* as_skip() noexcept {
         return static_cast<skip_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
+    binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_binary() noexcept {
+        return static_cast<binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    template <bool IS_LEAF>
     list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() noexcept {
         return static_cast<list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
-    pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() noexcept {
-        return static_cast<pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
+    template <bool IS_LEAF>
+    pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_pop() noexcept {
+        return static_cast<pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
     template <bool IS_LEAF>
     full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() noexcept {
@@ -152,11 +159,16 @@ struct node_base {
         return static_cast<const skip_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
     }
     template <bool IS_LEAF>
+    const binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_binary() const noexcept {
+        return static_cast<const binary_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
+    }
+    template <bool IS_LEAF>
     const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_list() const noexcept {
         return static_cast<const list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
-    const pop_node<T, THREADED, Allocator, FIXED_LEN>* as_pop() const noexcept {
-        return static_cast<const pop_node<T, THREADED, Allocator, FIXED_LEN>*>(this);
+    template <bool IS_LEAF>
+    const pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_pop() const noexcept {
+        return static_cast<const pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>*>(this);
     }
     template <bool IS_LEAF>
     const full_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>* as_full() const noexcept {
@@ -174,28 +186,35 @@ struct node_base {
     
     // Child access (interior nodes only)
     ptr_t get_child(unsigned char c) const noexcept {
+        if (is_binary()) {
+            return as_binary<false>()->get_child(c);
+        }
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child(c);
         }
         if (is_pop()) {
-            return as_pop()->get_child(c);
+            return as_pop<false>()->get_child(c);
         }
         return as_full<false>()->get_child(c);
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        if (is_binary()) {
+            return as_binary<false>()->get_child_slot(c);
+        }
         if (is_list()) [[likely]] {
             return as_list<false>()->get_child_slot(c);
         }
         if (is_pop()) {
-            return as_pop()->get_child_slot(c);
+            return as_pop<false>()->get_child_slot(c);
         }
         return as_full<false>()->get_child_slot(c);
     }
     
     int child_count() const noexcept {
+        if (is_binary()) return as_binary<false>()->count();
         if (is_list()) [[likely]] return as_list<false>()->count();
-        if (is_pop()) return as_pop()->count();
+        if (is_pop()) return as_pop<false>()->count();
         return as_full<false>()->count();
     }
     
@@ -204,7 +223,9 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             return false;
         } else {
+            if (is_binary()) return as_binary<false>()->eos.has_data();
             if (is_list()) [[likely]] return as_list<false>()->eos.has_data();
+            if (is_pop()) return as_pop<false>()->eos.has_data();
             return as_full<false>()->eos.has_data();
         }
     }
@@ -214,7 +235,9 @@ struct node_base {
             (void)out;
             return false;
         } else {
+            if (is_binary()) return as_binary<false>()->eos.try_read(out);
             if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
+            if (is_pop()) return as_pop<false>()->eos.try_read(out);
             return as_full<false>()->eos.try_read(out);
         }
     }
@@ -223,7 +246,9 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             (void)value;
         } else {
-            if (is_list()) [[likely]] as_list<false>()->eos.set(value);
+            if (is_binary()) as_binary<false>()->eos.set(value);
+            else if (is_list()) [[likely]] as_list<false>()->eos.set(value);
+            else if (is_pop()) as_pop<false>()->eos.set(value);
             else as_full<false>()->eos.set(value);
         }
     }
@@ -232,7 +257,9 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             // No EOS for fixed-length keys
         } else {
-            if (is_list()) [[likely]] as_list<false>()->eos.clear();
+            if (is_binary()) as_binary<false>()->eos.clear();
+            else if (is_list()) [[likely]] as_list<false>()->eos.clear();
+            else if (is_pop()) as_pop<false>()->eos.clear();
             else as_full<false>()->eos.clear();
         }
     }
@@ -266,6 +293,232 @@ struct skip_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     
     skip_node() = default;
     ~skip_node() = default;
+};
+
+// =============================================================================
+// BINARY_NODE - LEAF specialization (stores 2 values)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+struct binary_node<T, THREADED, Allocator, FIXED_LEN, true> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using data_t = typename base_t::data_t;
+    
+    static constexpr int MAX_ENTRIES = 2;
+    
+    unsigned char chars[2] = {};
+    int count_ = 0;
+    std::array<data_t, 2> values;
+    
+    binary_node() = default;
+    ~binary_node() = default;
+    
+    int count() const noexcept { return count_; }
+    bool has(unsigned char c) const noexcept { 
+        return (count_ > 0 && chars[0] == c) || (count_ > 1 && chars[1] == c); 
+    }
+    
+    int find(unsigned char c) const noexcept {
+        if (count_ > 0 && chars[0] == c) return 0;
+        if (count_ > 1 && chars[1] == c) return 1;
+        return -1;
+    }
+    
+    void add_entry(unsigned char c, const T& value) {
+        chars[count_] = c;
+        values[count_].set(value);
+        ++count_;
+    }
+    
+    void remove_entry(int idx) {
+        if (idx == 0 && count_ == 2) {
+            chars[0] = chars[1];
+            values[0] = std::move(values[1]);
+        }
+        --count_;
+    }
+    
+    void copy_values_to(binary_node* dest) const {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->values[i].deep_copy_from(values[i]);
+        }
+    }
+};
+
+// =============================================================================
+// BINARY_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+    requires (FIXED_LEN > 0)
+struct binary_node<T, THREADED, Allocator, FIXED_LEN, false> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    
+    static constexpr int MAX_CHILDREN = 2;
+    
+    unsigned char chars[2] = {};
+    int count_ = 0;
+    std::array<atomic_ptr, 2> children;
+    
+    binary_node() = default;
+    ~binary_node() = default;
+    
+    int count() const noexcept { return count_; }
+    bool has(unsigned char c) const noexcept { 
+        return (count_ > 0 && chars[0] == c) || (count_ > 1 && chars[1] == c); 
+    }
+    
+    int find(unsigned char c) const noexcept {
+        if (count_ > 0 && chars[0] == c) return 0;
+        if (count_ > 1 && chars[1] == c) return 1;
+        return -1;
+    }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        int idx = find(c);
+        return idx >= 0 ? children[idx].load() : nullptr;
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        int idx = find(c);
+        return idx >= 0 ? &children[idx] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
+        chars[count_] = c;
+        children[count_].store(child);
+        ++count_;
+    }
+    
+    void remove_child(int idx) {
+        if (idx == 0 && count_ == 2) {
+            chars[0] = chars[1];
+            children[0].store(children[1].load());
+        }
+        children[count_ - 1].store(nullptr);
+        --count_;
+    }
+    
+    unsigned char first_char() const noexcept { return chars[0]; }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+    
+    void move_children_to(binary_node* dest) {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+        count_ = 0;
+    }
+    
+    void copy_children_to(binary_node* dest) const {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+        }
+    }
+};
+
+// =============================================================================
+// BINARY_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// Entry count = child_count + (has_eos ? 1 : 0), supports 1-2 entries
+// Examples: 1 child + EOS = 2, 2 children = 2, 1 child alone = 1
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator>
+struct binary_node<T, THREADED, Allocator, 0, false> 
+    : node_with_skip<T, THREADED, Allocator, 0> {
+    using base_t = node_with_skip<T, THREADED, Allocator, 0>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    using eos_data_t = typename base_t::eos_data_t;
+    
+    static constexpr int MAX_CHILDREN = 2;
+    
+    eos_data_t eos;
+    unsigned char chars[2] = {};
+    int count_ = 0;  // child count (0-2), entry count = count_ + eos.has_data()
+    std::array<atomic_ptr, 2> children;
+    
+    binary_node() = default;
+    ~binary_node() = default;
+    
+    int count() const noexcept { return count_; }  // child count
+    int entry_count() const noexcept { return count_ + (eos.has_data() ? 1 : 0); }
+    
+    bool has(unsigned char c) const noexcept { 
+        return (count_ > 0 && chars[0] == c) || (count_ > 1 && chars[1] == c); 
+    }
+    
+    int find(unsigned char c) const noexcept {
+        if (count_ > 0 && chars[0] == c) return 0;
+        if (count_ > 1 && chars[1] == c) return 1;
+        return -1;
+    }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        int idx = find(c);
+        return idx >= 0 ? children[idx].load() : nullptr;
+    }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        int idx = find(c);
+        return idx >= 0 ? &children[idx] : nullptr;
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
+        chars[count_] = c;
+        children[count_].store(child);
+        ++count_;
+    }
+    
+    void remove_child(int idx) {
+        if (idx == 0 && count_ == 2) {
+            chars[0] = chars[1];
+            children[0].store(children[1].load());
+        }
+        children[count_ - 1].store(nullptr);
+        --count_;
+    }
+    
+    unsigned char first_char() const noexcept { return chars[0]; }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+    
+    void move_children_to(binary_node* dest) {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+        count_ = 0;
+    }
+    
+    void copy_children_to(binary_node* dest) const {
+        dest->count_ = count_;
+        for (int i = 0; i < count_; ++i) {
+            dest->chars[i] = chars[i];
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
+    void move_interior_to(binary_node* dest) {
+        dest->eos = std::move(eos);
+        move_children_to(dest);
+    }
+    
+    void copy_interior_to(binary_node* dest) const {
+        dest->eos.deep_copy_from(eos);
+        copy_children_to(dest);
+    }
 };
 
 // =============================================================================
@@ -517,13 +770,90 @@ struct list_node<T, THREADED, Allocator, 0, false>
 };
 
 // =============================================================================
-// POP_NODE - Interior node with 8-32 children using popcount indexing
-// Uses bitmap256 for presence tracking, compact children array indexed by popcount
-// Size: header(8) + skip(8) + bitmap(32) + 32*ptr(256) = 304 bytes (vs 2096 for full)
+// POP_NODE - LEAF specialization (8-32 values using popcount indexing)
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+struct pop_node<T, THREADED, Allocator, FIXED_LEN, true> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
+    using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
+    using data_t = typename base_t::data_t;
+    
+    static constexpr int MAX_ENTRIES = POP_MAX;  // 32
+    
+    bitmap256 valid;
+    std::array<data_t, MAX_ENTRIES> values;
+    
+    pop_node() = default;
+    ~pop_node() = default;
+    
+    // Get slot index for character c using popcount
+    int slot_for(unsigned char c) const noexcept {
+        int word = c >> 6;
+        int bit = c & 63;
+        int slot = 0;
+        for (int w = 0; w < word; ++w) {
+            slot += std::popcount(valid.word(w));
+        }
+        uint64_t mask = (1ULL << bit) - 1;
+        slot += std::popcount(valid.word(word) & mask);
+        return slot;
+    }
+    
+    int count() const noexcept { return valid.count(); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
+    
+    int find(unsigned char c) const noexcept {
+        return valid.test(c) ? slot_for(c) : -1;
+    }
+    
+    bool read_value(unsigned char c, T& out) const noexcept {
+        if (!valid.test(c)) return false;
+        return values[slot_for(c)].try_read(out);
+    }
+    
+    void add_value(unsigned char c, const T& val) {
+        int slot = slot_for(c);
+        int cnt = count();
+        // Shift values up to make room
+        for (int i = cnt; i > slot; --i) {
+            values[i] = std::move(values[i-1]);
+        }
+        values[slot].set(val);
+        valid.set(c);
+    }
+    
+    void remove_value(unsigned char c) {
+        int slot = slot_for(c);
+        valid.clear(c);
+        int new_count = count();
+        // Shift values down
+        for (int i = slot; i < new_count; ++i) {
+            values[i] = std::move(values[i+1]);
+        }
+        values[new_count].clear();
+    }
+    
+    void copy_values_to(pop_node* dest) const {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->values[i].deep_copy_from(values[i]);
+        }
+    }
+    
+    unsigned char first_char() const noexcept { return valid.first(); }
+};
+
+// =============================================================================
+// POP_NODE - INTERIOR specialization, FIXED_LEN > 0 (no eos)
+// 8-32 children using popcount indexing
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
+    requires (FIXED_LEN > 0)
+struct pop_node<T, THREADED, Allocator, FIXED_LEN, false> 
+    : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
     using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
@@ -538,21 +868,17 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
     
     // Get slot index for character c using popcount
     int slot_for(unsigned char c) const noexcept {
-        // Count bits set before position c
         int word = c >> 6;
         int bit = c & 63;
         int slot = 0;
-        // Sum popcounts of all words before this one
         for (int w = 0; w < word; ++w) {
             slot += std::popcount(valid.word(w));
         }
-        // Add popcount of bits before position in current word
         uint64_t mask = (1ULL << bit) - 1;
         slot += std::popcount(valid.word(word) & mask);
         return slot;
     }
     
-    // Unified interface
     int count() const noexcept { return valid.count(); }
     bool has(unsigned char c) const noexcept { return valid.test(c); }
     
@@ -566,30 +892,26 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         return &children[slot_for(c)];
     }
     
-    // Add child - caller must ensure count() < MAX_CHILDREN and !has(c)
     void add_child(unsigned char c, ptr_t child) {
         int slot = slot_for(c);
-        // Shift children up to make room
-        for (int i = count(); i > slot; --i) {
+        int cnt = count();
+        for (int i = cnt; i > slot; --i) {
             children[i].store(children[i-1].load());
         }
         children[slot].store(child);
         valid.set(c);
     }
     
-    // Remove child - caller must ensure has(c)
     void remove_child(unsigned char c) {
         int slot = slot_for(c);
         valid.clear(c);
         int new_count = count();
-        // Shift children down
         for (int i = slot; i < new_count; ++i) {
             children[i].store(children[i+1].load());
         }
         children[new_count].store(nullptr);
     }
     
-    // Move all children to a full_node
     void move_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) {
         int idx = 0;
         valid.for_each_set([&](unsigned char c) {
@@ -600,7 +922,6 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         });
     }
     
-    // Copy all children to a full_node
     void copy_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const {
         int idx = 0;
         valid.for_each_set([&](unsigned char c) {
@@ -610,7 +931,6 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         });
     }
     
-    // Move all children to another pop_node
     void move_children_to(pop_node* dest) {
         dest->valid = valid;
         int cnt = count();
@@ -620,15 +940,128 @@ struct pop_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
         }
     }
     
-    // Get first child character
-    unsigned char first_char() const noexcept {
-        return valid.first();
+    unsigned char first_char() const noexcept { return valid.first(); }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
+};
+
+// =============================================================================
+// POP_NODE - INTERIOR specialization, FIXED_LEN == 0 (has eos)
+// Entry count = child_count + (has_eos ? 1 : 0), supports 8-32 entries
+// =============================================================================
+
+template <typename T, bool THREADED, typename Allocator>
+struct pop_node<T, THREADED, Allocator, 0, false> 
+    : node_with_skip<T, THREADED, Allocator, 0> {
+    using base_t = node_with_skip<T, THREADED, Allocator, 0>;
+    using ptr_t = typename base_t::ptr_t;
+    using atomic_ptr = typename base_t::atomic_ptr;
+    using eos_data_t = typename base_t::eos_data_t;
+    
+    static constexpr int MAX_CHILDREN = POP_MAX;  // 32
+    
+    eos_data_t eos;
+    bitmap256 valid;
+    std::array<atomic_ptr, MAX_CHILDREN> children;
+    
+    pop_node() = default;
+    ~pop_node() = default;
+    
+    int slot_for(unsigned char c) const noexcept {
+        int word = c >> 6;
+        int bit = c & 63;
+        int slot = 0;
+        for (int w = 0; w < word; ++w) {
+            slot += std::popcount(valid.word(w));
+        }
+        uint64_t mask = (1ULL << bit) - 1;
+        slot += std::popcount(valid.word(word) & mask);
+        return slot;
     }
     
-    // Get child at slot index (for iteration)
-    ptr_t child_at_slot(int slot) const noexcept {
-        return children[slot].load();
+    int count() const noexcept { return valid.count(); }  // child count
+    int entry_count() const noexcept { return count() + (eos.has_data() ? 1 : 0); }
+    bool has(unsigned char c) const noexcept { return valid.test(c); }
+    
+    ptr_t get_child(unsigned char c) const noexcept {
+        if (!valid.test(c)) return nullptr;
+        return children[slot_for(c)].load();
     }
+    
+    atomic_ptr* get_child_slot(unsigned char c) noexcept {
+        if (!valid.test(c)) return nullptr;
+        return &children[slot_for(c)];
+    }
+    
+    void add_child(unsigned char c, ptr_t child) {
+        int slot = slot_for(c);
+        int cnt = count();
+        for (int i = cnt; i > slot; --i) {
+            children[i].store(children[i-1].load());
+        }
+        children[slot].store(child);
+        valid.set(c);
+    }
+    
+    void remove_child(unsigned char c) {
+        int slot = slot_for(c);
+        valid.clear(c);
+        int new_count = count();
+        for (int i = slot; i < new_count; ++i) {
+            children[i].store(children[i+1].load());
+        }
+        children[new_count].store(nullptr);
+    }
+    
+    void move_children_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            children[idx].store(nullptr);
+            ++idx;
+        });
+    }
+    
+    void copy_children_to_full(full_node<T, THREADED, Allocator, 0, false>* dest) const {
+        int idx = 0;
+        valid.for_each_set([&](unsigned char c) {
+            dest->valid.set(c);
+            dest->children[c].store(children[idx].load());
+            ++idx;
+        });
+    }
+    
+    void move_interior_to(pop_node* dest) {
+        dest->eos = std::move(eos);
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    void copy_interior_to(pop_node* dest) const {
+        dest->eos.deep_copy_from(eos);
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+        }
+    }
+    
+    // Alias for code that doesn't need to move eos
+    void move_children_to(pop_node* dest) {
+        dest->valid = valid;
+        int cnt = count();
+        for (int i = 0; i < cnt; ++i) {
+            dest->children[i].store(children[i].load());
+            children[i].store(nullptr);
+        }
+    }
+    
+    unsigned char first_char() const noexcept { return valid.first(); }
+    ptr_t child_at_slot(int slot) const noexcept { return children[slot].load(); }
 };
 
 // =============================================================================
@@ -901,9 +1334,12 @@ public:
     using base_t = node_base<T, THREADED, Allocator, FIXED_LEN>;
     using ptr_t = base_t*;
     using skip_t = skip_node<T, THREADED, Allocator, FIXED_LEN>;
+    using leaf_binary_t = binary_node<T, THREADED, Allocator, FIXED_LEN, true>;
+    using interior_binary_t = binary_node<T, THREADED, Allocator, FIXED_LEN, false>;
     using leaf_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_list_t = list_node<T, THREADED, Allocator, FIXED_LEN, false>;
-    using pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN>;
+    using leaf_pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN, true>;
+    using interior_pop_t = pop_node<T, THREADED, Allocator, FIXED_LEN, false>;
     using leaf_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, true>;
     using interior_full_t = full_node<T, THREADED, Allocator, FIXED_LEN, false>;
     
@@ -925,11 +1361,15 @@ public:
         if (!n || is_sentinel(n)) return;
         if (n->is_skip()) {
             delete n->as_skip();
+        } else if (n->is_binary()) {
+            if (n->is_leaf()) delete n->template as_binary<true>();
+            else delete n->template as_binary<false>();
         } else if (n->is_list()) [[likely]] {
             if (n->is_leaf()) delete n->template as_list<true>();
             else delete n->template as_list<false>();
         } else if (n->is_pop()) {
-            delete n->as_pop();
+            if (n->is_leaf()) delete n->template as_pop<true>();
+            else delete n->template as_pop<false>();
         } else {
             if (n->is_leaf()) delete n->template as_full<true>();
             else delete n->template as_full<false>();
@@ -944,6 +1384,13 @@ public:
         return n;
     }
     
+    ptr_t make_leaf_binary(std::string_view sk) {
+        auto* n = new leaf_binary_t();
+        n->set_header(make_header(true, FLAG_BINARY));
+        n->skip.assign(sk);
+        return n;
+    }
+    
     ptr_t make_leaf_list(std::string_view sk) {
         auto* n = new leaf_list_t();
         n->set_header(make_header(true, FLAG_LIST));
@@ -951,9 +1398,23 @@ public:
         return n;
     }
     
+    ptr_t make_leaf_pop(std::string_view sk) {
+        auto* n = new leaf_pop_t();
+        n->set_header(make_header(true, FLAG_POP));
+        n->skip.assign(sk);
+        return n;
+    }
+    
     ptr_t make_leaf_full(std::string_view sk) {
         auto* n = new leaf_full_t();
         n->set_header(make_header(true, 0));
+        n->skip.assign(sk);
+        return n;
+    }
+    
+    ptr_t make_interior_binary(std::string_view sk) {
+        auto* n = new interior_binary_t();
+        n->set_header(make_header(false, FLAG_BINARY));
         n->skip.assign(sk);
         return n;
     }
@@ -966,7 +1427,7 @@ public:
     }
     
     ptr_t make_interior_pop(std::string_view sk) {
-        auto* n = new pop_t();
+        auto* n = new interior_pop_t();
         n->set_header(make_header(false, FLAG_POP));
         n->skip.assign(sk);
         return n;
@@ -989,14 +1450,20 @@ public:
         }
         
         if (!n->is_leaf()) {
-            if (n->is_list()) [[likely]] {
+            if (n->is_binary()) {
+                auto* bn = n->template as_binary<false>();
+                int cnt = bn->count();
+                for (int i = 0; i < cnt; ++i) {
+                    dealloc_node(bn->children[i].load());
+                }
+            } else if (n->is_list()) [[likely]] {
                 auto* ln = n->template as_list<false>();
                 int cnt = ln->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(ln->children[i].load());
                 }
             } else if (n->is_pop()) {
-                auto* pn = n->as_pop();
+                auto* pn = n->template as_pop<false>();
                 int cnt = pn->count();
                 for (int i = 0; i < cnt; ++i) {
                     dealloc_node(pn->children[i].load());
@@ -1023,9 +1490,25 @@ public:
                 d->value.deep_copy_from(s->value);
                 return d;
             }
+            if (src->is_binary()) {
+                auto* s = src->template as_binary<true>();
+                auto* d = new leaf_binary_t();
+                d->set_header(s->header());
+                d->skip = s->skip;
+                s->copy_values_to(d);
+                return d;
+            }
             if (src->is_list()) [[likely]] {
                 auto* s = src->template as_list<true>();
                 auto* d = new leaf_list_t();
+                d->set_header(s->header());
+                d->skip = s->skip;
+                s->copy_values_to(d);
+                return d;
+            }
+            if (src->is_pop()) {
+                auto* s = src->template as_pop<true>();
+                auto* d = new leaf_pop_t();
                 d->set_header(s->header());
                 d->skip = s->skip;
                 s->copy_values_to(d);
@@ -1040,6 +1523,20 @@ public:
         }
         
         // Interior
+        if (src->is_binary()) {
+            auto* s = src->template as_binary<false>();
+            auto* d = new interior_binary_t();
+            d->set_header(s->header());
+            d->skip = s->skip;
+            if constexpr (FIXED_LEN == 0) {
+                d->eos.deep_copy_from(s->eos);
+            }
+            s->copy_children_to(d);
+            for (int i = 0; i < d->count_; ++i) {
+                d->children[i].store(deep_copy(d->children[i].load()));
+            }
+            return d;
+        }
         if (src->is_list()) [[likely]] {
             auto* s = src->template as_list<false>();
             auto* d = new interior_list_t();
@@ -1056,11 +1553,14 @@ public:
             return d;
         }
         if (src->is_pop()) {
-            auto* s = src->as_pop();
-            auto* d = new pop_t();
+            auto* s = src->template as_pop<false>();
+            auto* d = new interior_pop_t();
             d->set_header(s->header());
             d->skip = s->skip;
             d->valid = s->valid;
+            if constexpr (FIXED_LEN == 0) {
+                d->eos.deep_copy_from(s->eos);
+            }
             int cnt = s->count();
             for (int i = 0; i < cnt; ++i) {
                 d->children[i].store(deep_copy(s->children[i].load()));
