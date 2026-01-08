@@ -567,7 +567,9 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
         reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
-            read_path path;
+            // Fast path: epoch validation (same as contains())
+            // Safe because: no in-place value modification, epoch bumped before any write
+            uint64_t epoch_before = epoch_.load(std::memory_order_acquire);
             
             ptr_t root = root_.load();
             if (!root) {
@@ -576,13 +578,17 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             }
             if (root->is_poisoned()) continue;
             
-            bool found = read_impl_optimistic<true>(root, kbv, value, path);
-            if (validate_read_path(path)) {
+            bool found = read_impl<true>(root, kbv, value);
+            
+            uint64_t epoch_after = epoch_.load(std::memory_order_acquire);
+            if (epoch_before == epoch_after) {
                 reader_exit();
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
+            // Epoch changed - concurrent write, retry
         }
+        // Fallback after too many retries
         bool found = read_impl<true>(root_.load(), kbv, value);
         reader_exit();
         if (found) return iterator(this, kbv, value);
