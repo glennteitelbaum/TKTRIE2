@@ -142,122 +142,135 @@ TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexcept
     requires NEED_VALUE {
-    if constexpr (THREADED) {
-        if (!n || n->is_poisoned()) return false;
-    } else {
-        if (!n) return false;
-    }
+    if (!n) return false;
     
     // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
+        uint64_t h = n->header();  // Single atomic load per node
+        
+        if constexpr (THREADED) {
+            if (h & FLAG_POISON) return false;
+        }
+        
         // Skip string optimization: only load skip_str if skip is non-empty
-        if (n->skip_used()) {
+        if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (n->is_leaf()) break;
-        
-        // Interior node: check EOS or descend
-        if (key.empty()) {
-            return n->try_read_eos(out);
-        }
-        
-        unsigned char c = static_cast<unsigned char>(key[0]);
-        key.remove_prefix(1);
-        n = n->get_child(c);
-        
-        if constexpr (THREADED) {
-            if (!n || n->is_poisoned()) return false;
-        } else {
+        if (!(h & FLAG_LEAF)) {
+            // Interior node: check EOS or descend
+            if (key.empty()) {
+                if constexpr (FIXED_LEN > 0) {
+                    return false;
+                } else {
+                    if (!(h & FLAG_HAS_EOS)) return false;
+                    // Dispatch to read EOS value
+                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos.try_read(out);
+                    if (h & FLAG_LIST) return n->template as_list<false>()->eos.try_read(out);
+                    if (h & FLAG_POP) return n->template as_pop<false>()->eos.try_read(out);
+                    return n->template as_full<false>()->eos.try_read(out);
+                }
+            }
+            
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            key.remove_prefix(1);
+            n = n->get_child(c);
+            
             if (!n) return false;
+            continue;
         }
+        
+        // Leaf node: dispatch based on type
+        if (h & FLAG_SKIP) {
+            if (!key.empty()) return false;
+            return n->as_skip()->value.try_read(out);
+        }
+        
+        // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
+        if (key.size() != 1) return false;
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        
+        if (h & FLAG_BINARY) {
+            auto* bn = n->template as_binary<true>();
+            int idx = bn->find(c);
+            if (idx < 0) return false;
+            return bn->values[idx].try_read(out);
+        }
+        if (h & FLAG_LIST) {
+            auto* ln = n->template as_list<true>();
+            int idx = ln->find(c);
+            if (idx < 0) return false;
+            return ln->read_value(idx, out);
+        }
+        if (h & FLAG_POP) {
+            auto* pn = n->template as_pop<true>();
+            return pn->read_value(c, out);
+        }
+        // Default: FULL
+        auto* fn = n->template as_full<true>();
+        if (!fn->has(c)) return false;
+        return fn->read_value(c, out);
     }
-    
-    // Leaf node: skip already consumed, poison already checked
-    if (n->is_skip()) {
-        if (!key.empty()) return false;
-        return n->as_skip()->value.try_read(out);
-    }
-    
-    // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
-    if (key.size() != 1) return false;
-    unsigned char c = static_cast<unsigned char>(key[0]);
-    
-    if (n->is_binary()) {
-        auto* bn = n->template as_binary<true>();
-        int idx = bn->find(c);
-        if (idx < 0) return false;
-        return bn->values[idx].try_read(out);
-    }
-    if (n->is_list()) [[likely]] {
-        auto* ln = n->template as_list<true>();
-        int idx = ln->find(c);
-        if (idx < 0) return false;
-        return ln->read_value(idx, out);
-    }
-    if (n->is_pop()) {
-        auto* pn = n->template as_pop<true>();
-        return pn->read_value(c, out);
-    }
-    auto* fn = n->template as_full<true>();
-    if (!fn->has(c)) return false;
-    return fn->read_value(c, out);
 }
 
 TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcept
     requires (!NEED_VALUE) {
-    if constexpr (THREADED) {
-        if (!n || n->is_poisoned()) return false;
-    } else {
-        if (!n) return false;
-    }
+    if (!n) return false;
     
     // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
+        uint64_t h = n->header();  // Single atomic load per node
+        
+        if constexpr (THREADED) {
+            if (h & FLAG_POISON) return false;
+        }
+        
         // Skip string optimization: only load skip_str if skip is non-empty
-        if (n->skip_used()) {
+        if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (n->is_leaf()) break;
-        
-        // Interior node: check EOS or descend
-        if (key.empty()) {
-            return n->has_eos();
-        }
-        
-        unsigned char c = static_cast<unsigned char>(key[0]);
-        key.remove_prefix(1);
-        n = n->get_child(c);
-        
-        if constexpr (THREADED) {
-            if (!n || n->is_poisoned()) return false;
-        } else {
+        if (!(h & FLAG_LEAF)) {
+            // Interior node: check EOS or descend
+            if (key.empty()) {
+                if constexpr (FIXED_LEN > 0) {
+                    return false;
+                } else {
+                    return (h & FLAG_HAS_EOS) != 0;
+                }
+            }
+            
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            key.remove_prefix(1);
+            n = n->get_child(c);
+            
             if (!n) return false;
+            continue;
         }
+        
+        // Leaf node: dispatch based on type
+        if (h & FLAG_SKIP) {
+            return key.empty();
+        }
+        
+        // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
+        if (key.size() != 1) return false;
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        
+        if (h & FLAG_BINARY) {
+            return n->template as_binary<true>()->has(c);
+        }
+        if (h & FLAG_LIST) {
+            return n->template as_list<true>()->has(c);
+        }
+        if (h & FLAG_POP) {
+            return n->template as_pop<true>()->has(c);
+        }
+        // Default: FULL
+        return n->template as_full<true>()->has(c);
     }
-    
-    // Leaf node: skip already consumed, poison already checked
-    if (n->is_skip()) {
-        return key.empty();
-    }
-    
-    // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
-    if (key.size() != 1) return false;
-    unsigned char c = static_cast<unsigned char>(key[0]);
-    
-    if (n->is_binary()) {
-        return n->template as_binary<true>()->has(c);
-    }
-    if (n->is_list()) [[likely]] {
-        return n->template as_list<true>()->has(c);
-    }
-    if (n->is_pop()) {
-        return n->template as_pop<true>()->has(c);
-    }
-    return n->template as_full<true>()->has(c);
 }
 
 TKTRIE_TEMPLATE
@@ -265,59 +278,74 @@ template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T& out, read_path& path) const noexcept
     requires NEED_VALUE {
     if (!n) return false;
-    if (!path.push_checked(n)) return false;  // Single header load for poison + version
     
     // Unified loop: consume skip for every node
     while (true) {
-        // Skip string optimization: only load skip_str if skip is non-empty
-        if (n->skip_used()) {
+        uint64_t h = n->header();  // Single atomic load per node
+        
+        if (h & FLAG_POISON) return false;
+        
+        // Record for validation
+        if (path.len >= read_path::MAX_DEPTH) return false;
+        path.nodes[path.len] = n;
+        path.versions[path.len] = h & VERSION_MASK;
+        ++path.len;
+        
+        // Skip string optimization
+        if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (n->is_leaf()) break;
-        
-        // Interior node: check EOS or descend
-        if (key.empty()) {
-            return n->try_read_eos(out);
+        if (!(h & FLAG_LEAF)) {
+            // Interior node: check EOS or descend
+            if (key.empty()) {
+                if constexpr (FIXED_LEN > 0) {
+                    return false;
+                } else {
+                    if (!(h & FLAG_HAS_EOS)) return false;
+                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos.try_read(out);
+                    if (h & FLAG_LIST) return n->template as_list<false>()->eos.try_read(out);
+                    if (h & FLAG_POP) return n->template as_pop<false>()->eos.try_read(out);
+                    return n->template as_full<false>()->eos.try_read(out);
+                }
+            }
+            
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            key.remove_prefix(1);
+            n = n->get_child(c);
+            
+            if (!n) return false;
+            continue;
         }
         
-        unsigned char c = static_cast<unsigned char>(key[0]);
-        key.remove_prefix(1);
-        n = n->get_child(c);
+        // Leaf node
+        if (h & FLAG_SKIP) {
+            if (!key.empty()) return false;
+            return n->as_skip()->value.try_read(out);
+        }
         
-        if (!n) return false;
-        if (!path.push_checked(n)) return false;  // Single header load
+        if (key.size() != 1) return false;
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        
+        if (h & FLAG_BINARY) {
+            auto* bn = n->template as_binary<true>();
+            int idx = bn->find(c);
+            if (idx < 0) return false;
+            return bn->values[idx].try_read(out);
+        }
+        if (h & FLAG_LIST) {
+            auto* ln = n->template as_list<true>();
+            int idx = ln->find(c);
+            if (idx < 0) return false;
+            return ln->read_value(idx, out);
+        }
+        if (h & FLAG_POP) {
+            return n->template as_pop<true>()->read_value(c, out);
+        }
+        auto* fn = n->template as_full<true>();
+        if (!fn->has(c)) return false;
+        return fn->read_value(c, out);
     }
-    
-    // Leaf node: skip already consumed, poison already checked in push_checked
-    if (n->is_skip()) {
-        if (!key.empty()) return false;
-        return n->as_skip()->value.try_read(out);
-    }
-    
-    // BINARY, LIST, POP, or FULL leaf
-    if (key.size() != 1) return false;
-    unsigned char c = static_cast<unsigned char>(key[0]);
-    
-    if (n->is_binary()) {
-        auto* bn = n->template as_binary<true>();
-        int idx = bn->find(c);
-        if (idx < 0) return false;
-        return bn->values[idx].try_read(out);
-    }
-    if (n->is_list()) [[likely]] {
-        auto* ln = n->template as_list<true>();
-        int idx = ln->find(c);
-        if (idx < 0) return false;
-        return ln->read_value(idx, out);
-    }
-    if (n->is_pop()) {
-        auto* pn = n->template as_pop<true>();
-        return pn->read_value(c, out);
-    }
-    auto* fn = n->template as_full<true>();
-    if (!fn->has(c)) return false;
-    return fn->read_value(c, out);
 }
 
 TKTRIE_TEMPLATE
@@ -325,49 +353,55 @@ template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, read_path& path) const noexcept
     requires (!NEED_VALUE) {
     if (!n) return false;
-    if (!path.push_checked(n)) return false;  // Single header load for poison + version
     
     // Unified loop: consume skip for every node
     while (true) {
-        // Skip string optimization: only load skip_str if skip is non-empty
-        if (n->skip_used()) {
+        uint64_t h = n->header();  // Single atomic load per node
+        
+        if (h & FLAG_POISON) return false;
+        
+        // Record for validation
+        if (path.len >= read_path::MAX_DEPTH) return false;
+        path.nodes[path.len] = n;
+        path.versions[path.len] = h & VERSION_MASK;
+        ++path.len;
+        
+        // Skip string optimization
+        if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (n->is_leaf()) break;
-        
-        // Interior node: check EOS or descend
-        if (key.empty()) {
-            return n->has_eos();
+        if (!(h & FLAG_LEAF)) {
+            // Interior node: check EOS or descend
+            if (key.empty()) {
+                if constexpr (FIXED_LEN > 0) {
+                    return false;
+                } else {
+                    return (h & FLAG_HAS_EOS) != 0;
+                }
+            }
+            
+            unsigned char c = static_cast<unsigned char>(key[0]);
+            key.remove_prefix(1);
+            n = n->get_child(c);
+            
+            if (!n) return false;
+            continue;
         }
         
-        unsigned char c = static_cast<unsigned char>(key[0]);
-        key.remove_prefix(1);
-        n = n->get_child(c);
+        // Leaf node
+        if (h & FLAG_SKIP) {
+            return key.empty();
+        }
         
-        if (!n) return false;
-        if (!path.push_checked(n)) return false;  // Single header load
+        if (key.size() != 1) return false;
+        unsigned char c = static_cast<unsigned char>(key[0]);
+        
+        if (h & FLAG_BINARY) return n->template as_binary<true>()->has(c);
+        if (h & FLAG_LIST) return n->template as_list<true>()->has(c);
+        if (h & FLAG_POP) return n->template as_pop<true>()->has(c);
+        return n->template as_full<true>()->has(c);
     }
-    
-    // Leaf node: skip already consumed, poison already checked in push_checked
-    if (n->is_skip()) {
-        return key.empty();
-    }
-    
-    // BINARY, LIST, POP, or FULL leaf
-    if (key.size() != 1) return false;
-    unsigned char c = static_cast<unsigned char>(key[0]);
-    
-    if (n->is_binary()) {
-        return n->template as_binary<true>()->has(c);
-    }
-    if (n->is_list()) [[likely]] {
-        return n->template as_list<true>()->has(c);
-    }
-    if (n->is_pop()) {
-        return n->template as_pop<true>()->has(c);
-    }
-    return n->template as_full<true>()->has(c);
 }
 
 TKTRIE_TEMPLATE
