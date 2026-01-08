@@ -84,7 +84,7 @@ TKTRIE uses three node types optimized for different branching factors:
 ```cpp
 // LIST node: children packed in single atomic uint64
 // Layout: [count:8][char6:8][char5:8]...[char0:8]
-small_list<THREADED> chars;  // Which characters have children
+small_list chars;            // Which characters have children
 std::array<ptr, 7> children; // The child pointers
 
 // FULL node: direct indexing by character
@@ -121,9 +121,9 @@ TKTRIE natively supports integer keys via big-endian encoding:
 ### Resulting Tree Depth
 
 For 100K random uint64 keys:
-- **Max depth**: 4 levels
-- **Average depth**: 2.79 levels
-- **Average skip length**: 4.01 bytes
+- **Max depth**: ~4 levels
+- **Average depth**: ~3 levels
+- **Average skip length**: ~4 bytes
 
 This is dramatically shallower than a standard trie (which would be 8 levels for 8-byte keys).
 
@@ -151,14 +151,20 @@ In concurrent programming, a reader might:
 We use a **self-referential sentinel node** that is safe to dereference:
 
 ```cpp
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
-    bitmap256 valid{};                       // All bits can be set
-    std::array<void*, 256> dummy_children{}; // All point to self
-    
-    constexpr retry_storage() noexcept 
-        : node_with_skip<...>(RETRY_SENTINEL_HEADER) {}  // FLAG_POISON set
-};
+template <typename T, bool THREADED, typename Allocator>
+node_base<T, THREADED, Allocator>* get_retry_sentinel() noexcept {
+    static full_node<T, THREADED, Allocator> sentinel;
+    static bool initialized = []() {
+        sentinel.set_header(SENTINEL_HEADER);  // FLAG_POISON set
+        auto* self = static_cast<node_base*>(&sentinel);
+        for (int i = 0; i < 256; ++i) {
+            sentinel.children[i].store(self);  // All point to self
+            sentinel.valid.set(static_cast<unsigned char>(i));
+        }
+        return true;
+    }();
+    return &sentinel;
+}
 ```
 
 The RETRY sentinel has `FLAG_POISON` set, marking it as "logically deleted."
@@ -197,24 +203,11 @@ Reader at RETRY sentinel
 
 The self-reference creates a **safe infinite loop** that's broken by poison checks. This is safer than nullptr (which would crash) or a dangling pointer (use-after-free).
 
-### Static Initialization
-
-The sentinel uses C++20 `constinit` for safe static initialization:
-
-```cpp
-template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
-struct sentinel_holder {
-    static constinit retry_storage<...> retry;
-};
-```
-
-This guarantees the sentinel exists before any trie operations, avoiding static initialization order issues.
-
 ### Sentinel Header
 
 ```cpp
 static constexpr uint64_t FLAG_POISON = 1ULL << 60;
-static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON;  // Interior FULL + poisoned
+static constexpr uint64_t SENTINEL_HEADER = FLAG_POISON;  // Interior FULL + poisoned
 ```
 
 ---
@@ -233,93 +226,110 @@ Time 3: Writer frees A
 Time 4: Reader R dereferences A → CRASH (use-after-free)
 ```
 
-### Standard EBR (Global Epoch)
-
-Traditional EBR uses a **global epoch counter**:
-
-1. **Global epoch**: Single counter incremented by writers
-2. **Reader registration**: Each reader records current epoch when starting
-3. **Grace period**: Node retired at epoch E can be freed when all readers have advanced past E
-
-```
-Global Epoch: 5
-
-Reader Slots:
-  Thread 1: epoch=5 (active)
-  Thread 2: epoch=4 (active)  ← oldest
-  Thread 3: epoch=0 (inactive)
-
-Safe to free: nodes retired at epoch ≤ 2 (oldest - 2)
-```
-
-### Problems with Global EBR
-
-1. **Global contention**: All tries share one epoch counter
-2. **Cross-trie interference**: Slow reader in trie A blocks reclamation in trie B
-3. **Registration overhead**: Thread-local storage lookup on every operation
-
 ### TKTRIE's Per-Trie EBR
 
-Each trie has its own epoch and reader tracking:
+TKTRIE uses a per-trie epoch and reader tracking:
 
 ```cpp
 // Per-trie state (in tktrie class)
 alignas(64) std::atomic<uint64_t> epoch_{1};  // Bumped on writes
 
-// Cache-line padded reader slots (16 slots, 1KB total)
-struct alignas(64) PaddedReaderSlot {
-    std::atomic<uint64_t> epoch{0};  // 0 = inactive
+// Per-trie retired node tracking
+struct retired_entry {
+    ptr_t node;
+    uint64_t epoch;
+    retired_entry* next;
 };
-std::array<PaddedReaderSlot, 16> reader_epochs_;
+std::atomic<retired_entry*> retired_head_{nullptr};
+```
 
-// Retired node list (lock-free MPSC queue)
-std::atomic<ptr_t> retired_head_{nullptr};
-std::atomic<size_t> retired_count_{0};
+### Global Thread Slots
+
+Reader tracking uses global EBR slots shared across all tries:
+
+```cpp
+class ebr_slot {
+    std::atomic<uint64_t> epoch_{0};   // Current epoch reader holds
+    std::atomic<bool> active_{false};   // Is reader active?
+    std::atomic<bool> valid_{true};     // Is slot still valid?
+};
+
+class ebr_global {
+    std::vector<ebr_slot*> slots_;     // All registered slots
+    // ...
+};
 ```
 
 ### Reader Protocol
 
 ```cpp
-void reader_enter() const noexcept {
-    size_t slot = thread_slot_hash(16);  // Hash thread ID to slot
-    uint64_t e = epoch_.load(std::memory_order_acquire);
-    reader_epochs_[slot].epoch.store(e, std::memory_order_release);
+void reader_enter() noexcept {
+    // Get thread-local slot
+    ebr_slot& slot = get_ebr_slot();
+    // Record current global epoch
+    uint64_t e = ebr_slot::global_epoch().load();
+    slot.epoch_.store(e);
+    slot.active_.store(true);
 }
 
-void reader_exit() const noexcept {
-    size_t slot = thread_slot_hash(16);
-    reader_epochs_[slot].epoch.store(0, std::memory_order_release);  // Mark inactive
+void reader_exit() noexcept {
+    ebr_slot& slot = get_ebr_slot();
+    slot.active_.store(false);  // Mark inactive
 }
 ```
 
 ### Finding Safe Epoch
 
 ```cpp
-uint64_t min_reader_epoch() const noexcept {
-    uint64_t current = epoch_.load();
-    uint64_t min_e = current;
-    for (auto& slot : reader_epochs_) {
-        uint64_t e = slot.epoch.load();
-        if (e != 0 && e < min_e) {  // Active reader with older epoch
-            min_e = e;
+uint64_t compute_safe_epoch() {
+    uint64_t current = ebr_slot::global_epoch().load();
+    uint64_t safe = current;
+    
+    for (auto* slot : slots_) {
+        if (slot->is_valid() && slot->is_active()) {
+            uint64_t e = slot->epoch();
+            if (e < safe) safe = e;  // Oldest active reader
         }
     }
-    return min_e;
+    return safe;
 }
 
-// Node retired at epoch E can be freed when min_reader_epoch() > E + grace_period
+// Node retired at epoch E can be freed when safe_epoch > E + grace_period
 ```
 
-### Slot Collisions
+### Epoch Validation (Fast Path)
 
-With 16 slots and potentially many threads, collisions are possible:
+For reads, TKTRIE uses **epoch validation** instead of path validation:
 
+```cpp
+bool contains(const Key& key) const {
+    reader_enter();
+    
+    for (int attempts = 0; attempts < 10; ++attempts) {
+        uint64_t epoch_before = epoch_.load();  // Snapshot epoch
+        
+        ptr_t root = root_.load();
+        if (!root) { reader_exit(); return false; }
+        if (root->is_poisoned()) continue;  // Retry
+        
+        bool found = read_impl(root, key);
+        
+        uint64_t epoch_after = epoch_.load();
+        if (epoch_before == epoch_after) {  // No concurrent writes
+            reader_exit();
+            return found;
+        }
+        // Epoch changed → retry to ensure consistent read
+    }
+    
+    reader_exit();
+    return fallback_locked_read();  // Too many retries
+}
 ```
-Thread 1 (slot 3): epoch=10
-Thread 2 (slot 3): epoch=12  ← overwrites Thread 1's registration
-```
 
-**This is safe**: We see the newer epoch (12), which is conservative. We might delay reclamation slightly, but never free too early.
+This is faster than path validation because:
+- Only 2 atomic loads (epoch before/after) vs N loads (one per node)
+- No path recording overhead during traversal
 
 ### Benefits of Per-Trie EBR
 
@@ -327,7 +337,7 @@ Thread 2 (slot 3): epoch=12  ← overwrites Thread 1's registration
 |--------|------------|--------------|
 | Epoch counter | Single global | One per trie |
 | Reader interference | Cross-trie | Isolated |
-| Memory overhead | O(threads) | O(tries × 16) |
+| Memory overhead | O(threads) | O(tries × slots) |
 | Scalability | Limited | Per-trie |
 
 ---
@@ -356,7 +366,7 @@ bool is_poisoned() const noexcept {
 }
 
 void poison() noexcept {
-    // Bump version AND set poison - version check catches both modifications and poison
+    // Bump version AND set poison - version check catches both
     uint64_t h = header_.load();
     header_.store(bump_version(h) | FLAG_POISON);
 }
@@ -369,21 +379,6 @@ void retire_node(ptr_t n) {
     n->poison();           // 1. Mark as dead FIRST
     ebr_retire(n, epoch);  // 2. Add to retired list
     epoch_.fetch_add(1);   // 3. Bump epoch
-}
-```
-
-### Reader Protocol
-
-```cpp
-bool read_impl(ptr_t n, std::string_view key) {
-    while (true) {
-        if (n->is_poisoned()) return false;  // Retry from root
-        
-        // ... traverse to child ...
-        n = n->get_child(c);
-        
-        if (!n || n->is_poisoned()) return false;  // Check again
-    }
 }
 ```
 
@@ -438,12 +433,6 @@ This means a **single version check** catches both:
 - In-place modifications (child added, value changed)
 - Node retirement (poison was set)
 
-Versions enable optimistic concurrency:
-1. Reader records version before traversal
-2. Reader performs traversal
-3. If version unchanged → result is valid (poison would have changed version)
-4. Otherwise → retry
-
 ---
 
 ## Putting It All Together
@@ -452,10 +441,10 @@ A complete read operation:
 
 ```cpp
 bool contains(const Key& key) const {
-    reader_enter();  // Register with this trie's EBR
+    reader_enter();  // Register with global EBR
     
     for (int attempts = 0; attempts < 10; ++attempts) {
-        uint64_t epoch_before = epoch_.load();
+        uint64_t epoch_before = epoch_.load();  // Per-trie epoch
         
         ptr_t n = root_.load();
         if (!n) { reader_exit(); return false; }
@@ -481,3 +470,4 @@ This achieves:
 - **Safe memory reclamation**: EBR prevents use-after-free
 - **Progress guarantee**: Sentinel ensures no infinite loops
 - **Per-trie isolation**: Operations on trie A don't affect trie B
+- **Efficient validation**: Epoch check is O(1), not O(path length)

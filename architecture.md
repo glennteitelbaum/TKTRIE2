@@ -750,100 +750,125 @@ Writer:                          Reader:
 
 ### EBR Solution
 
+TKTRIE uses a hybrid EBR approach:
+- **Global thread slots** shared across all tries
+- **Per-trie epoch counter** for write tracking
+- **Per-trie retired lists** for node reclamation
+
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│                  PER-TRIE EBR ARCHITECTURE                    │
+│                     EBR ARCHITECTURE                          │
 └───────────────────────────────────────────────────────────────┘
 
-                       ┌─────────────────┐
-                       │     TKTRIE      │
-                       │                 │
-                       │  epoch_: 42     │  ◄── Global epoch for this trie
-                       │                 │
-                       │  reader_slots_[16]    ◄── Per-thread epochs
-                       │  [0]: 42 (active)
-                       │  [1]: 0  (inactive)
-                       │  [2]: 41 (active)
-                       │  ...
-                       │                 │
-                       │  retired_:      │  ◄── Nodes pending deletion
-                       │  [(node1, 40)]
-                       │  [(node2, 41)]
-                       │  [(node3, 42)]
-                       │                 │
-                       └─────────────────┘
+  GLOBAL (ebr_global)              PER-TRIE (tktrie)
+  ┌─────────────────────┐          ┌─────────────────────┐
+  │ global_epoch: 100   │          │ epoch_: 42          │
+  │                     │          │                     │
+  │ slots_:             │          │ retired_:           │
+  │  [slot1] ◄──────────┼──┐       │  [(node1, 40)]      │
+  │  [slot2]            │  │       │  [(node2, 41)]      │
+  │  [slot3]            │  │       │  [(node3, 42)]      │
+  │  ...                │  │       │                     │
+  └─────────────────────┘  │       └─────────────────────┘
+                           │
+  THREAD-LOCAL             │
+  ┌─────────────────────┐  │
+  │ ebr_slot:           │──┘  (auto-registered)
+  │  epoch_: 100        │
+  │  active_: true      │
+  │  valid_: true       │
+  └─────────────────────┘
 
-SAFE TO DELETE: epoch + 2 ≤ min(active reader epochs)
-
-  Current epoch: 42
-  Active readers: slot[0]=42, slot[2]=41
-  Min active: 41
-  
-  node1 (epoch=40): 40 + 2 = 42 ≤ 41? NO  → Wait
-  node2 (epoch=41): 41 + 2 = 43 ≤ 41? NO  → Wait
-  node3 (epoch=42): 42 + 2 = 44 ≤ 41? NO  → Wait
-  
-  After readers exit and epoch advances to 44:
-  Min active: (none) = 44
-  
-  node1: 40 + 2 = 42 ≤ 44? YES → DELETE
-  node2: 41 + 2 = 43 ≤ 44? YES → DELETE
-  node3: 42 + 2 = 44 ≤ 44? YES → DELETE
+RECLAMATION: retired_epoch + 2 ≤ min(active reader epochs)
 ```
 
-### Reader Slot Assignment
+### Thread-Local Slots
+
+Each thread has its own slot, automatically registered with the global manager:
 
 ```cpp
-// Thread-local slot index (hash of thread ID)
-size_t slot_index = std::hash<std::thread::id>{}(
-    std::this_thread::get_id()) % NUM_SLOTS;
-
-void reader_enter() {
-    // Record current epoch in our slot
-    reader_slots_[slot_index].store(epoch_.load());
-}
-
-void reader_exit() {
-    // Clear our slot (0 = inactive)
-    reader_slots_[slot_index].store(0);
-}
-```
-
-### Cache Line Padding
-
-Reader slots are padded to avoid false sharing:
-
-```cpp
-struct alignas(64) padded_epoch {
-    std::atomic<uint64_t> epoch{0};
-    char padding[56];  // Fill to 64 bytes
+class ebr_slot {
+    std::atomic<uint64_t> epoch_{0};   // Epoch when reader started
+    std::atomic<bool> active_{false};   // Is reader in critical section?
+    std::atomic<bool> valid_{true};     // Is slot still valid?
+    
+public:
+    void enter() noexcept {
+        epoch_.store(global_epoch().load());
+        active_.store(true);
+    }
+    
+    void exit() noexcept {
+        active_.store(false);
+    }
 };
 
-std::array<padded_epoch, 16> reader_slots_;
+// Thread-local slot (auto-registered on first use)
+ebr_slot& get_ebr_slot() {
+    thread_local ebr_slot slot;  // Constructor registers with ebr_global
+    return slot;
+}
+```
+
+### Computing Safe Epoch
+
+```cpp
+uint64_t ebr_global::compute_safe_epoch() {
+    uint64_t current = global_epoch().load();
+    uint64_t safe = current;
+    
+    for (auto* slot : slots_) {
+        if (slot->is_valid() && slot->is_active()) {
+            uint64_t e = slot->epoch();
+            if (e < safe) safe = e;  // Track oldest active reader
+        }
+    }
+    return safe;
+}
+
+// Reclaim nodes where: retired_epoch + 2 <= safe_epoch
+```
+
+### Retired Node Tracking
+
+Each trie maintains its own retired list using wrapper entries:
+
+```cpp
+struct retired_entry {
+    ptr_t node;           // The retired node
+    uint64_t epoch;       // Epoch when retired  
+    retired_entry* next;  // Linked list
+};
+
+void ebr_retire(ptr_t n, uint64_t epoch) {
+    auto* entry = new retired_entry{n, epoch, nullptr};
+    // Add to lock-protected list
+    std::lock_guard lock(ebr_mutex_);
+    entry->next = retired_head_;
+    retired_head_ = entry;
+}
 ```
 
 ---
 
 ## Pseudocode Reference
 
-### Find
+### Find (Epoch Validation)
 
 ```
 FUNCTION find(key) -> (found, value):
     key_bytes = encode(key)
     
     IF THREADED:
-        reader_enter()
+        reader_enter()  // Register with global EBR
         
     LOOP max_retries:
-        path = []
+        epoch_before = trie.epoch_.load()  // Snapshot epoch
         node = root
         
         WHILE node != null:
             IF node.is_poisoned():
-                BREAK  // Retry
-            
-            path.append((node, node.version()))
+                BREAK  // Retry from beginning
             
             // Match skip
             skip = node.skip
@@ -851,34 +876,45 @@ FUNCTION find(key) -> (found, value):
             
             IF m < skip.length:
                 // Key not found (skip doesn't match)
-                IF validate_path(path):
+                epoch_after = trie.epoch_.load()
+                IF epoch_before == epoch_after:
                     reader_exit()
                     RETURN (false, null)
-                BREAK  // Version changed, retry
+                BREAK  // Epoch changed, retry
             
             key_bytes = key_bytes[m:]  // Consume matched prefix
             
             IF key_bytes.empty():
-                // End of key
+                // End of key - check for value
                 IF node.is_leaf():
                     IF node.is_skip():
                         value = node.leaf_value
+                        epoch_after = trie.epoch_.load()
+                        IF epoch_before == epoch_after:
+                            reader_exit()
+                            RETURN (true, value)
                     ELSE:
-                        RETURN (false, null)  // Multi-value leaf
+                        // Multi-value leaf, no match at empty key
+                        epoch_after = trie.epoch_.load()
+                        IF epoch_before == epoch_after:
+                            reader_exit()
+                            RETURN (false, null)
                 ELSE:
+                    // Interior node - check eos_ptr
                     value = node.eos_ptr
-                    IF value == null:
+                    epoch_after = trie.epoch_.load()
+                    IF epoch_before == epoch_after:
+                        reader_exit()
+                        IF value != null:
+                            RETURN (true, *value)
                         RETURN (false, null)
-                
-                IF validate_path(path):
-                    reader_exit()
-                    RETURN (true, value)
                 BREAK
             
             IF node.is_leaf():
                 // Must consume exactly 1 more char in leaf
                 IF key_bytes.length != 1:
-                    IF validate_path(path):
+                    epoch_after = trie.epoch_.load()
+                    IF epoch_before == epoch_after:
                         reader_exit()
                         RETURN (false, null)
                     BREAK
@@ -886,11 +922,13 @@ FUNCTION find(key) -> (found, value):
                 c = key_bytes[0]
                 IF node.has_entry(c):
                     value = node.get_value(c)
-                    IF validate_path(path):
+                    epoch_after = trie.epoch_.load()
+                    IF epoch_before == epoch_after:
                         reader_exit()
                         RETURN (true, value)
                 ELSE:
-                    IF validate_path(path):
+                    epoch_after = trie.epoch_.load()
+                    IF epoch_before == epoch_after:
                         reader_exit()
                         RETURN (false, null)
                 BREAK
@@ -903,6 +941,8 @@ FUNCTION find(key) -> (found, value):
     reader_exit()
     RETURN (false, null)  // Max retries exceeded
 ```
+
+**Key insight**: Epoch validation is O(1) - just compare two atomic loads. No need to record path or validate each node's version individually.
 
 ### Insert
 
@@ -992,6 +1032,8 @@ FUNCTION erase(key) -> bool:
 
 ### Validate Path
 
+Used during write operations to ensure speculative probing is still valid:
+
 ```
 FUNCTION validate_path(path) -> bool:
     // Check all recorded versions still match
@@ -1002,6 +1044,8 @@ FUNCTION validate_path(path) -> bool:
     RETURN true
 ```
 
+**Note**: Read operations use faster epoch validation (O(1) vs O(path length)).
+
 ### Retire Node
 
 ```
@@ -1010,34 +1054,33 @@ FUNCTION retire_node(node):
         RETURN
     
     node.poison()              // Bumps version + sets poison flag
-    current_epoch = epoch.load()
+    current_epoch = global_epoch.load()
     
+    // Add to per-trie retired list with wrapper entry
+    entry = new retired_entry(node, current_epoch)
     mutex.lock()
-    retired_list.append((node, current_epoch))
+    retired_list.prepend(entry)
     mutex.unlock()
     
-    epoch.fetch_add(1)         // Advance epoch
+    global_epoch.fetch_add(1)  // Advance global epoch
 ```
 
 ### Try Reclaim
 
 ```
 FUNCTION try_reclaim():
-    // Find minimum epoch held by any active reader
-    safe_epoch = epoch.load()
-    FOR slot IN reader_slots_:
-        e = slot.load()
-        IF e != 0 AND e < safe_epoch:  // 0 = inactive
-            safe_epoch = e
+    // Find minimum epoch held by any active reader (global)
+    safe_epoch = ebr_global.compute_safe_epoch()
     
     // Delete nodes retired before safe_epoch - 2
     mutex.lock()
     still_retired = []
-    FOR (node, retired_epoch) IN retired_list:
-        IF retired_epoch + 2 <= safe_epoch:
-            delete node
+    FOR entry IN retired_list:
+        IF entry.epoch + 2 <= safe_epoch:
+            delete entry.node
+            delete entry
         ELSE:
-            still_retired.append((node, retired_epoch))
+            still_retired.append(entry)
     retired_list = still_retired
     mutex.unlock()
 ```
@@ -1048,9 +1091,10 @@ FUNCTION try_reclaim():
 
 TKTRIE achieves high concurrent read performance through:
 
-1. **Lock-free reads**: Version numbers + poison flags enable optimistic traversal
-2. **Per-trie EBR**: Safe memory reclamation without global coordination
-3. **Skip compression**: Shallow trees (avg depth ~3) mean fewer nodes to validate
+1. **Lock-free reads**: Epoch validation enables optimistic traversal with O(1) consistency check
+2. **Global EBR with per-trie retired lists**: Safe memory reclamation with thread isolation
+3. **Skip compression**: Shallow trees (avg depth ~3) minimize traversal cost
 4. **Adaptive nodes**: SKIP/LIST/FULL minimize memory while maintaining performance
+5. **Poison bits**: Writers mark nodes dead before retiring, readers detect and retry
 
-The architecture trades write complexity for read performance, making it ideal for read-heavy concurrent workloads.
+The architecture trades write complexity for read performance, making it ideal for read-heavy concurrent workloads where reads can be 2-8x faster than mutex-guarded alternatives.
