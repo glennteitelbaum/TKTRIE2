@@ -346,12 +346,28 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     case erase_op::DELETE_LAST_LEAF_ENTRY: {
         if (!slot || slot->load() != info.target) return false;
         if (info.path_len > 1) {
-            info.path[info.path_len - 2].node->bump_version();
+            // Must call parent's remove_child to properly update bitmap + shift array
+            ptr_t parent = info.path[info.path_len - 2].node;
+            unsigned char edge = info.path[info.path_len - 1].edge;
+            parent->bump_version();
+            if (parent->is_binary()) {
+                auto* bn = parent->template as_binary<false>();
+                int idx = bn->find(edge);
+                if (idx >= 0) bn->remove_child(idx);
+            } else if (parent->is_list()) {
+                parent->template as_list<false>()->remove_child(edge);
+            } else if (parent->is_pop()) {
+                parent->template as_pop<false>()->remove_child(edge);
+            } else {
+                parent->template as_full<false>()->remove_child(edge);
+            }
+        } else {
+            // Deleting root node
+            if constexpr (THREADED) {
+                slot->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
+            }
+            slot->store(nullptr);
         }
-        if constexpr (THREADED) {
-            slot->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
-        }
-        slot->store(nullptr);
         return true;
     }
     
