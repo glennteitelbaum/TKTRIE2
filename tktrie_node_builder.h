@@ -11,7 +11,7 @@ namespace gteitelbaum {
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
 struct retry_storage : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
-    bitmap256 valid{};
+    bitmap256<THREADED> valid{};
     std::array<void*, 256> dummy_children{};
     
     constexpr retry_storage() noexcept 

@@ -707,7 +707,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             ebr_cleanup();
         }
         
-        reader_enter();
+        size_t slot = reader_enter();
         
         constexpr int MAX_RETRIES = 7;
         
@@ -723,7 +723,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
 
             if (spec.op == spec_op::EXISTS) {
                 stat_success(retry);
-                reader_exit();
+                reader_exit(slot);
                 return {iterator(this, kb, value), false};
             }
 
@@ -769,7 +769,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 size_.fetch_add(1);
                 stat_success(retry);
-                reader_exit();
+                reader_exit(slot);
                 return {iterator(this, kb, value), true};
             }
 
@@ -791,7 +791,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         n->set_eos(value);
                         size_.fetch_add(1);
                         stat_success(retry);
-                        reader_exit();
+                        reader_exit(slot);
                         return {iterator(this, kb, value), true};
                     }
                 } else {
@@ -849,7 +849,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
-                    reader_exit();
+                    reader_exit(slot);
                     return {iterator(this, kb, value), true};
                 }
             }
@@ -881,7 +881,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                     }
                     size_.fetch_add(1);
                     stat_success(retry);
-                    reader_exit();
+                    reader_exit(slot);
                     return {iterator(this, kb, value), true};
                 }
                 dealloc_speculation(alloc);
@@ -900,7 +900,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (!res.inserted) {
                 if (retired_any && !res.old_nodes.empty()) *retired_any = true;
                 for (auto* old : res.old_nodes) retire_node(old);
-                reader_exit();
+                reader_exit(slot);
                 return {iterator(this, kb, value), false};
             }
             
@@ -912,7 +912,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             if (retired_any && !res.old_nodes.empty()) *retired_any = true;
             for (auto* old : res.old_nodes) retire_node(old);
             size_.fetch_add(1);
-            reader_exit();
+            reader_exit(slot);
             return {iterator(this, kb, value), true};
         }
     }

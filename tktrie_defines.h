@@ -274,32 +274,92 @@ public:
 };
 
 // =============================================================================
-// BITMAP256 - 256-bit bitmap for FULL nodes
+// BITMAP256 - 256-bit bitmap for FULL/POP nodes
+// Templated on THREADED: uses atomic operations when true
 // =============================================================================
 
+template <bool THREADED>
 class bitmap256 {
-    uint64_t bits_[4] = {};
+    // Use atomic storage when THREADED, plain uint64_t otherwise
+    std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> bits_[4] = {};
+    
+    // Internal helpers for atomic/non-atomic access
+    uint64_t load_word(int w) const noexcept {
+        if constexpr (THREADED) {
+            return bits_[w].load(std::memory_order_acquire);
+        } else {
+            return bits_[w];
+        }
+    }
+    
+    void store_word(int w, uint64_t val) noexcept {
+        if constexpr (THREADED) {
+            bits_[w].store(val, std::memory_order_release);
+        } else {
+            bits_[w] = val;
+        }
+    }
+    
 public:
     constexpr bitmap256() noexcept = default;
-    bool test(unsigned char c) const noexcept { return (bits_[c >> 6] & (1ULL << (c & 63))) != 0; }
-    void set(unsigned char c) noexcept { bits_[c >> 6] |= (1ULL << (c & 63)); }
-    void clear(unsigned char c) noexcept { bits_[c >> 6] &= ~(1ULL << (c & 63)); }
-    uint64_t word(int w) const noexcept { return bits_[w]; }  // Access individual 64-bit word
-    int count() const noexcept {
-        return std::popcount(bits_[0]) + std::popcount(bits_[1]) +
-               std::popcount(bits_[2]) + std::popcount(bits_[3]);
+    
+    // Copy constructor - needed because atomic is not copyable
+    bitmap256(const bitmap256& other) noexcept {
+        for (int w = 0; w < 4; ++w) {
+            store_word(w, other.load_word(w));
+        }
     }
+    
+    bitmap256& operator=(const bitmap256& other) noexcept {
+        if (this != &other) {
+            for (int w = 0; w < 4; ++w) {
+                store_word(w, other.load_word(w));
+            }
+        }
+        return *this;
+    }
+    
+    bool test(unsigned char c) const noexcept {
+        return (load_word(c >> 6) & (1ULL << (c & 63))) != 0;
+    }
+    
+    void set(unsigned char c) noexcept {
+        if constexpr (THREADED) {
+            bits_[c >> 6].fetch_or(1ULL << (c & 63), std::memory_order_release);
+        } else {
+            bits_[c >> 6] |= (1ULL << (c & 63));
+        }
+    }
+    
+    void clear(unsigned char c) noexcept {
+        if constexpr (THREADED) {
+            bits_[c >> 6].fetch_and(~(1ULL << (c & 63)), std::memory_order_release);
+        } else {
+            bits_[c >> 6] &= ~(1ULL << (c & 63));
+        }
+    }
+    
+    uint64_t word(int w) const noexcept { return load_word(w); }
+    
+    int count() const noexcept {
+        return std::popcount(load_word(0)) + std::popcount(load_word(1)) +
+               std::popcount(load_word(2)) + std::popcount(load_word(3));
+    }
+    
     unsigned char first() const noexcept {
-        for (int w = 0; w < 4; ++w)
-            if (bits_[w]) return static_cast<unsigned char>((w << 6) | std::countr_zero(bits_[w]));
+        for (int w = 0; w < 4; ++w) {
+            uint64_t bits = load_word(w);
+            if (bits) return static_cast<unsigned char>((w << 6) | std::countr_zero(bits));
+        }
         return 0;
     }
     
     // Kernighan's method iteration - O(k) where k = popcount
+    // Note: Takes snapshot of bitmap, iteration is not atomic with concurrent modifications
     template <typename Fn>
     void for_each_set(Fn&& fn) const noexcept {
         for (int w = 0; w < 4; ++w) {
-            uint64_t bits = bits_[w];
+            uint64_t bits = load_word(w);
             while (bits) {
                 unsigned char c = static_cast<unsigned char>((w << 6) | std::countr_zero(bits));
                 fn(c);
@@ -308,28 +368,15 @@ public:
         }
     }
     
-    template <bool THREADED>
-    bool atomic_test(unsigned char c) const noexcept {
-        if constexpr (THREADED) {
-            uint64_t val = reinterpret_cast<const std::atomic<uint64_t>*>(&bits_[c >> 6])->load(std::memory_order_acquire);
-            return (val & (1ULL << (c & 63))) != 0;
-        } else {
-            return test(c);
-        }
-    }
+    // Legacy atomic_ methods - now just aliases since base operations are already atomic when THREADED
+    template <bool>
+    bool atomic_test(unsigned char c) const noexcept { return test(c); }
     
-    template <bool THREADED>
-    void atomic_set(unsigned char c) noexcept {
-        if constexpr (THREADED)
-            reinterpret_cast<std::atomic<uint64_t>*>(&bits_[c >> 6])->fetch_or(1ULL << (c & 63), std::memory_order_release);
-        else set(c);
-    }
-    template <bool THREADED>
-    void atomic_clear(unsigned char c) noexcept {
-        if constexpr (THREADED)
-            reinterpret_cast<std::atomic<uint64_t>*>(&bits_[c >> 6])->fetch_and(~(1ULL << (c & 63)), std::memory_order_release);
-        else clear(c);
-    }
+    template <bool>
+    void atomic_set(unsigned char c) noexcept { set(c); }
+    
+    template <bool>
+    void atomic_clear(unsigned char c) noexcept { clear(c); }
 };
 
 // =============================================================================

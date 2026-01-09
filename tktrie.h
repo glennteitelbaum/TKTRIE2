@@ -292,8 +292,8 @@ private:
     void ebr_retire(ptr_t n, uint64_t epoch);      // Lock-free push
     void ebr_cleanup();                             // Free reclaimable nodes (grabs ebr_mutex_)
     uint64_t min_reader_epoch() const noexcept;    // Scan slots for oldest active reader
-    void reader_enter() const noexcept;            // Store epoch in thread's slot
-    void reader_exit() const noexcept;             // Clear thread's slot
+    size_t reader_enter() const noexcept;          // Claim slot, return slot index
+    void reader_exit(size_t slot) const noexcept;  // Release slot
 
     // -------------------------------------------------------------------------
     // Static helpers

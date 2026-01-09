@@ -549,7 +549,7 @@ struct pop_node<T, THREADED, Allocator, FIXED_LEN, true>
     
     static constexpr int MAX_ENTRIES = POP_MAX;  // 32
     
-    bitmap256 valid;
+    bitmap256<THREADED> valid;
     std::array<data_t, MAX_ENTRIES> values;
     
     pop_node() = default;
@@ -635,7 +635,7 @@ struct pop_node<T, THREADED, Allocator, FIXED_LEN, false>
     
     static constexpr int MAX_CHILDREN = POP_MAX;  // 32
     
-    bitmap256 valid;
+    bitmap256<THREADED> valid;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     pop_node() = default;
@@ -754,7 +754,7 @@ struct pop_node<T, THREADED, Allocator, 0, false>
     static constexpr int MAX_CHILDREN = POP_MAX;  // 32
     
     eos_data_t eos;
-    bitmap256 valid;
+    bitmap256<THREADED> valid;
     std::array<atomic_ptr, MAX_CHILDREN> children;
     
     pop_node() = default;
@@ -875,7 +875,7 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, true>
     using base_t = node_with_skip<T, THREADED, Allocator, FIXED_LEN>;
     using data_t = typename base_t::data_t;
     
-    bitmap256 valid;
+    bitmap256<THREADED> valid;
     std::array<data_t, 256> values;
     
     full_node() = default;
@@ -936,7 +936,7 @@ struct full_node<T, THREADED, Allocator, FIXED_LEN, false>
     using ptr_t = typename base_t::ptr_t;
     using atomic_ptr = typename base_t::atomic_ptr;
     
-    bitmap256 valid;
+    bitmap256<THREADED> valid;
     std::array<atomic_ptr, 256> children;
     
     full_node() = default;
@@ -1006,7 +1006,7 @@ struct full_node<T, THREADED, Allocator, 0, false>
     using eos_data_t = typename base_t::eos_data_t;
     
     eos_data_t eos;
-    bitmap256 valid;
+    bitmap256<THREADED> valid;
     std::array<atomic_ptr, 256> children;
     
     full_node() = default;

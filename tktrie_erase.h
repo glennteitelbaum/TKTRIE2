@@ -39,7 +39,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             ebr_cleanup();
         }
         
-        reader_enter();
+        size_t slot = reader_enter();
         
         static constexpr int MAX_RETRIES = 7;
         
@@ -47,7 +47,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             erase_spec_info info = probe_erase(root_.load(), kb);
 
             if (info.op == erase_op::NOT_FOUND) {
-                reader_exit();
+                reader_exit(slot);
                 return {false, false};
             }
 
@@ -58,7 +58,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
                     epoch_.fetch_add(1, std::memory_order_release);
                     size_.fetch_sub(1);
-                    reader_exit();
+                    reader_exit(slot);
                     return {true, false};
                 }
                 continue;
@@ -70,7 +70,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (do_inplace_leaf_pop_erase(info.target, info.c, info.target_version)) {
                     epoch_.fetch_add(1, std::memory_order_release);
                     size_.fetch_sub(1);
-                    reader_exit();
+                    reader_exit(slot);
                     return {true, false};
                 }
                 continue;
@@ -82,7 +82,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
                     epoch_.fetch_add(1, std::memory_order_release);
                     size_.fetch_sub(1);
-                    reader_exit();
+                    reader_exit(slot);
                     return {true, false};
                 }
                 continue;
@@ -134,7 +134,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         retired_any = true;
                     }
                     size_.fetch_sub(1);
-                    reader_exit();
+                    reader_exit(slot);
                     return {true, retired_any};
                 }
                 dealloc_erase_speculation(alloc);
@@ -146,7 +146,7 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
-            reader_exit();
+            reader_exit(slot);
             return apply_erase_result(res);
         }
     }

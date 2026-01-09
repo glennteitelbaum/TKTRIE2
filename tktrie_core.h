@@ -51,31 +51,42 @@ void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
 }
 
 TKTRIE_TEMPLATE
-void TKTRIE_CLASS::reader_enter() const noexcept {
+size_t TKTRIE_CLASS::reader_enter() const noexcept {
     if constexpr (THREADED) {
-        size_t slot = thread_slot_hash(EBR_PADDED_SLOTS);
-        uint64_t epoch = epoch_.load(std::memory_order_acquire);
-        const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
-            .epoch.store(epoch, std::memory_order_release);
+        size_t start = thread_slot_hash(EBR_PADDED_SLOTS);
+        uint64_t my_epoch = epoch_.load(std::memory_order_seq_cst);
+        
+        size_t slot = start;
+        while (true) {
+            uint64_t expected = 0;
+            if (const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
+                    .epoch.compare_exchange_strong(expected, my_epoch,
+                        std::memory_order_seq_cst, std::memory_order_relaxed)) {
+                return slot;
+            }
+            slot = (slot + 1) % EBR_PADDED_SLOTS;
+            // If we wrapped around, keep trying - a slot will free up
+        }
     }
+    return 0;
 }
 
 TKTRIE_TEMPLATE
-void TKTRIE_CLASS::reader_exit() const noexcept {
+void TKTRIE_CLASS::reader_exit(size_t slot) const noexcept {
     if constexpr (THREADED) {
-        size_t slot = thread_slot_hash(EBR_PADDED_SLOTS);
         const_cast<PaddedReaderSlot&>(reader_epochs_[slot])
-            .epoch.store(0, std::memory_order_release);
+            .epoch.store(0, std::memory_order_seq_cst);
     }
 }
 
 TKTRIE_TEMPLATE
 uint64_t TKTRIE_CLASS::min_reader_epoch() const noexcept {
     if constexpr (THREADED) {
-        uint64_t current = epoch_.load(std::memory_order_acquire);
+        uint64_t current = epoch_.load(std::memory_order_seq_cst);
         uint64_t min_e = current;
         for (size_t i = 0; i < EBR_PADDED_SLOTS; ++i) {
-            uint64_t e = reader_epochs_[i].epoch.load(std::memory_order_acquire);
+            // Use seq_cst to ensure we see all reader_enter stores
+            uint64_t e = reader_epochs_[i].epoch.load(std::memory_order_seq_cst);
             if (e != 0 && e < min_e) {
                 min_e = e;
             }
@@ -106,8 +117,10 @@ void TKTRIE_CLASS::ebr_cleanup() {
             retire_entry_t* curr = list;
             list = list->next;
             
-            // Safe if retired at least 2 epochs before min reader epoch
-            if (curr->epoch + 2 <= min_epoch) {
+            // Safe if retired at least 8 epochs before min reader epoch
+            // (larger grace period handles slot collisions where faster threads
+            // overwrite slower readers' epoch in the same slot)
+            if (curr->epoch + 8 <= min_epoch) {
                 node_deleter(curr->node);
                 delete curr;
             } else {
@@ -529,7 +542,7 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
         
-        reader_enter();
+        size_t slot = reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             // Fast path: check epoch before and after traversal
@@ -537,7 +550,7 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
             
             ptr_t root = root_.load();
             if (!root) {
-                reader_exit();
+                reader_exit(slot);
                 return false;
             }
             
@@ -550,14 +563,14 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
             // Validate: if epoch unchanged, result is valid
             uint64_t epoch_after = epoch_.load(std::memory_order_acquire);
             if (epoch_before == epoch_after) {
-                reader_exit();
+                reader_exit(slot);
                 return found;
             }
             // Write happened during traversal, retry
         }
         // Fallback: too many retries, use locked read
         bool result = read_impl<false>(root_.load(), kbv);
-        reader_exit();
+        reader_exit(slot);
         return result;
     } else {
         return read_impl<false>(root_.load(), kbv);
@@ -610,7 +623,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
         
-        reader_enter();
+        size_t slot = reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
             // Fast path: epoch validation (same as contains())
@@ -619,7 +632,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             
             ptr_t root = root_.load();
             if (!root) {
-                reader_exit();
+                reader_exit(slot);
                 return end();
             }
             if (root->is_poisoned()) continue;
@@ -628,7 +641,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
             
             uint64_t epoch_after = epoch_.load(std::memory_order_acquire);
             if (epoch_before == epoch_after) {
-                reader_exit();
+                reader_exit(slot);
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
@@ -636,7 +649,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
         }
         // Fallback after too many retries
         bool found = read_impl<true>(root_.load(), kbv, value);
-        reader_exit();
+        reader_exit(slot);
         if (found) return iterator(this, kbv, value);
     } else {
         if (read_impl<true>(root_.load(), kbv, value)) {
