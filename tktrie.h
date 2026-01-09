@@ -362,7 +362,8 @@ public:
     std::pair<iterator, bool> insert(const std::pair<const Key, T>& kv);
     bool erase(const Key& key);
     iterator find(const Key& key) const;
-    iterator end() const noexcept { return iterator(); }
+    iterator begin() const { return iterator::make_begin(this); }
+    iterator end() const noexcept { return iterator::make_end(this); }
     void reclaim_retired() noexcept;
     
     ptr_t test_root() const noexcept { return root_.load(); }
@@ -378,27 +379,294 @@ public:
     using trie_t = tktrie<Key, T, THREADED, Allocator>;
     using traits = tktrie_traits<Key>;
     static constexpr size_t FIXED_LEN = traits::FIXED_LEN;
+    using ptr_t = node_base<T, THREADED, Allocator, FIXED_LEN>*;
     
     using key_storage_t = std::conditional_t<(FIXED_LEN > 0),
         std::array<char, FIXED_LEN>,
         std::string>;
 
 private:
+    // Stack entry for traversal
+    struct stack_entry {
+        ptr_t node;
+        int index;      // Current position within node (-1 = at EOS, 0+ = child/entry index)
+        unsigned char edge;  // Edge char used to reach this node (0 for root)
+    };
+    
+    static constexpr int MAX_DEPTH = 64;
+    
     const trie_t* trie_ = nullptr;
-    key_storage_t key_bytes_{};
+    std::array<stack_entry, MAX_DEPTH> stack_{};
+    int stack_depth_ = 0;
+    std::string key_bytes_;  // Accumulated key
     T value_{};
     bool valid_ = false;
+    bool at_eos_ = false;  // True if current position is at an EOS value
+
+    // Push node onto stack
+    void push(ptr_t node, int index, unsigned char edge) {
+        if (stack_depth_ < MAX_DEPTH) {
+            stack_[stack_depth_++] = {node, index, edge};
+        }
+    }
+    
+    // Pop from stack
+    bool pop() {
+        if (stack_depth_ > 0) {
+            --stack_depth_;
+            return true;
+        }
+        return false;
+    }
+    
+    // Get current stack top
+    stack_entry& top() { return stack_[stack_depth_ - 1]; }
+    const stack_entry& top() const { return stack_[stack_depth_ - 1]; }
+    
+    // Descend to leftmost value from current node
+    void descend_left(ptr_t node) {
+        while (node && !node->is_poisoned()) {
+            if (node->is_leaf()) {
+                if (node->is_skip()) {
+                    // SKIP leaf - single value
+                    key_bytes_.append(node->skip_str());
+                    push(node, 0, 0);
+                    node->as_skip()->value.try_read(value_);
+                    valid_ = true;
+                    return;
+                }
+                // Multi-entry leaf - go to first entry
+                key_bytes_.append(node->skip_str());
+                push(node, 0, 0);
+                load_leaf_value_at(node, 0);
+                return;
+            }
+            
+            // Interior node
+            key_bytes_.append(node->skip_str());
+            
+            // Check EOS first (it's the "smallest" - empty suffix)
+            if constexpr (FIXED_LEN == 0) {
+                if (node->has_eos()) {
+                    push(node, -1, 0);  // -1 indicates EOS position
+                    node->try_read_eos(value_);
+                    valid_ = true;
+                    at_eos_ = true;
+                    return;
+                }
+            }
+            
+            // Go to first child
+            auto [c, child] = get_first_child(node);
+            if (!child) {
+                valid_ = false;
+                return;
+            }
+            push(node, 0, c);
+            key_bytes_.push_back(static_cast<char>(c));
+            node = child;
+        }
+        valid_ = false;
+    }
+    
+    // Descend to rightmost value from current node
+    void descend_right(ptr_t node) {
+        while (node && !node->is_poisoned()) {
+            if (node->is_leaf()) {
+                if (node->is_skip()) {
+                    key_bytes_.append(node->skip_str());
+                    push(node, 0, 0);
+                    node->as_skip()->value.try_read(value_);
+                    valid_ = true;
+                    return;
+                }
+                // Multi-entry leaf - go to last entry
+                key_bytes_.append(node->skip_str());
+                int last = node->leaf_entry_count() - 1;
+                push(node, last, 0);
+                load_leaf_value_at(node, last);
+                return;
+            }
+            
+            // Interior node - go to last child first
+            key_bytes_.append(node->skip_str());
+            
+            auto [c, child] = get_last_child(node);
+            if (child) {
+                push(node, get_child_count(node) - 1, c);
+                key_bytes_.push_back(static_cast<char>(c));
+                node = child;
+            } else if constexpr (FIXED_LEN == 0) {
+                // No children, check EOS
+                if (node->has_eos()) {
+                    push(node, -1, 0);
+                    node->try_read_eos(value_);
+                    valid_ = true;
+                    at_eos_ = true;
+                    return;
+                }
+                valid_ = false;
+                return;
+            } else {
+                valid_ = false;
+                return;
+            }
+        }
+        valid_ = false;
+    }
+    
+    // Get first child (smallest char)
+    std::pair<unsigned char, ptr_t> get_first_child(ptr_t node) const {
+        if (node->is_binary()) {
+            auto* bn = node->template as_binary<false>();
+            if (bn->count() > 0) return {bn->char_at(0), bn->child_at_slot(0)};
+        } else if (node->is_list()) {
+            auto* ln = node->template as_list<false>();
+            if (ln->count() > 0) return {ln->char_at(0), ln->child_at_slot(0)};
+        } else if (node->is_pop()) {
+            auto* pn = node->template as_pop<false>();
+            if (pn->count() > 0) {
+                unsigned char c = pn->valid().first();
+                return {c, pn->get_child(c)};
+            }
+        } else if (node->is_full()) {
+            auto* fn = node->template as_full<false>();
+            if (fn->count() > 0) {
+                unsigned char c = fn->valid().first();
+                return {c, fn->get_child(c)};
+            }
+        }
+        return {0, nullptr};
+    }
+    
+    // Get last child (largest char)
+    std::pair<unsigned char, ptr_t> get_last_child(ptr_t node) const {
+        if (node->is_binary()) {
+            auto* bn = node->template as_binary<false>();
+            int cnt = bn->count();
+            if (cnt > 0) return {bn->char_at(cnt - 1), bn->child_at_slot(cnt - 1)};
+        } else if (node->is_list()) {
+            auto* ln = node->template as_list<false>();
+            int cnt = ln->count();
+            if (cnt > 0) return {ln->char_at(cnt - 1), ln->child_at_slot(cnt - 1)};
+        } else if (node->is_pop()) {
+            auto* pn = node->template as_pop<false>();
+            unsigned char last = 255;
+            while (last > 0 && !pn->valid().test(last)) --last;
+            if (pn->valid().test(last)) return {last, pn->get_child(last)};
+        } else if (node->is_full()) {
+            auto* fn = node->template as_full<false>();
+            unsigned char last = 255;
+            while (last > 0 && !fn->valid().test(last)) --last;
+            if (fn->valid().test(last)) return {last, fn->get_child(last)};
+        }
+        return {0, nullptr};
+    }
+    
+    // Get child count
+    int get_child_count(ptr_t node) const {
+        return node->child_count();
+    }
+    
+    // Get child at index (for BINARY/LIST) or by iteration (for POP/FULL)
+    std::pair<unsigned char, ptr_t> get_child_at(ptr_t node, int idx) const {
+        if (node->is_binary()) {
+            auto* bn = node->template as_binary<false>();
+            return {bn->char_at(idx), bn->child_at_slot(idx)};
+        } else if (node->is_list()) {
+            auto* ln = node->template as_list<false>();
+            return {ln->char_at(idx), ln->child_at_slot(idx)};
+        } else if (node->is_pop()) {
+            auto* pn = node->template as_pop<false>();
+            int i = 0;
+            unsigned char result_c = 0;
+            ptr_t result_p = nullptr;
+            pn->valid().for_each_set([&](unsigned char c) {
+                if (i == idx) { result_c = c; result_p = pn->get_child(c); }
+                ++i;
+            });
+            return {result_c, result_p};
+        } else {
+            auto* fn = node->template as_full<false>();
+            int i = 0;
+            unsigned char result_c = 0;
+            ptr_t result_p = nullptr;
+            fn->valid().for_each_set([&](unsigned char c) {
+                if (i == idx) { result_c = c; result_p = fn->get_child(c); }
+                ++i;
+            });
+            return {result_c, result_p};
+        }
+    }
+    
+    // Load value from leaf at given index
+    void load_leaf_value_at(ptr_t leaf, int idx) {
+        unsigned char c = 0;
+        if (leaf->is_binary()) {
+            auto* bn = leaf->template as_binary<true>();
+            c = bn->char_at(idx);
+            bn->read_value(idx, value_);
+        } else if (leaf->is_list()) {
+            auto* ln = leaf->template as_list<true>();
+            c = ln->char_at(idx);
+            ln->read_value(idx, value_);
+        } else if (leaf->is_pop()) {
+            auto* pn = leaf->template as_pop<true>();
+            int i = 0;
+            pn->valid().for_each_set([&](unsigned char ch) {
+                if (i == idx) {
+                    c = ch;
+                    pn->element_at_slot(idx).try_read(value_);
+                }
+                ++i;
+            });
+        } else {
+            auto* fn = leaf->template as_full<true>();
+            int i = 0;
+            fn->valid().for_each_set([&](unsigned char ch) {
+                if (i == idx) {
+                    c = ch;
+                    fn->read_value(ch, value_);
+                }
+                ++i;
+            });
+        }
+        key_bytes_.push_back(static_cast<char>(c));
+        valid_ = true;
+    }
 
 public:
     tktrie_iterator() = default;
     
+    // Constructor from find() result
     tktrie_iterator(const trie_t* t, std::string_view kb, const T& v)
-        : trie_(t), value_(v), valid_(true) {
-        if constexpr (FIXED_LEN > 0) {
-            std::memcpy(key_bytes_.data(), kb.data(), FIXED_LEN);
-        } else {
-            key_bytes_ = std::string(kb);
+        : trie_(t), key_bytes_(kb), value_(v), valid_(true) {}
+    
+    // Constructor for begin()
+    static tktrie_iterator make_begin(const trie_t* t) {
+        tktrie_iterator it;
+        it.trie_ = t;
+        ptr_t root = t->test_root();
+        if (root && !root->is_poisoned()) {
+            it.descend_left(root);
         }
+        return it;
+    }
+    
+    // Constructor for end()
+    static tktrie_iterator make_end(const trie_t* t) {
+        tktrie_iterator it;
+        it.trie_ = t;
+        it.valid_ = false;
+        return it;
+    }
+    
+    // Constructor for end() before begin
+    static tktrie_iterator make_rend(const trie_t* t) {
+        tktrie_iterator it;
+        it.trie_ = t;
+        it.valid_ = false;
+        return it;
     }
 
     Key key() const { 
@@ -408,15 +676,215 @@ public:
             return traits::from_bytes(key_bytes_);
         }
     }
+    
     const T& value() const { return value_; }
     bool valid() const { return valid_; }
     explicit operator bool() const { return valid_; }
 
     bool operator==(const tktrie_iterator& o) const {
-        if ((!valid_) & (!o.valid_)) return true;
-        return (valid_ == o.valid_) & (key_bytes_ == o.key_bytes_);
+        if (!valid_ && !o.valid_) return true;
+        if (valid_ != o.valid_) return false;
+        return key_bytes_ == o.key_bytes_;
     }
     bool operator!=(const tktrie_iterator& o) const { return !(*this == o); }
+    
+    // Pre-increment: advance to next entry
+    tktrie_iterator& operator++() {
+        if (!valid_ || stack_depth_ == 0) {
+            valid_ = false;
+            return *this;
+        }
+        
+        stack_entry& cur = top();
+        ptr_t node = cur.node;
+        
+        if (node->is_leaf()) {
+            if (node->is_skip()) {
+                // SKIP has one value, go up
+                key_bytes_.resize(key_bytes_.size() - node->skip_str().size());
+                pop();
+                advance_from_parent();
+                return *this;
+            }
+            
+            // Multi-entry leaf - try next entry
+            int cnt = node->leaf_entry_count();
+            key_bytes_.pop_back();  // Remove current entry's char
+            
+            if (cur.index + 1 < cnt) {
+                cur.index++;
+                load_leaf_value_at(node, cur.index);
+                return *this;
+            }
+            
+            // No more entries in this leaf, go up
+            key_bytes_.resize(key_bytes_.size() - node->skip_str().size());
+            pop();
+            advance_from_parent();
+            return *this;
+        }
+        
+        // Interior node - we were at EOS or a child
+        if (at_eos_) {
+            at_eos_ = false;
+            // Move to first child
+            if (node->child_count() > 0) {
+                auto [c, child] = get_first_child(node);
+                cur.index = 0;
+                cur.edge = c;
+                key_bytes_.push_back(static_cast<char>(c));
+                descend_left(child);
+                return *this;
+            }
+            // No children, go up
+            key_bytes_.resize(key_bytes_.size() - node->skip_str().size());
+            pop();
+            advance_from_parent();
+            return *this;
+        }
+        
+        // Should not reach here during normal iteration
+        valid_ = false;
+        return *this;
+    }
+    
+    // Post-increment
+    tktrie_iterator operator++(int) {
+        tktrie_iterator tmp = *this;
+        ++(*this);
+        return tmp;
+    }
+    
+    // Pre-decrement: go to previous entry
+    tktrie_iterator& operator--() {
+        if (stack_depth_ == 0) {
+            // At end() or rend(), go to last element
+            if (trie_) {
+                ptr_t root = trie_->test_root();
+                if (root && !root->is_poisoned()) {
+                    descend_right(root);
+                }
+            }
+            return *this;
+        }
+        
+        stack_entry& cur = top();
+        ptr_t node = cur.node;
+        
+        if (node->is_leaf()) {
+            if (node->is_skip()) {
+                // SKIP has one value, go up and left
+                key_bytes_.resize(key_bytes_.size() - node->skip_str().size());
+                pop();
+                retreat_from_parent();
+                return *this;
+            }
+            
+            // Multi-entry leaf - try previous entry
+            key_bytes_.pop_back();
+            
+            if (cur.index > 0) {
+                cur.index--;
+                load_leaf_value_at(node, cur.index);
+                return *this;
+            }
+            
+            // No more entries, go up
+            key_bytes_.resize(key_bytes_.size() - node->skip_str().size());
+            pop();
+            retreat_from_parent();
+            return *this;
+        }
+        
+        // Interior node at EOS - nothing before EOS at this node, go up
+        if (at_eos_) {
+            at_eos_ = false;
+            key_bytes_.resize(key_bytes_.size() - node->skip_str().size());
+            pop();
+            retreat_from_parent();
+            return *this;
+        }
+        
+        valid_ = false;
+        return *this;
+    }
+    
+    // Post-decrement
+    tktrie_iterator operator--(int) {
+        tktrie_iterator tmp = *this;
+        --(*this);
+        return tmp;
+    }
+
+private:
+    // After popping from a leaf, try to advance within/from parent
+    void advance_from_parent() {
+        while (stack_depth_ > 0) {
+            stack_entry& parent = top();
+            ptr_t pnode = parent.node;
+            
+            // Remove edge char from key
+            if (parent.edge != 0 || parent.index >= 0) {
+                if (!key_bytes_.empty()) key_bytes_.pop_back();
+            }
+            
+            int child_cnt = pnode->child_count();
+            
+            // Try next child
+            if (parent.index + 1 < child_cnt) {
+                parent.index++;
+                auto [c, child] = get_child_at(pnode, parent.index);
+                parent.edge = c;
+                key_bytes_.push_back(static_cast<char>(c));
+                descend_left(child);
+                return;
+            }
+            
+            // No more children, go up
+            key_bytes_.resize(key_bytes_.size() - pnode->skip_str().size());
+            pop();
+        }
+        valid_ = false;
+    }
+    
+    // After popping from a leaf, try to retreat within/from parent
+    void retreat_from_parent() {
+        while (stack_depth_ > 0) {
+            stack_entry& parent = top();
+            ptr_t pnode = parent.node;
+            
+            // Remove edge char
+            if (parent.edge != 0 || parent.index >= 0) {
+                if (!key_bytes_.empty()) key_bytes_.pop_back();
+            }
+            
+            // Try previous child
+            if (parent.index > 0) {
+                parent.index--;
+                auto [c, child] = get_child_at(pnode, parent.index);
+                parent.edge = c;
+                key_bytes_.push_back(static_cast<char>(c));
+                descend_right(child);
+                return;
+            }
+            
+            // At first child, check EOS
+            if constexpr (FIXED_LEN == 0) {
+                if (parent.index == 0 && pnode->has_eos()) {
+                    parent.index = -1;
+                    pnode->try_read_eos(value_);
+                    valid_ = true;
+                    at_eos_ = true;
+                    return;
+                }
+            }
+            
+            // No EOS or already past it, go up
+            key_bytes_.resize(key_bytes_.size() - pnode->skip_str().size());
+            pop();
+        }
+        valid_ = false;
+    }
 };
 
 // =============================================================================

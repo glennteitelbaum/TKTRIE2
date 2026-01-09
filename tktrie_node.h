@@ -195,58 +195,82 @@ struct node_base {
         return static_cast<const node_with_skip<T, THREADED, Allocator, FIXED_LEN>*>(this)->skip.view();
     }
     
-    // Dispatchers
+    // Dispatchers - use 2-level hierarchy for max 2 branches
     ptr_t get_child(unsigned char c) const noexcept {
-        if (is_binary()) return as_binary<false>()->get_child(c);
-        if (is_list()) [[likely]] return as_list<false>()->get_child(c);
-        if (is_pop()) return as_pop<false>()->get_child(c);
-        return as_full<false>()->get_child(c);
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] return as_binary<false>()->get_child(c);
+            else return as_list<false>()->get_child(c);
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<false>()->get_child(c);
+            else return as_full<false>()->get_child(c);
+        }
     }
     
     atomic_ptr* get_child_slot(unsigned char c) noexcept {
-        if (is_binary()) return as_binary<false>()->get_child_slot(c);
-        if (is_list()) [[likely]] return as_list<false>()->get_child_slot(c);
-        if (is_pop()) return as_pop<false>()->get_child_slot(c);
-        return as_full<false>()->get_child_slot(c);
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] return as_binary<false>()->get_child_slot(c);
+            else return as_list<false>()->get_child_slot(c);
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<false>()->get_child_slot(c);
+            else return as_full<false>()->get_child_slot(c);
+        }
     }
     
     int child_count() const noexcept {
-        if (is_binary()) return as_binary<false>()->count();
-        if (is_list()) [[likely]] return as_list<false>()->count();
-        if (is_pop()) return as_pop<false>()->count();
-        return as_full<false>()->count();
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] return as_binary<false>()->count();
+            else return as_list<false>()->count();
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<false>()->count();
+            else return as_full<false>()->count();
+        }
     }
     
     int leaf_entry_count() const noexcept {
-        if (is_binary()) return as_binary<true>()->count();
-        if (is_list()) [[likely]] return as_list<true>()->count();
-        if (is_pop()) return as_pop<true>()->count();
-        return as_full<true>()->count();
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] return as_binary<true>()->count();
+            else return as_list<true>()->count();
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<true>()->count();
+            else return as_full<true>()->count();
+        }
     }
     
     bool has_child(unsigned char c) const noexcept {
-        if (is_binary()) return as_binary<false>()->has(c);
-        if (is_list()) [[likely]] return as_list<false>()->has(c);
-        if (is_pop()) return as_pop<false>()->has(c);
-        return as_full<false>()->has(c);
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] return as_binary<false>()->has(c);
+            else return as_list<false>()->has(c);
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<false>()->has(c);
+            else return as_full<false>()->has(c);
+        }
     }
     
     std::pair<unsigned char, ptr_t> first_child_info() const noexcept {
-        if (is_binary()) {
-            auto* bn = as_binary<false>();
-            return {bn->first_char(), bn->child_at_slot(0)};
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] {
+                auto* bn = as_binary<false>();
+                return {bn->first_char(), bn->child_at_slot(0)};
+            } else {
+                auto* ln = as_list<false>();
+                return {ln->char_at(0), ln->child_at_slot(0)};
+            }
+        } else {
+            if (h & FLAG_POP) [[likely]] {
+                auto* pn = as_pop<false>();
+                return {pn->first_char(), pn->child_at_slot(0)};
+            } else {
+                auto* fn = as_full<false>();
+                unsigned char c = fn->valid().first();
+                return {c, fn->get_child(c)};
+            }
         }
-        if (is_list()) [[likely]] {
-            auto* ln = as_list<false>();
-            return {ln->char_at(0), ln->child_at_slot(0)};
-        }
-        if (is_pop()) {
-            auto* pn = as_pop<false>();
-            return {pn->first_char(), pn->child_at_slot(0)};
-        }
-        auto* fn = as_full<false>();
-        unsigned char c = fn->valid().first();
-        return {c, fn->get_child(c)};
     }
     
     bool has_eos() const noexcept {
@@ -260,10 +284,14 @@ struct node_base {
             return false;
         } else {
             if (!eos_flag()) return false;
-            if (is_binary()) return as_binary<false>()->eos().try_read(out);
-            if (is_list()) [[likely]] return as_list<false>()->eos().try_read(out);
-            if (is_pop()) return as_pop<false>()->eos().try_read(out);
-            return as_full<false>()->eos().try_read(out);
+            uint64_t h = header();
+            if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+                if (h & FLAG_BINARY) [[likely]] return as_binary<false>()->eos().try_read(out);
+                else return as_list<false>()->eos().try_read(out);
+            } else {
+                if (h & FLAG_POP) [[likely]] return as_pop<false>()->eos().try_read(out);
+                else return as_full<false>()->eos().try_read(out);
+            }
         }
     }
     
@@ -271,10 +299,14 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             (void)value;
         } else {
-            if (is_binary()) as_binary<false>()->eos().set(value);
-            else if (is_list()) [[likely]] as_list<false>()->eos().set(value);
-            else if (is_pop()) as_pop<false>()->eos().set(value);
-            else as_full<false>()->eos().set(value);
+            uint64_t h = header();
+            if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+                if (h & FLAG_BINARY) [[likely]] as_binary<false>()->eos().set(value);
+                else as_list<false>()->eos().set(value);
+            } else {
+                if (h & FLAG_POP) [[likely]] as_pop<false>()->eos().set(value);
+                else as_full<false>()->eos().set(value);
+            }
             set_eos_flag();
         }
     }
@@ -282,73 +314,91 @@ struct node_base {
     void clear_eos() {
         if constexpr (FIXED_LEN > 0) {
         } else {
-            if (is_binary()) as_binary<false>()->eos().clear();
-            else if (is_list()) [[likely]] as_list<false>()->eos().clear();
-            else if (is_pop()) as_pop<false>()->eos().clear();
-            else as_full<false>()->eos().clear();
+            uint64_t h = header();
+            if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+                if (h & FLAG_BINARY) [[likely]] as_binary<false>()->eos().clear();
+                else as_list<false>()->eos().clear();
+            } else {
+                if (h & FLAG_POP) [[likely]] as_pop<false>()->eos().clear();
+                else as_full<false>()->eos().clear();
+            }
             clear_eos_flag();
         }
     }
     
     bool has_leaf_entry(unsigned char c) const noexcept {
-        if (is_binary()) return as_binary<true>()->has(c);
-        if (is_list()) [[likely]] return as_list<true>()->has(c);
-        if (is_pop()) return as_pop<true>()->has(c);
-        return as_full<true>()->has(c);
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] return as_binary<true>()->has(c);
+            else return as_list<true>()->has(c);
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<true>()->has(c);
+            else return as_full<true>()->has(c);
+        }
     }
     
     bool try_read_leaf_value(unsigned char c, T& out) const noexcept {
-        if (is_binary()) {
-            auto* bn = as_binary<true>();
-            int idx = bn->find(c);
-            if (idx < 0) return false;
-            return bn->read_value(idx, out);
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] {
+                auto* bn = as_binary<true>();
+                int idx = bn->find(c);
+                if (idx < 0) return false;
+                return bn->read_value(idx, out);
+            } else {
+                auto* ln = as_list<true>();
+                int idx = ln->find(c);
+                if (idx < 0) return false;
+                return ln->read_value(idx, out);
+            }
+        } else {
+            if (h & FLAG_POP) [[likely]] return as_pop<true>()->read_value(c, out);
+            else {
+                auto* fn = as_full<true>();
+                if (!fn->has(c)) return false;
+                return fn->read_value(c, out);
+            }
         }
-        if (is_list()) [[likely]] {
-            auto* ln = as_list<true>();
-            int idx = ln->find(c);
-            if (idx < 0) return false;
-            return ln->read_value(idx, out);
-        }
-        if (is_pop()) return as_pop<true>()->read_value(c, out);
-        auto* fn = as_full<true>();
-        if (!fn->has(c)) return false;
-        return fn->read_value(c, out);
     }
     
     template <typename Fn>
     void for_each_leaf_entry(Fn&& fn) const {
-        if (is_binary()) {
-            auto* bn = as_binary<true>();
-            for (int i = 0; i < bn->count(); ++i) {
-                T val{};
-                bn->value_at(i).try_read(val);
-                fn(bn->char_at(i), val);
+        uint64_t h = header();
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if (h & FLAG_BINARY) [[likely]] {
+                auto* bn = as_binary<true>();
+                for (int i = 0; i < bn->count(); ++i) {
+                    T val{};
+                    bn->value_at(i).try_read(val);
+                    fn(bn->char_at(i), val);
+                }
+            } else {
+                auto* ln = as_list<true>();
+                int cnt = ln->count();
+                for (int i = 0; i < cnt; ++i) {
+                    T val{};
+                    ln->value_at(i).try_read(val);
+                    fn(ln->char_at(i), val);
+                }
             }
-        } else if (is_list()) [[likely]] {
-            auto* ln = as_list<true>();
-            int cnt = ln->count();
-            for (int i = 0; i < cnt; ++i) {
-                T val{};
-                ln->value_at(i).try_read(val);
-                fn(ln->char_at(i), val);
-            }
-        } else if (is_pop()) {
-            auto* pn = as_pop<true>();
-            int slot = 0;
-            pn->valid().for_each_set([pn, &fn, &slot](unsigned char c) {
-                T val{};
-                pn->element_at_slot(slot).try_read(val);
-                fn(c, val);
-                ++slot;
-            });
         } else {
-            auto* fn_node = as_full<true>();
-            fn_node->valid().for_each_set([fn_node, &fn](unsigned char c) {
-                T val{};
-                fn_node->read_value(c, val);
-                fn(c, val);
-            });
+            if (h & FLAG_POP) [[likely]] {
+                auto* pn = as_pop<true>();
+                int slot = 0;
+                pn->valid().for_each_set([pn, &fn, &slot](unsigned char c) {
+                    T val{};
+                    pn->element_at_slot(slot).try_read(val);
+                    fn(c, val);
+                    ++slot;
+                });
+            } else {
+                auto* fn_node = as_full<true>();
+                fn_node->valid().for_each_set([fn_node, &fn](unsigned char c) {
+                    T val{};
+                    fn_node->read_value(c, val);
+                    fn(c, val);
+                });
+            }
         }
     }
 };

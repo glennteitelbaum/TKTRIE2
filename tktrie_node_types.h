@@ -288,13 +288,23 @@ public:
         if (idx >= 0) {
             elements_[idx].set(val);
         } else {
-            idx = chars_.add(c);
+            int cnt = chars_.count();
+            idx = chars_.add_sorted(c);
+            // Shift elements to match char order
+            for (int i = cnt; i > idx; --i) {
+                elements_[i] = std::move(elements_[i - 1]);
+            }
             elements_[idx].set(val);
         }
     }
     
     int add_entry(unsigned char c, const T& val) requires IS_LEAF {
-        int idx = chars_.add(c);
+        int cnt = chars_.count();
+        int idx = chars_.add_sorted(c);
+        // Shift elements to match char order
+        for (int i = cnt; i > idx; --i) {
+            elements_[i] = std::move(elements_[i - 1]);
+        }
         elements_[idx].set(val);
         return idx;
     }
@@ -342,16 +352,29 @@ public:
     }
     
     void add_entry(unsigned char c, ptr_t child) requires (!IS_LEAF) {
-        int idx = chars_.add(c);
+        int cnt = chars_.count();
+        int idx = chars_.add_sorted(c);
+        // Shift elements to match char order
+        for (int i = cnt; i > idx; --i) {
+            elements_[i] = elements_[i - 1];
+        }
         elements_[idx].store(child);
     }
     
     void add_two_children(unsigned char c1, ptr_t child1, unsigned char c2, ptr_t child2) 
         requires (!IS_LEAF) {
-        chars_.add(c1);
-        chars_.add(c2);
-        elements_[0].store(child1);
-        elements_[1].store(child2);
+        // Insert in sorted order
+        if (c1 < c2) {
+            chars_.add(c1);
+            chars_.add(c2);
+            elements_[0].store(child1);
+            elements_[1].store(child2);
+        } else {
+            chars_.add(c2);
+            chars_.add(c1);
+            elements_[0].store(child2);
+            elements_[1].store(child1);
+        }
     }
     
     void remove_entry(unsigned char c) requires (!IS_LEAF) {

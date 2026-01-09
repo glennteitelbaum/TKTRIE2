@@ -133,8 +133,9 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
     requires NEED_VALUE {
     if (!n) return false;
     
+    uint64_t h;
     while (true) {
-        uint64_t h = n->header();
+        h = n->header();
         
         if constexpr (THREADED) {
             if (h & FLAG_POISON) return false;
@@ -144,33 +145,34 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (!(h & FLAG_LEAF)) {
-            if (key.empty()) {
-                if constexpr (FIXED_LEN > 0) {
-                    return false;
-                } else {
-                    if (!(h & FLAG_HAS_EOS)) return false;
-                    return n->try_read_eos(out);
-                }
+        if (h & FLAG_LEAF) [[unlikely]] break;
+        
+        // Interior node: check EOS or descend
+        if (key.empty()) {
+            if constexpr (FIXED_LEN > 0) {
+                return false;
+            } else {
+                if (!(h & FLAG_HAS_EOS)) return false;
+                return n->try_read_eos(out);
             }
-            
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            key.remove_prefix(1);
-            n = n->get_child(c);
-            
-            if (!n) return false;
-            continue;
         }
         
-        if (h & FLAG_SKIP) {
-            if (!key.empty()) return false;
-            return n->as_skip()->value.try_read(out);
-        }
-        
-        if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        return n->try_read_leaf_value(c, out);
+        key.remove_prefix(1);
+        n = n->get_child(c);
+        
+        if (!n) return false;
     }
+    
+    // Leaf node
+    if (h & FLAG_SKIP) {
+        if (!key.empty()) return false;
+        return n->as_skip()->value.try_read(out);
+    }
+    
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    return n->try_read_leaf_value(c, out);
 }
 
 TKTRIE_TEMPLATE
@@ -179,8 +181,9 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
     requires (!NEED_VALUE) {
     if (!n) return false;
     
+    uint64_t h;
     while (true) {
-        uint64_t h = n->header();
+        h = n->header();
         
         if constexpr (THREADED) {
             if (h & FLAG_POISON) return false;
@@ -190,31 +193,32 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (!(h & FLAG_LEAF)) {
-            if (key.empty()) {
-                if constexpr (FIXED_LEN > 0) {
-                    return false;
-                } else {
-                    return (h & FLAG_HAS_EOS) != 0;
-                }
+        if (h & FLAG_LEAF) [[unlikely]] break;
+        
+        // Interior node: check EOS or descend
+        if (key.empty()) {
+            if constexpr (FIXED_LEN > 0) {
+                return false;
+            } else {
+                return (h & FLAG_HAS_EOS) != 0;
             }
-            
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            key.remove_prefix(1);
-            n = n->get_child(c);
-            
-            if (!n) return false;
-            continue;
         }
         
-        if (h & FLAG_SKIP) {
-            return key.empty();
-        }
-        
-        if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        return n->has_leaf_entry(c);
+        key.remove_prefix(1);
+        n = n->get_child(c);
+        
+        if (!n) return false;
     }
+    
+    // Leaf node
+    if (h & FLAG_SKIP) {
+        return key.empty();
+    }
+    
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    return n->has_leaf_entry(c);
 }
 
 TKTRIE_TEMPLATE
@@ -223,8 +227,9 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
     requires NEED_VALUE {
     if (!n) return false;
     
+    uint64_t h;
     while (true) {
-        uint64_t h = n->header();
+        h = n->header();
         
         if (h & FLAG_POISON) return false;
         
@@ -237,33 +242,34 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (!(h & FLAG_LEAF)) {
-            if (key.empty()) {
-                if constexpr (FIXED_LEN > 0) {
-                    return false;
-                } else {
-                    if (!(h & FLAG_HAS_EOS)) return false;
-                    return n->try_read_eos(out);
-                }
+        if (h & FLAG_LEAF) [[unlikely]] break;
+        
+        // Interior node: check EOS or descend
+        if (key.empty()) {
+            if constexpr (FIXED_LEN > 0) {
+                return false;
+            } else {
+                if (!(h & FLAG_HAS_EOS)) return false;
+                return n->try_read_eos(out);
             }
-            
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            key.remove_prefix(1);
-            n = n->get_child(c);
-            
-            if (!n) return false;
-            continue;
         }
         
-        if (h & FLAG_SKIP) {
-            if (!key.empty()) return false;
-            return n->as_skip()->value.try_read(out);
-        }
-        
-        if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        return n->try_read_leaf_value(c, out);
+        key.remove_prefix(1);
+        n = n->get_child(c);
+        
+        if (!n) return false;
     }
+    
+    // Leaf node
+    if (h & FLAG_SKIP) {
+        if (!key.empty()) return false;
+        return n->as_skip()->value.try_read(out);
+    }
+    
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    return n->try_read_leaf_value(c, out);
 }
 
 TKTRIE_TEMPLATE
@@ -272,8 +278,9 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
     requires (!NEED_VALUE) {
     if (!n) return false;
     
+    uint64_t h;
     while (true) {
-        uint64_t h = n->header();
+        h = n->header();
         
         if (h & FLAG_POISON) return false;
         
@@ -286,31 +293,32 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
-        if (!(h & FLAG_LEAF)) {
-            if (key.empty()) {
-                if constexpr (FIXED_LEN > 0) {
-                    return false;
-                } else {
-                    return (h & FLAG_HAS_EOS) != 0;
-                }
+        if (h & FLAG_LEAF) [[unlikely]] break;
+        
+        // Interior node: check EOS or descend
+        if (key.empty()) {
+            if constexpr (FIXED_LEN > 0) {
+                return false;
+            } else {
+                return (h & FLAG_HAS_EOS) != 0;
             }
-            
-            unsigned char c = static_cast<unsigned char>(key[0]);
-            key.remove_prefix(1);
-            n = n->get_child(c);
-            
-            if (!n) return false;
-            continue;
         }
         
-        if (h & FLAG_SKIP) {
-            return key.empty();
-        }
-        
-        if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        return n->has_leaf_entry(c);
+        key.remove_prefix(1);
+        n = n->get_child(c);
+        
+        if (!n) return false;
     }
+    
+    // Leaf node
+    if (h & FLAG_SKIP) {
+        return key.empty();
+    }
+    
+    if (key.size() != 1) return false;
+    unsigned char c = static_cast<unsigned char>(key[0]);
+    return n->has_leaf_entry(c);
 }
 
 TKTRIE_TEMPLATE

@@ -252,6 +252,33 @@ public:
         return n;
     }
     
+    // Sorted insert - returns insertion position
+    int add_sorted(unsigned char c) noexcept {
+        uint64_t d = data_.load();
+        int n = static_cast<int>((d >> 56) & 0xFF);
+        [[assume(n >= 0 && n < 7)]];
+        
+        // Find insertion point (linear search, n <= 6)
+        int pos = 0;
+        while (pos < n && static_cast<unsigned char>((d >> (pos * 8)) & 0xFF) < c) ++pos;
+        
+        // Shift elements from pos..n-1 up to pos+1..n
+        for (int i = n; i > pos; --i) {
+            unsigned char ch = static_cast<unsigned char>((d >> ((i - 1) * 8)) & 0xFF);
+            d &= ~(0xFFULL << (i * 8));
+            d |= (static_cast<uint64_t>(ch) << (i * 8));
+        }
+        
+        // Insert new char at pos
+        d &= ~(0xFFULL << (pos * 8));
+        d |= (static_cast<uint64_t>(c) << (pos * 8));
+        
+        // Update count
+        d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(n + 1) << 56);
+        data_.store(d);
+        return pos;
+    }
+    
     void remove_at(int idx) noexcept {
         uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
