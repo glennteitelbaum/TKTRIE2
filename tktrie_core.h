@@ -446,39 +446,21 @@ TKTRIE_CLASS::tktrie() : root_(nullptr) {
 
 TKTRIE_TEMPLATE
 TKTRIE_CLASS::~tktrie() {
+    ptr_t r = root_.load();
+    root_.store(nullptr);
+    if (r && !builder_t::is_sentinel(r)) {
+        builder_.dealloc_node(r);
+    }
     if constexpr (THREADED) {
-        // Loop until root stays null - handles writers that sneak in
-        while (true) {
-            ptr_t tree_to_delete = nullptr;
-            {
-                std::lock_guard<mutex_t> lock(mutex_);
-                tree_to_delete = root_.exchange(nullptr);
-                
-                // Drain retired list while holding lock
-                std::lock_guard<std::mutex> ebr_lock(ebr_mutex_);
-                retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
-                retired_count_.store(0, std::memory_order_relaxed);
-                while (list) {
-                    retire_entry_t* curr = list;
-                    list = list->next;
-                    node_deleter(curr->node);
-                    delete curr;
-                }
-            }
-            // Delete tree outside lock (can be slow)
-            if (tree_to_delete && !builder_t::is_sentinel(tree_to_delete)) {
-                builder_.dealloc_node(tree_to_delete);
-            } else {
-                // Root was already null and stayed null - we're done
-                break;
-            }
-        }
-    } else {
-        // Non-threaded: just delete
-        ptr_t r = root_.load();
-        root_.store(nullptr);
-        if (r && !builder_t::is_sentinel(r)) {
-            builder_.dealloc_node(r);
+        // Drain retired list
+        std::lock_guard<std::mutex> lock(ebr_mutex_);
+        retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
+        retired_count_.store(0, std::memory_order_relaxed);
+        while (list) {
+            retire_entry_t* curr = list;
+            list = list->next;
+            node_deleter(curr->node);
+            delete curr;
         }
     }
 }
