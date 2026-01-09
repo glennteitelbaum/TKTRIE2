@@ -252,44 +252,23 @@ struct trie_ops {
         
         // Copy existing entries and add new one - dispatch to correct dst type
         if constexpr (MAX == BINARY_MAX) {
-            if constexpr (IS_LEAF) {
-                auto* dst = dst_base->template as_list<true>();
-                copy_entries<IS_LEAF>(src, dst);
-                dst->add_value(c, entry);
-                dst->update_capacity_flags();
-            } else {
-                auto* dst = dst_base->template as_list<false>();
-                copy_entries<IS_LEAF>(src, dst);
-                copy_eos_to(src, dst_base);
-                dst->add_child(c, entry);
-                dst->update_capacity_flags();
-            }
+            auto* dst = dst_base->template as_list<IS_LEAF>();
+            copy_entries<IS_LEAF>(src, dst);
+            if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
+            add_entry_to<IS_LEAF>(dst, c, entry);
+            dst->update_capacity_flags();
         } else if constexpr (MAX == LIST_MAX) {
-            if constexpr (IS_LEAF) {
-                auto* dst = dst_base->template as_pop<true>();
-                copy_entries<IS_LEAF>(src, dst);
-                dst->add_value(c, entry);
-                dst->update_capacity_flags();
-            } else {
-                auto* dst = dst_base->template as_pop<false>();
-                copy_entries<IS_LEAF>(src, dst);
-                copy_eos_to(src, dst_base);
-                dst->add_child(c, entry);
-                dst->update_capacity_flags();
-            }
+            auto* dst = dst_base->template as_pop<IS_LEAF>();
+            copy_entries<IS_LEAF>(src, dst);
+            if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
+            add_entry_to<IS_LEAF>(dst, c, entry);
+            dst->update_capacity_flags();
         } else if constexpr (MAX == POP_MAX) {
-            if constexpr (IS_LEAF) {
-                auto* dst = dst_base->template as_full<true>();
-                copy_entries<IS_LEAF>(src, dst);
-                dst->add_value(c, entry);
-                dst->update_capacity_flags();
-            } else {
-                auto* dst = dst_base->template as_full<false>();
-                copy_entries<IS_LEAF>(src, dst);
-                copy_eos_to(src, dst_base);
-                dst->add_child(c, entry);
-                dst->update_capacity_flags();
-            }
+            auto* dst = dst_base->template as_full<IS_LEAF>();
+            copy_entries<IS_LEAF>(src, dst);
+            if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
+            add_entry_to<IS_LEAF>(dst, c, entry);
+            dst->update_capacity_flags();
         }
         
         // Handle SPEC vs NON-SPEC
@@ -319,22 +298,13 @@ struct trie_ops {
         // Hierarchical dispatch: 2 levels for better branch prediction
         if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
             if ((h & FLAG_BINARY) != 0) [[likely]] {
-                if constexpr (IS_LEAF)
-                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_binary<true>(), c, entry, builder, alloc);
-                else
-                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_binary<false>(), c, entry, builder, alloc);
+                return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_binary<IS_LEAF>(), c, entry, builder, alloc);
             } else {
-                if constexpr (IS_LEAF)
-                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_list<true>(), c, entry, builder, alloc);
-                else
-                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_list<false>(), c, entry, builder, alloc);
+                return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_list<IS_LEAF>(), c, entry, builder, alloc);
             }
         } else {
             if ((h & FLAG_POP) != 0) [[likely]] {
-                if constexpr (IS_LEAF)
-                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_pop<true>(), c, entry, builder, alloc);
-                else
-                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_pop<false>(), c, entry, builder, alloc);
+                return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_pop<IS_LEAF>(), c, entry, builder, alloc);
             } else {
                 // FULL can't upgrade - return failure
                 result res;
@@ -358,27 +328,15 @@ struct trie_ops {
         // Hierarchical dispatch: 2 levels for better branch prediction
         if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
             if ((h & FLAG_BINARY) != 0) [[likely]] {
-                if constexpr (IS_LEAF)
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_binary<true>(), c, entry, builder, alloc);
-                else
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_binary<false>(), c, entry, builder, alloc);
+                return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_binary<IS_LEAF>(), c, entry, builder, alloc);
             } else {
-                if constexpr (IS_LEAF)
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_list<true>(), c, entry, builder, alloc);
-                else
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_list<false>(), c, entry, builder, alloc);
+                return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_list<IS_LEAF>(), c, entry, builder, alloc);
             }
         } else {
             if ((h & FLAG_POP) != 0) [[likely]] {
-                if constexpr (IS_LEAF)
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_pop<true>(), c, entry, builder, alloc);
-                else
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_pop<false>(), c, entry, builder, alloc);
+                return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_pop<IS_LEAF>(), c, entry, builder, alloc);
             } else {
-                if constexpr (IS_LEAF)
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_full<true>(), c, entry, builder, alloc);
-                else
-                    return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_full<false>(), c, entry, builder, alloc);
+                return add_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_full<IS_LEAF>(), c, entry, builder, alloc);
             }
         }
     }
@@ -425,38 +383,20 @@ struct trie_ops {
         
         // Copy entries except removed one - dispatch to correct dst type
         if constexpr (MAX == LIST_MAX) {
-            if constexpr (IS_LEAF) {
-                auto* dst = dst_base->template as_binary<true>();
-                copy_entries_except<IS_LEAF>(src, dst, removed_c);
-                dst->update_capacity_flags();
-            } else {
-                auto* dst = dst_base->template as_binary<false>();
-                copy_entries_except<IS_LEAF>(src, dst, removed_c);
-                copy_eos_to(src, dst_base);
-                dst->update_capacity_flags();
-            }
+            auto* dst = dst_base->template as_binary<IS_LEAF>();
+            copy_entries_except<IS_LEAF>(src, dst, removed_c);
+            if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
+            dst->update_capacity_flags();
         } else if constexpr (MAX == POP_MAX) {
-            if constexpr (IS_LEAF) {
-                auto* dst = dst_base->template as_list<true>();
-                copy_entries_except<IS_LEAF>(src, dst, removed_c);
-                dst->update_capacity_flags();
-            } else {
-                auto* dst = dst_base->template as_list<false>();
-                copy_entries_except<IS_LEAF>(src, dst, removed_c);
-                copy_eos_to(src, dst_base);
-                dst->update_capacity_flags();
-            }
+            auto* dst = dst_base->template as_list<IS_LEAF>();
+            copy_entries_except<IS_LEAF>(src, dst, removed_c);
+            if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
+            dst->update_capacity_flags();
         } else if constexpr (MAX == 256) {
-            if constexpr (IS_LEAF) {
-                auto* dst = dst_base->template as_pop<true>();
-                copy_entries_except<IS_LEAF>(src, dst, removed_c);
-                dst->update_capacity_flags();
-            } else {
-                auto* dst = dst_base->template as_pop<false>();
-                copy_entries_except<IS_LEAF>(src, dst, removed_c);
-                copy_eos_to(src, dst_base);
-                dst->update_capacity_flags();
-            }
+            auto* dst = dst_base->template as_pop<IS_LEAF>();
+            copy_entries_except<IS_LEAF>(src, dst, removed_c);
+            if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
+            dst->update_capacity_flags();
         }
         
         if constexpr (SPECULATIVE) {
@@ -483,27 +423,15 @@ struct trie_ops {
         
         if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
             if ((h & FLAG_BINARY) != 0) [[likely]] {
-                if constexpr (IS_LEAF)
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_binary<true>(), c, builder, alloc);
-                else
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_binary<false>(), c, builder, alloc);
+                return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_binary<IS_LEAF>(), c, builder, alloc);
             } else {
-                if constexpr (IS_LEAF)
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_list<true>(), c, builder, alloc);
-                else
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_list<false>(), c, builder, alloc);
+                return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_list<IS_LEAF>(), c, builder, alloc);
             }
         } else {
             if ((h & FLAG_POP) != 0) [[likely]] {
-                if constexpr (IS_LEAF)
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_pop<true>(), c, builder, alloc);
-                else
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_pop<false>(), c, builder, alloc);
+                return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_pop<IS_LEAF>(), c, builder, alloc);
             } else {
-                if constexpr (IS_LEAF)
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_full<true>(), c, builder, alloc);
-                else
-                    return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_full<false>(), c, builder, alloc);
+                return remove_entry_typed<SPECULATIVE, IS_LEAF>(node, node->template as_full<IS_LEAF>(), c, builder, alloc);
             }
         }
     }
