@@ -91,14 +91,11 @@ struct trie_ops {
     template <bool IS_LEAF, int SRC_MAX>
     static ptr_t make_upgraded(std::string_view skip, builder_t& builder) {
         if constexpr (SRC_MAX == BINARY_MAX) {
-            if constexpr (IS_LEAF) return builder.make_leaf_list(skip);
-            else return builder.make_interior_list(skip);
+            return builder.template make_list<IS_LEAF>(skip);
         } else if constexpr (SRC_MAX == LIST_MAX) {
-            if constexpr (IS_LEAF) return builder.make_leaf_pop(skip);
-            else return builder.make_interior_pop(skip);
+            return builder.template make_pop<IS_LEAF>(skip);
         } else if constexpr (SRC_MAX == POP_MAX) {
-            if constexpr (IS_LEAF) return builder.make_leaf_full(skip);
-            else return builder.make_interior_full(skip);
+            return builder.template make_full<IS_LEAF>(skip);
         } else {
             return nullptr;  // FULL can't upgrade
         }
@@ -110,14 +107,11 @@ struct trie_ops {
     template <bool IS_LEAF, int SRC_MAX>
     static ptr_t make_downgraded(std::string_view skip, builder_t& builder) {
         if constexpr (SRC_MAX == LIST_MAX) {
-            if constexpr (IS_LEAF) return builder.make_leaf_binary(skip);
-            else return builder.make_interior_binary(skip);
+            return builder.template make_binary<IS_LEAF>(skip);
         } else if constexpr (SRC_MAX == POP_MAX) {
-            if constexpr (IS_LEAF) return builder.make_leaf_list(skip);
-            else return builder.make_interior_list(skip);
+            return builder.template make_list<IS_LEAF>(skip);
         } else if constexpr (SRC_MAX == 256) {
-            if constexpr (IS_LEAF) return builder.make_leaf_pop(skip);
-            else return builder.make_interior_pop(skip);
+            return builder.template make_pop<IS_LEAF>(skip);
         } else {
             return nullptr;  // BINARY can't downgrade (becomes SKIP)
         }

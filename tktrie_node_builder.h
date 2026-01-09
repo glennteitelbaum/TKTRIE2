@@ -166,6 +166,31 @@ public:
         return n;
     }
     
+    // Templated versions - IS_LEAF selects leaf vs interior
+    template <bool IS_LEAF>
+    ptr_t make_binary(std::string_view sk) {
+        if constexpr (IS_LEAF) return make_leaf_binary(sk);
+        else return make_interior_binary(sk);
+    }
+    
+    template <bool IS_LEAF>
+    ptr_t make_list(std::string_view sk) {
+        if constexpr (IS_LEAF) return make_leaf_list(sk);
+        else return make_interior_list(sk);
+    }
+    
+    template <bool IS_LEAF>
+    ptr_t make_pop(std::string_view sk) {
+        if constexpr (IS_LEAF) return make_leaf_pop(sk);
+        else return make_interior_pop(sk);
+    }
+    
+    template <bool IS_LEAF>
+    ptr_t make_full(std::string_view sk) {
+        if constexpr (IS_LEAF) return make_leaf_full(sk);
+        else return make_interior_full(sk);
+    }
+    
     void dealloc_node(ptr_t n) {
         if (!n || is_sentinel(n)) return;
         
