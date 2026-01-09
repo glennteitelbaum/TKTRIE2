@@ -88,6 +88,18 @@ struct atomic_node_ptr {
     atomic_node_ptr() noexcept : ptr_(nullptr) {}
     explicit atomic_node_ptr(ptr_t p) noexcept : ptr_(p) {}
     
+    // Copy/move for use in generic shift operations
+    atomic_node_ptr(const atomic_node_ptr& other) noexcept : ptr_(other.ptr_.load(std::memory_order_acquire)) {}
+    atomic_node_ptr& operator=(const atomic_node_ptr& other) noexcept {
+        ptr_.store(other.ptr_.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    atomic_node_ptr(atomic_node_ptr&& other) noexcept : ptr_(other.ptr_.exchange(nullptr, std::memory_order_acq_rel)) {}
+    atomic_node_ptr& operator=(atomic_node_ptr&& other) noexcept {
+        ptr_.store(other.ptr_.exchange(nullptr, std::memory_order_acq_rel), std::memory_order_release);
+        return *this;
+    }
+    
     ptr_t load() const noexcept { return ptr_.load(std::memory_order_acquire); }
     void store(ptr_t p) noexcept { ptr_.store(p, std::memory_order_release); }
     ptr_t exchange(ptr_t p) noexcept { return ptr_.exchange(p, std::memory_order_acq_rel); }
@@ -249,10 +261,10 @@ struct node_base {
             return false;
         } else {
             if (!eos_flag()) return false;  // Fast path: check flag first
-            if (is_binary()) return as_binary<false>()->eos.try_read(out);
-            if (is_list()) [[likely]] return as_list<false>()->eos.try_read(out);
-            if (is_pop()) return as_pop<false>()->eos.try_read(out);
-            return as_full<false>()->eos.try_read(out);
+            if (is_binary()) return as_binary<false>()->eos().try_read(out);
+            if (is_list()) [[likely]] return as_list<false>()->eos().try_read(out);
+            if (is_pop()) return as_pop<false>()->eos().try_read(out);
+            return as_full<false>()->eos().try_read(out);
         }
     }
     
@@ -260,10 +272,10 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             (void)value;
         } else {
-            if (is_binary()) as_binary<false>()->eos.set(value);
-            else if (is_list()) [[likely]] as_list<false>()->eos.set(value);
-            else if (is_pop()) as_pop<false>()->eos.set(value);
-            else as_full<false>()->eos.set(value);
+            if (is_binary()) as_binary<false>()->eos().set(value);
+            else if (is_list()) [[likely]] as_list<false>()->eos().set(value);
+            else if (is_pop()) as_pop<false>()->eos().set(value);
+            else as_full<false>()->eos().set(value);
             set_eos_flag();  // Update header flag
         }
     }
@@ -272,10 +284,10 @@ struct node_base {
         if constexpr (FIXED_LEN > 0) {
             // No EOS for fixed-length keys
         } else {
-            if (is_binary()) as_binary<false>()->eos.clear();
-            else if (is_list()) [[likely]] as_list<false>()->eos.clear();
-            else if (is_pop()) as_pop<false>()->eos.clear();
-            else as_full<false>()->eos.clear();
+            if (is_binary()) as_binary<false>()->eos().clear();
+            else if (is_list()) [[likely]] as_list<false>()->eos().clear();
+            else if (is_pop()) as_pop<false>()->eos().clear();
+            else as_full<false>()->eos().clear();
             clear_eos_flag();  // Update header flag
         }
     }

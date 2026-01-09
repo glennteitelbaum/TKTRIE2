@@ -196,9 +196,9 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         
         // Convert BINARY to SKIP when count goes from 2 to 1
         int idx = bn->find(c);
-        unsigned char other_c = bn->chars[1 - idx];
+        unsigned char other_c = bn->char_at(1 - idx);
         T other_val;
-        bn->values[1 - idx].try_read(other_val);
+        bn->value_at(1 - idx).try_read(other_val);
         
         // Build new skip string: existing skip + other_c
         std::string new_skip_str(leaf->skip_str());
@@ -231,11 +231,11 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
             auto* new_bn = bn->template as_binary<true>();
             int src_idx = 0;
             for (int i = 0; i < 7; ++i) {
-                unsigned char ch = ln->chars.char_at(i);
+                unsigned char ch = ln->char_at(i);
                 if (i >= count) break;
                 if (ch == c) continue;
                 T val{};
-                ln->values[i].try_read(val);
+                ln->value_at(i).try_read(val);
                 new_bn->add_entry(ch, val);
                 ++src_idx;
             }
@@ -263,7 +263,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         if (count == 8) {
             ptr_t ln = builder_.make_leaf_list(leaf->skip_str());
             auto* new_ln = ln->template as_list<true>();
-            pn->valid.for_each_set([&](unsigned char ch) {
+            pn->valid().for_each_set([&](unsigned char ch) {
                 if (ch == c) return;
                 T val{};
                 pn->read_value(ch, val);
@@ -292,7 +292,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (count == 33) {
         ptr_t pn = builder_.make_leaf_pop(leaf->skip_str());
         auto* new_pn = pn->template as_pop<true>();
-        fn->valid.for_each_set([&](unsigned char ch) {
+        fn->valid().for_each_set([&](unsigned char ch) {
             if (ch == c) return;
             T val{};
             fn->read_value(ch, val);
@@ -381,16 +381,16 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
         child = bn->child_at_slot(0);
     } else if (n->is_list()) {
         auto* ln = n->template as_list<false>();
-        c = ln->chars.char_at(0);
-        child = ln->children[0].load();
+        c = ln->char_at(0);
+        child = ln->child_at_slot(0);
     } else if (n->is_pop()) {
         auto* pn = n->template as_pop<false>();
         c = pn->first_char();
         child = pn->child_at_slot(0);
     } else if (n->is_full()) {
         auto* fn = n->template as_full<false>();
-        c = fn->valid.first();
-        child = fn->children[c].load();
+        c = fn->valid().first();
+        child = fn->get_child(c);
     }
     if (!child || builder_t::is_sentinel(child)) return res;
 
@@ -448,16 +448,16 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
                 ptr_t new_bn = builder_.make_interior_binary(n->skip_str());
                 auto* dest = new_bn->template as_binary<false>();
                 for (int i = 0; i < ln->count(); ++i) {
-                    unsigned char ch = ln->chars.char_at(i);
+                    unsigned char ch = ln->char_at(i);
                     if (ch == removed_c) continue;
-                    dest->add_child(ch, ln->children[i].load());
-                    ln->children[i].store(nullptr);
+                    dest->add_child(ch, ln->child_at_slot(i));
+                    ln->child_slot_at(i)->store(nullptr);
                 }
                 if constexpr (FIXED_LEN == 0) {
                     if (eos_exists) {
                         T val{};
                         n->try_read_eos(val);
-                        dest->eos.set(val);
+                        dest->eos().set(val);
                         new_bn->set_eos_flag();  // Update header flag
                     }
                 }
@@ -487,17 +487,18 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
             if (total_remaining <= 7) {
                 ptr_t new_ln = builder_.make_interior_list(n->skip_str());
                 auto* dest = new_ln->template as_list<false>();
-                pn->valid.for_each_set([&](unsigned char ch) {
-                    if (ch == removed_c) return;
-                    int slot = pn->slot_for(ch);
-                    dest->add_child(ch, pn->children[slot].load());
-                    pn->children[slot].store(nullptr);
+                int slot = 0;
+                pn->valid().for_each_set([&](unsigned char ch) {
+                    if (ch == removed_c) { ++slot; return; }
+                    dest->add_child(ch, pn->child_at_slot(slot));
+                    pn->child_slot_at(slot)->store(nullptr);
+                    ++slot;
                 });
                 if constexpr (FIXED_LEN == 0) {
                     if (eos_exists) {
                         T val{};
                         n->try_read_eos(val);
-                        dest->eos.set(val);
+                        dest->eos().set(val);
                         new_ln->set_eos_flag();  // Update header flag
                     }
                 }
@@ -517,16 +518,16 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
             if (total_remaining <= POP_MAX) {
                 ptr_t new_pn = builder_.make_interior_pop(n->skip_str());
                 auto* dest = new_pn->template as_pop<false>();
-                fn->valid.for_each_set([&](unsigned char ch) {
+                fn->valid().for_each_set([&](unsigned char ch) {
                     if (ch == removed_c) return;
-                    dest->add_child(ch, fn->children[ch].load());
-                    fn->children[ch].store(nullptr);
+                    dest->add_child(ch, fn->get_child(ch));
+                    fn->get_child_slot(ch)->store(nullptr);
                 });
                 if constexpr (FIXED_LEN == 0) {
                     if (eos_exists) {
                         T val{};
                         n->try_read_eos(val);
-                        dest->eos.set(val);
+                        dest->eos().set(val);
                         new_pn->set_eos_flag();  // Update header flag
                     }
                 }
@@ -554,8 +555,8 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         } else if (n->is_list()) {
             auto* ln = n->template as_list<false>();
-            c = ln->chars.char_at(0);
-            child = ln->children[0].load();
+            c = ln->char_at(0);
+            child = ln->child_at_slot(0);
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         } else if (n->is_pop()) {
             auto* pn = n->template as_pop<false>();
@@ -564,8 +565,8 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         } else if (n->is_full()) {
             auto* fn = n->template as_full<false>();
-            c = fn->valid.first();
-            child = fn->children[c].load();
+            c = fn->valid().first();
+            child = fn->get_child(c);
             can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
         }
     }

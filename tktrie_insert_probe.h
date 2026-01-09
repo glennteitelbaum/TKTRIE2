@@ -345,8 +345,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         auto* dst = list->template as_list<true>();
         for (int i = 0; i < src->count(); ++i) {
             T val{};
-            src->values[i].try_read(val);
-            dst->add_value(src->chars[i], val);
+            src->value_at(i).try_read(val);
+            dst->add_value(src->char_at(i), val);
         }
         dst->add_value(info.c, value);
         dst->update_capacity_flags();
@@ -362,9 +362,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         auto* src = info.target->template as_list<true>();
         auto* dst = pop->template as_pop<true>();
         for (int i = 0; i < src->count(); ++i) {
-            unsigned char ch = src->chars.char_at(i);
+            unsigned char ch = src->char_at(i);
             T val{};
-            src->values[i].try_read(val);
+            src->value_at(i).try_read(val);
             dst->add_value(ch, val);
         }
         dst->add_value(info.c, value);
@@ -381,9 +381,9 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         auto* src = info.target->template as_pop<true>();
         auto* dst = full->template as_full<true>();
         int slot = 0;
-        src->valid.for_each_set([src, dst, &slot](unsigned char ch) {
+        src->valid().for_each_set([src, dst, &slot](unsigned char ch) {
             T val{};
-            src->values[slot].try_read(val);
+            src->element_at_slot(slot).try_read(val);
             dst->add_value(ch, val);
             ++slot;
         });
@@ -487,12 +487,12 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         auto* src = info.target->template as_binary<false>();
         auto* dst = list->template as_list<false>();
         for (int i = 0; i < src->count(); ++i) {
-            dst->add_child(src->chars[i], src->children[i].load());
+            dst->add_child(src->char_at(i), src->child_at_slot(i));
         }
         if constexpr (FIXED_LEN == 0) {
             T eos_val;
-            if (src->eos.try_read(eos_val)) {
-                dst->eos.set(eos_val);
+            if (src->eos().try_read(eos_val)) {
+                dst->eos().set(eos_val);
                 list->set_eos_flag();  // Update header flag
             }
         }
@@ -514,13 +514,13 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         auto* src = info.target->template as_list<false>();
         auto* dst = pop->template as_pop<false>();
         for (int i = 0; i < src->count(); ++i) {
-            unsigned char ch = src->chars.char_at(i);
-            dst->add_child(ch, src->children[i].load());
+            unsigned char ch = src->char_at(i);
+            dst->add_child(ch, src->child_at_slot(i));
         }
         if constexpr (FIXED_LEN == 0) {
             T eos_val;
-            if (src->eos.try_read(eos_val)) {
-                dst->eos.set(eos_val);
+            if (src->eos().try_read(eos_val)) {
+                dst->eos().set(eos_val);
                 pop->set_eos_flag();  // Update header flag
             }
         }
@@ -542,8 +542,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         info.target->template as_pop<false>()->copy_children_to_full(full->template as_full<false>());
         if constexpr (FIXED_LEN == 0) {
             T eos_val;
-            if (info.target->template as_pop<false>()->eos.try_read(eos_val)) {
-                full->template as_full<false>()->eos.set(eos_val);
+            if (info.target->template as_pop<false>()->eos().try_read(eos_val)) {
+                full->template as_full<false>()->eos().set(eos_val);
                 full->set_eos_flag();  // Update header flag
             }
         }

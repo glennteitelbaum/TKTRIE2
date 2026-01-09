@@ -209,7 +209,7 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
             auto* bn = n->template as_binary<true>();
             int idx = bn->find(c);
             if (idx < 0) return false;
-            return bn->values[idx].try_read(out);
+            return bn->read_value(idx, out);
         }
         if (h & FLAG_LIST) {
             auto* ln = n->template as_list<true>();
@@ -346,7 +346,7 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
             auto* bn = n->template as_binary<true>();
             int idx = bn->find(c);
             if (idx < 0) return false;
-            return bn->values[idx].try_read(out);
+            return bn->read_value(idx, out);
         }
         if (h & FLAG_LIST) {
             auto* ln = n->template as_list<true>();

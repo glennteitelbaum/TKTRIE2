@@ -118,16 +118,16 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
                 child = bn->child_at_slot(0);
             } else if (n->is_list()) {
                 auto* ln = n->template as_list<false>();
-                c = ln->chars.char_at(0);
-                child = ln->children[0].load();
+                c = ln->char_at(0);
+                child = ln->child_at_slot(0);
             } else if (n->is_pop()) {
                 auto* pn = n->template as_pop<false>();
                 c = pn->first_char();
                 child = pn->child_at_slot(0);
             } else {
                 auto* fn = n->template as_full<false>();
-                c = fn->valid.first();
-                child = fn->children[c].load();
+                c = fn->valid().first();
+                child = fn->get_child(c);
             }
             if (child && !builder_t::is_sentinel(child) && !child->is_poisoned()) {
                 info.collapse_child = child;
@@ -213,9 +213,9 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
         auto* bn = info.target->template as_binary<true>();
         int idx = bn->find(info.c);
         int other_idx = 1 - idx;  // The other entry (0 or 1)
-        unsigned char other_c = bn->chars[other_idx];
+        unsigned char other_c = bn->char_at(other_idx);
         T other_val{};
-        bn->values[other_idx].try_read(other_val);
+        bn->value_at(other_idx).try_read(other_val);
         
         // New skip = old skip + remaining char
         std::string new_skip_str(info.target_skip);

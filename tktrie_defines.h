@@ -346,6 +346,21 @@ public:
                std::popcount(load_word(2)) + std::popcount(load_word(3));
     }
     
+    // Get slot index for character c using popcount (branch-free)
+    // Used by POP nodes for compacted array indexing
+    int slot_for(unsigned char c) const noexcept {
+        int w = c >> 6;
+        uint64_t mask = (1ULL << (c & 63)) - 1;
+        
+        int s0 = std::popcount(load_word(w) & mask);
+        int s1 = s0 + std::popcount(load_word(0));
+        int s2 = s1 + std::popcount(load_word(1));
+        int s3 = s2 + std::popcount(load_word(2));
+        
+        std::array<int, 4> cumulative = {s0, s1, s2, s3};
+        return cumulative[w];
+    }
+    
     unsigned char first() const noexcept {
         for (int w = 0; w < 4; ++w) {
             uint64_t bits = load_word(w);
@@ -366,6 +381,37 @@ public:
                 bits &= bits - 1;
             }
         }
+    }
+    
+    // =========================================================================
+    // Array shift helpers for POP node operations
+    // =========================================================================
+    
+    // Shift array elements up to make room for insert at slot position
+    // Returns slot where new element should be placed
+    // Caller must: 1) set arr[slot] to new value, 2) call set(c)
+    template <typename Array>
+    int shift_up_for_insert(unsigned char c, Array& arr, int current_count) noexcept {
+        int slot = slot_for(c);
+        for (int i = current_count; i > slot; --i) {
+            arr[i] = std::move(arr[i - 1]);
+        }
+        return slot;
+    }
+    
+    // Clear bit and shift array elements down after removal
+    // Clears arr[new_count] after shifting
+    // Returns new count after removal
+    template <typename Array, typename ClearFn>
+    int shift_down_for_remove(unsigned char c, Array& arr, ClearFn&& clear_fn) noexcept {
+        int slot = slot_for(c);
+        clear(c);
+        int new_count = count();
+        for (int i = slot; i < new_count; ++i) {
+            arr[i] = std::move(arr[i + 1]);
+        }
+        clear_fn(arr[new_count]);
+        return new_count;
     }
     
     // Legacy atomic_ methods - now just aliases since base operations are already atomic when THREADED

@@ -180,24 +180,24 @@ public:
                 auto* bn = n->template as_binary<false>();
                 int cnt = bn->count();
                 for (int i = 0; i < cnt; ++i) {
-                    dealloc_node(bn->children[i].load());
+                    dealloc_node(bn->child_at_slot(i));
                 }
             } else if (n->is_list()) [[likely]] {
                 auto* ln = n->template as_list<false>();
                 int cnt = ln->count();
                 for (int i = 0; i < cnt; ++i) {
-                    dealloc_node(ln->children[i].load());
+                    dealloc_node(ln->child_at_slot(i));
                 }
             } else if (n->is_pop()) {
                 auto* pn = n->template as_pop<false>();
                 int cnt = pn->count();
                 for (int i = 0; i < cnt; ++i) {
-                    dealloc_node(pn->children[i].load());
+                    dealloc_node(pn->child_at_slot(i));
                 }
             } else {
                 auto* fn = n->template as_full<false>();
-                fn->valid.for_each_set([this, fn](unsigned char c) {
-                    dealloc_node(fn->children[c].load());
+                fn->valid().for_each_set([this, fn](unsigned char c) {
+                    dealloc_node(fn->get_child(c));
                 });
             }
         }
@@ -248,18 +248,18 @@ public:
             return d;
         }
         
-        // Interior
+        // Interior - copy structure then recursively deep_copy children
         if (src->is_binary()) {
             auto* s = src->template as_binary<false>();
             auto* d = new interior_binary_t();
             d->set_header(s->header());
             d->skip = s->skip;
-            if constexpr (FIXED_LEN == 0) {
-                d->eos.deep_copy_from(s->eos);
-            }
-            s->copy_children_to(d);
-            for (int i = 0; i < d->count_; ++i) {
-                d->children[i].store(deep_copy(d->children[i].load()));
+            s->copy_interior_to(d);
+            // Now deep copy children in place
+            int cnt = d->count();
+            for (int i = 0; i < cnt; ++i) {
+                ptr_t child = d->child_at_slot(i);
+                d->get_child_slot(d->char_at(i))->store(deep_copy(child));
             }
             return d;
         }
@@ -268,13 +268,11 @@ public:
             auto* d = new interior_list_t();
             d->set_header(s->header());
             d->skip = s->skip;
-            d->chars = s->chars;
-            if constexpr (FIXED_LEN == 0) {
-                d->eos.deep_copy_from(s->eos);
-            }
-            int cnt = s->count();
+            s->copy_interior_to(d);
+            int cnt = d->count();
             for (int i = 0; i < cnt; ++i) {
-                d->children[i].store(deep_copy(s->children[i].load()));
+                ptr_t child = d->child_at_slot(i);
+                d->get_child_slot(d->char_at(i))->store(deep_copy(child));
             }
             return d;
         }
@@ -283,26 +281,28 @@ public:
             auto* d = new interior_pop_t();
             d->set_header(s->header());
             d->skip = s->skip;
-            d->valid = s->valid;
-            if constexpr (FIXED_LEN == 0) {
-                d->eos.deep_copy_from(s->eos);
-            }
-            int cnt = s->count();
+            s->copy_interior_to(d);
+            int cnt = d->count();
             for (int i = 0; i < cnt; ++i) {
-                d->children[i].store(deep_copy(s->children[i].load()));
+                ptr_t child = d->child_at_slot(i);
+                // For POP, we need to iterate the valid bitmap to get char
+                // but since children are stored sequentially, just update in place
             }
+            // For POP/FULL, iterate via bitmap
+            d->valid().for_each_set([this, d](unsigned char c) {
+                ptr_t child = d->get_child(c);
+                d->get_child_slot(c)->store(deep_copy(child));
+            });
             return d;
         }
         auto* s = src->template as_full<false>();
         auto* d = new interior_full_t();
         d->set_header(s->header());
         d->skip = s->skip;
-        d->valid = s->valid;
-        if constexpr (FIXED_LEN == 0) {
-            d->eos.deep_copy_from(s->eos);
-        }
-        s->valid.for_each_set([this, s, d](unsigned char c) {
-            d->children[c].store(deep_copy(s->children[c].load()));
+        s->copy_interior_to(d);
+        d->valid().for_each_set([this, d](unsigned char c) {
+            ptr_t child = d->get_child(c);
+            d->get_child_slot(c)->store(deep_copy(child));
         });
         return d;
     }
