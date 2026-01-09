@@ -306,6 +306,44 @@ struct trie_ops {
     }
     
     // =========================================================================
+    // UPGRADE WRAPPER - Dispatches to typed upgrade based on node type
+    // =========================================================================
+    template <bool SPECULATIVE, bool IS_LEAF, typename Alloc = void>
+    static result upgrade(
+        ptr_t node, unsigned char c,
+        entry_t<T, ptr_t, IS_LEAF> entry,
+        builder_t& builder, [[maybe_unused]] Alloc* alloc = nullptr)
+    {
+        uint64_t h = node->header();
+        
+        // Hierarchical dispatch: 2 levels for better branch prediction
+        if ((h & (FLAG_BINARY | FLAG_LIST)) != 0) [[likely]] {
+            if ((h & FLAG_BINARY) != 0) [[likely]] {
+                if constexpr (IS_LEAF)
+                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_binary<true>(), c, entry, builder, alloc);
+                else
+                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_binary<false>(), c, entry, builder, alloc);
+            } else {
+                if constexpr (IS_LEAF)
+                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_list<true>(), c, entry, builder, alloc);
+                else
+                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_list<false>(), c, entry, builder, alloc);
+            }
+        } else {
+            if ((h & FLAG_POP) != 0) [[likely]] {
+                if constexpr (IS_LEAF)
+                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_pop<true>(), c, entry, builder, alloc);
+                else
+                    return upgrade<SPECULATIVE, IS_LEAF>(node, node->template as_pop<false>(), c, entry, builder, alloc);
+            } else {
+                // FULL can't upgrade - return failure
+                result res;
+                return res;
+            }
+        }
+    }
+    
+    // =========================================================================
     // ADD ENTRY - Unified in-place or upgrade for leaf and interior
     // Uses hierarchical 2-level dispatch
     // =========================================================================
