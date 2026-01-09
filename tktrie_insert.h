@@ -3,6 +3,8 @@
 // This file contains implementation details for tktrie (insert operations)
 // It should only be included from tktrie_core.h
 
+#include "tktrie_insert_helper.h"
+
 namespace gteitelbaum {
 
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
@@ -328,114 +330,14 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_char_to_leaf(
     ptr_t leaf, unsigned char c, const T& value) {
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
+    auto helper_res = ops::template add_entry<false, true>(leaf, c, value, builder_, static_cast<void*>(nullptr));
+    
     insert_result res;
-
-    // BINARY leaf: 2 entries, convert to LIST if adding 3rd
-    if (leaf->is_binary()) {
-        auto* bn = leaf->template as_binary<true>();
-        if (bn->has(c)) return res;  // exists
-
-        if (bn->count() < BINARY_MAX) {
-            leaf->bump_version();
-            bn->add_entry(c, value);
-            bn->update_capacity_flags();
-            res.in_place = true;
-            res.inserted = true;
-            return res;
-        }
-
-        // Convert BINARY → LIST (adding 3rd entry)
-        ptr_t list = builder_.make_leaf_list(leaf->skip_str());
-        auto* ln = list->template as_list<true>();
-        for (int i = 0; i < bn->count(); ++i) {
-            T val{};
-            bn->value_at(i).try_read(val);
-            ln->add_value(bn->char_at(i), val);
-        }
-        ln->add_value(c, value);
-        ln->update_capacity_flags();
-
-        res.new_node = list;
-        res.old_nodes.push_back(leaf);
-        res.inserted = true;
-        return res;
-    }
-
-    // LIST leaf: 3-7 entries, convert to POP if adding 8th
-    if (leaf->is_list()) {
-        auto* ln = leaf->template as_list<true>();
-        if (ln->has(c)) return res;
-
-        if (ln->count() < LIST_MAX) {
-            leaf->bump_version();
-            ln->add_value(c, value);
-            ln->update_capacity_flags();
-            res.in_place = true;
-            res.inserted = true;
-            return res;
-        }
-
-        // Convert LIST → POP (adding 8th entry)
-        ptr_t pop = builder_.make_leaf_pop(leaf->skip_str());
-        auto* pn = pop->template as_pop<true>();
-        [[assume(ln->count() == 7)]];  // Must be LIST_MAX to reach here
-        for (int i = 0; i < ln->count(); ++i) {
-            unsigned char ch = ln->char_at(i);
-            T val{};
-            ln->value_at(i).try_read(val);
-            pn->add_value(ch, val);
-        }
-        pn->add_value(c, value);
-        pn->update_capacity_flags();
-
-        res.new_node = pop;
-        res.old_nodes.push_back(leaf);
-        res.inserted = true;
-        return res;
-    }
-
-    // POP leaf: 8-32 entries, convert to FULL if adding 33rd
-    if (leaf->is_pop()) {
-        auto* pn = leaf->template as_pop<true>();
-        if (pn->has(c)) return res;
-
-        if (pn->count() < POP_MAX) {
-            leaf->bump_version();
-            pn->add_value(c, value);
-            pn->update_capacity_flags();
-            res.in_place = true;
-            res.inserted = true;
-            return res;
-        }
-
-        // Convert POP → FULL (adding 33rd entry)
-        ptr_t full = builder_.make_leaf_full(leaf->skip_str());
-        auto* fn = full->template as_full<true>();
-        [[assume(pn->count() == 32)]];  // Must be POP_MAX to reach here
-        int slot = 0;
-        pn->valid().for_each_set([pn, fn, &slot](unsigned char ch) {
-            T val{};
-            pn->element_at_slot(slot).try_read(val);
-            fn->add_value(ch, val);
-            ++slot;
-        });
-        fn->add_value(c, value);
-        fn->update_capacity_flags();
-
-        res.new_node = full;
-        res.old_nodes.push_back(leaf);
-        res.inserted = true;
-        return res;
-    }
-
-    // FULL leaf: 33+ entries
-    auto* fn = leaf->template as_full<true>();
-    if (fn->has(c)) return res;
-    leaf->bump_version();
-    fn->add_value_atomic(c, value);
-    fn->update_capacity_flags();
-    res.in_place = true;
-    res.inserted = true;
+    res.new_node = helper_res.new_node;
+    if (helper_res.old_node) res.old_nodes.push_back(helper_res.old_node);
+    res.inserted = helper_res.success;
+    res.in_place = helper_res.in_place;
     return res;
 }
 
@@ -725,121 +627,15 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::set_interior_eos(ptr_t n, con
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_child_to_interior(
     ptr_t n, unsigned char c, std::string_view remaining, const T& value) {
-    insert_result res;
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     ptr_t child = create_leaf_for_key(remaining, value);
-
-    if (n->is_binary()) {
-        auto* bn = n->template as_binary<false>();
-        if (bn->count() < BINARY_MAX) {
-            n->bump_version();
-            bn->add_child(c, child);
-            bn->update_capacity_flags();
-            res.in_place = true;
-            res.inserted = true;
-            return res;
-        }
-        // BINARY at capacity -> convert to LIST
-        ptr_t list = builder_.make_interior_list(n->skip_str());
-        auto* ln = list->template as_list<false>();
-        for (int i = 0; i < bn->count(); ++i) {
-            ln->add_child(bn->char_at(i), bn->child_at_slot(i));
-            bn->child_slot_at(i)->store(nullptr);
-        }
-        if constexpr (FIXED_LEN == 0) {
-            T eos_val;
-            if (bn->eos().try_read(eos_val)) {
-                ln->eos().set(eos_val);
-                list->set_eos_flag();  // Update header flag
-            }
-        }
-        ln->add_child(c, child);
-        ln->update_capacity_flags();
-        res.new_node = list;
-        res.old_nodes.push_back(n);
-        res.inserted = true;
-        return res;
-    }
-
-    if (n->is_list()) {
-        auto* ln = n->template as_list<false>();
-        if (ln->count() < LIST_MAX) {
-            n->bump_version();
-            ln->add_child(c, child);
-            ln->update_capacity_flags();
-            res.in_place = true;
-            res.inserted = true;
-            return res;
-        }
-        // LIST at capacity -> convert to POP
-        ptr_t pop = builder_.make_interior_pop(n->skip_str());
-        auto* pn = pop->template as_pop<false>();
-        // Copy children from list to pop
-        for (int i = 0; i < ln->count(); ++i) {
-            unsigned char ch = ln->char_at(i);
-            pn->add_child(ch, ln->child_at_slot(i));
-            ln->child_slot_at(i)->store(nullptr);
-        }
-        if constexpr (FIXED_LEN == 0) {
-            // Move EOS if present
-            T eos_val;
-            if (ln->eos().try_read(eos_val)) {
-                pn->eos().set(eos_val);
-                pop->set_eos_flag();  // Update header flag
-            }
-        }
-        pn->add_child(c, child);
-        pn->update_capacity_flags();
-        res.new_node = pop;
-        res.old_nodes.push_back(n);
-        res.inserted = true;
-        return res;
-    }
-
-    if (n->is_pop()) {
-        auto* pn = n->template as_pop<false>();
-        if (pn->count() < POP_MAX) {
-            n->bump_version();
-            pn->add_child(c, child);
-            pn->update_capacity_flags();
-            res.in_place = true;
-            res.inserted = true;
-            return res;
-        }
-        // POP at capacity -> convert to FULL
-        ptr_t full = builder_.make_interior_full(n->skip_str());
-        pn->move_children_to_full(full->template as_full<false>());
-        if constexpr (FIXED_LEN == 0) {
-            T eos_val;
-            if (pn->eos().try_read(eos_val)) {
-                full->template as_full<false>()->eos().set(eos_val);
-                full->set_eos_flag();  // Update header flag
-            }
-        }
-        full->template as_full<false>()->add_child(c, child);
-        full->template as_full<false>()->update_capacity_flags();
-        res.new_node = full;
-        res.old_nodes.push_back(n);
-        res.inserted = true;
-        return res;
-    }
-
-    if (n->is_full()) {
-        n->bump_version();
-        n->template as_full<false>()->add_child_atomic(c, child);
-        n->template as_full<false>()->update_capacity_flags();
-        res.in_place = true;
-        res.inserted = true;
-        return res;
-    }
-
-    // Shouldn't reach here for normal nodes, but handle gracefully
-    ptr_t binary = builder_.make_interior_binary(n->skip_str());
-    binary->template as_binary<false>()->add_child(c, child);
-    binary->template as_binary<false>()->update_capacity_flags();
-
-    res.new_node = binary;
-    res.old_nodes.push_back(n);
-    res.inserted = true;
+    auto helper_res = ops::template add_entry<false, false>(n, c, child, builder_, static_cast<void*>(nullptr));
+    
+    insert_result res;
+    res.new_node = helper_res.new_node;
+    if (helper_res.old_node) res.old_nodes.push_back(helper_res.old_node);
+    res.inserted = helper_res.success;
+    res.in_place = helper_res.in_place;
     return res;
 }
 

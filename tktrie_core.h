@@ -180,10 +180,10 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
                 } else {
                     if (!(h & FLAG_HAS_EOS)) return false;
                     // Dispatch to read EOS value
-                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos.try_read(out);
-                    if (h & FLAG_LIST) return n->template as_list<false>()->eos.try_read(out);
-                    if (h & FLAG_POP) return n->template as_pop<false>()->eos.try_read(out);
-                    return n->template as_full<false>()->eos.try_read(out);
+                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos().try_read(out);
+                    if (h & FLAG_LIST) return n->template as_list<false>()->eos().try_read(out);
+                    if (h & FLAG_POP) return n->template as_pop<false>()->eos().try_read(out);
+                    return n->template as_full<false>()->eos().try_read(out);
                 }
             }
             
@@ -318,10 +318,10 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
                     return false;
                 } else {
                     if (!(h & FLAG_HAS_EOS)) return false;
-                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos.try_read(out);
-                    if (h & FLAG_LIST) return n->template as_list<false>()->eos.try_read(out);
-                    if (h & FLAG_POP) return n->template as_pop<false>()->eos.try_read(out);
-                    return n->template as_full<false>()->eos.try_read(out);
+                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos().try_read(out);
+                    if (h & FLAG_LIST) return n->template as_list<false>()->eos().try_read(out);
+                    if (h & FLAG_POP) return n->template as_pop<false>()->eos().try_read(out);
+                    return n->template as_full<false>()->eos().try_read(out);
                 }
             }
             
