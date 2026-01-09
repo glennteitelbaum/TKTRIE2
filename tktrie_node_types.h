@@ -97,12 +97,7 @@ public:
         ++count_;
     }
     
-    // Alias for unified interface
-    void add_value(unsigned char c, const T& value) requires IS_LEAF {
-        add_entry(c, value);
-    }
-    
-    void remove_entry(int idx) requires IS_LEAF {
+    void remove_at(int idx) requires IS_LEAF {
         if (idx == 0 && count_ == 2) {
             chars_[0] = chars_[1];
             elements_[0] = std::move(elements_[1]);
@@ -144,13 +139,13 @@ public:
         return &elements_[slot];
     }
     
-    void add_child(unsigned char c, ptr_t child) requires (!IS_LEAF) {
+    void add_entry(unsigned char c, ptr_t child) requires (!IS_LEAF) {
         chars_[count_] = c;
         elements_[count_].store(child);
         ++count_;
     }
     
-    void remove_child(int idx) requires (!IS_LEAF) {
+    void remove_at(int idx) requires (!IS_LEAF) {
         if (idx == 0 && count_ == 2) {
             chars_[0] = chars_[1];
             elements_[0] = elements_[1];
@@ -265,13 +260,13 @@ public:
         }
     }
     
-    int add_value(unsigned char c, const T& val) requires IS_LEAF {
+    int add_entry(unsigned char c, const T& val) requires IS_LEAF {
         int idx = chars_.add(c);
         elements_[idx].set(val);
         return idx;
     }
     
-    void remove_value(unsigned char c) requires IS_LEAF {
+    void remove_entry(unsigned char c) requires IS_LEAF {
         int idx = chars_.find(c);
         if (idx < 0) return;
         int cnt = chars_.count();
@@ -316,7 +311,7 @@ public:
         return &elements_[slot];
     }
     
-    void add_child(unsigned char c, ptr_t child) requires (!IS_LEAF) {
+    void add_entry(unsigned char c, ptr_t child) requires (!IS_LEAF) {
         int idx = chars_.add(c);
         elements_[idx].store(child);
     }
@@ -329,7 +324,7 @@ public:
         elements_[1].store(child2);
     }
     
-    void remove_child(unsigned char c) requires (!IS_LEAF) {
+    void remove_entry(unsigned char c) requires (!IS_LEAF) {
         int idx = chars_.find(c);
         if (idx < 0) return;
         int cnt = chars_.count();
@@ -452,13 +447,13 @@ public:
         return elements_[valid_.slot_for(c)].try_read(out);
     }
     
-    void add_value(unsigned char c, const T& val) requires IS_LEAF {
+    void add_entry(unsigned char c, const T& val) requires IS_LEAF {
         int slot = valid_.shift_up_for_insert(c, elements_, count());
         elements_[slot].set(val);
         valid_.set(c);
     }
     
-    void remove_value(unsigned char c) requires IS_LEAF {
+    void remove_entry(unsigned char c) requires IS_LEAF {
         valid_.shift_down_for_remove(c, elements_, [](auto& v) { v.clear(); });
     }
     
@@ -491,13 +486,13 @@ public:
         return &elements_[slot];
     }
     
-    void add_child(unsigned char c, ptr_t child) requires (!IS_LEAF) {
+    void add_entry(unsigned char c, ptr_t child) requires (!IS_LEAF) {
         int slot = valid_.shift_up_for_insert(c, elements_, count());
         elements_[slot].store(child);
         valid_.set(c);
     }
     
-    void remove_child(unsigned char c) requires (!IS_LEAF) {
+    void remove_entry(unsigned char c) requires (!IS_LEAF) {
         valid_.shift_down_for_remove(c, elements_, [](auto& p) { p.store(nullptr); });
     }
     
@@ -603,17 +598,17 @@ public:
         valid_.template atomic_set<THREADED>(c);
     }
     
-    void add_value(unsigned char c, const T& val) requires IS_LEAF {
+    void add_entry(unsigned char c, const T& val) requires IS_LEAF {
         elements_[c].set(val);
         valid_.set(c);
     }
     
-    void add_value_atomic(unsigned char c, const T& val) requires IS_LEAF {
+    void add_entry_atomic(unsigned char c, const T& val) requires IS_LEAF {
         elements_[c].set(val);
         valid_.template atomic_set<THREADED>(c);
     }
     
-    void remove_value(unsigned char c) requires IS_LEAF {
+    void remove_entry(unsigned char c) requires IS_LEAF {
         elements_[c].clear();
         valid_.template atomic_clear<THREADED>(c);
     }
@@ -636,17 +631,17 @@ public:
         return valid_.test(c) ? &elements_[c] : nullptr;
     }
     
-    void add_child(unsigned char c, ptr_t child) requires (!IS_LEAF) {
+    void add_entry(unsigned char c, ptr_t child) requires (!IS_LEAF) {
         elements_[c].store(child);
         valid_.set(c);
     }
     
-    void add_child_atomic(unsigned char c, ptr_t child) requires (!IS_LEAF) {
+    void add_entry_atomic(unsigned char c, ptr_t child) requires (!IS_LEAF) {
         elements_[c].store(child);
         valid_.template atomic_set<THREADED>(c);
     }
     
-    void remove_child(unsigned char c) requires (!IS_LEAF) {
+    void remove_entry(unsigned char c) requires (!IS_LEAF) {
         valid_.template atomic_clear<THREADED>(c);
         elements_[c].store(nullptr);
     }
@@ -688,7 +683,7 @@ void list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>::move_interior_to_ful
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars_.char_at(i);
         dest->valid().set(ch);
-        dest->add_child(ch, elements_[i].load());
+        dest->add_entry(ch, elements_[i].load());
         elements_[i].store(nullptr);
     }
 }
@@ -703,7 +698,7 @@ void list_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>::copy_interior_to_ful
     [[assume(cnt >= 0 && cnt < 8)]];
     for (int i = 0; i < cnt; ++i) {
         unsigned char ch = chars_.char_at(i);
-        dest->add_child(ch, elements_[i].load());
+        dest->add_entry(ch, elements_[i].load());
     }
 }
 
@@ -716,7 +711,7 @@ void pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>::move_children_to_full
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) requires (!IS_LEAF) {
     int idx = 0;
     valid_.for_each_set([&](unsigned char c) {
-        dest->add_child(c, elements_[idx].load());
+        dest->add_entry(c, elements_[idx].load());
         elements_[idx].store(nullptr);
         ++idx;
     });
@@ -727,7 +722,7 @@ void pop_node<T, THREADED, Allocator, FIXED_LEN, IS_LEAF>::copy_children_to_full
     full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const requires (!IS_LEAF) {
     int idx = 0;
     valid_.for_each_set([&](unsigned char c) {
-        dest->add_child(c, elements_[idx].load());
+        dest->add_entry(c, elements_[idx].load());
         ++idx;
     });
 }

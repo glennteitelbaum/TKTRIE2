@@ -222,7 +222,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             interior->set_eos(value);
         }
         ptr_t child = builder_.make_leaf_skip(skip.substr(m + 1), old_value);
-        interior->template as_list<false>()->add_child(old_c, child);
+        interior->template as_list<false>()->add_entry(old_c, child);
         interior->template as_list<false>()->update_capacity_flags();
 
         interior->poison();
@@ -244,7 +244,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             interior->set_eos(old_value);
         }
         ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->template as_list<false>()->add_child(new_c, child);
+        interior->template as_list<false>()->add_entry(new_c, child);
         interior->template as_list<false>()->update_capacity_flags();
 
         interior->poison();
@@ -263,8 +263,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t interior = builder_.make_interior_binary(common);
         ptr_t old_child = ops::clone_leaf_with_skip(info.target, skip.substr(m + 1), builder_);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->template as_binary<false>()->add_child(old_c, old_child);
-        interior->template as_binary<false>()->add_child(new_c, new_child);
+        interior->template as_binary<false>()->add_entry(old_c, old_child);
+        interior->template as_binary<false>()->add_entry(new_c, new_child);
         interior->template as_binary<false>()->update_capacity_flags();
 
         interior->poison();
@@ -285,7 +285,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             interior->set_eos(value);
         }
         ptr_t old_child = ops::clone_leaf_with_skip(info.target, skip.substr(m + 1), builder_);
-        interior->template as_binary<false>()->add_child(old_c, old_child);
+        interior->template as_binary<false>()->add_entry(old_c, old_child);
         interior->template as_binary<false>()->update_capacity_flags();
 
         interior->poison();
@@ -311,8 +311,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t new_int = builder_.make_interior_binary(common);
         ptr_t old_child = ops::clone_interior_with_skip(info.target, skip.substr(m + 1), builder_);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        new_int->template as_binary<false>()->add_child(old_c, old_child);
-        new_int->template as_binary<false>()->add_child(new_c, new_child);
+        new_int->template as_binary<false>()->add_entry(old_c, old_child);
+        new_int->template as_binary<false>()->add_entry(new_c, new_child);
         new_int->template as_binary<false>()->update_capacity_flags();
 
         new_int->poison();
@@ -333,7 +333,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
             new_int->set_eos(value);
         }
         ptr_t old_child = ops::clone_interior_with_skip(info.target, skip.substr(m + 1), builder_);
-        new_int->template as_binary<false>()->add_child(old_c, old_child);
+        new_int->template as_binary<false>()->add_entry(old_c, old_child);
         new_int->template as_binary<false>()->update_capacity_flags();
 
         new_int->poison();

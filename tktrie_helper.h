@@ -33,12 +33,10 @@ namespace gteitelbaum {
 
 template <typename Node>
 constexpr int node_max_count() {
-    if constexpr (requires { Node::MAX_CHILDREN; }) 
-        return Node::MAX_CHILDREN;
-    else if constexpr (requires { Node::MAX_ENTRIES; })
+    if constexpr (requires { Node::MAX_ENTRIES; })
         return Node::MAX_ENTRIES;
     else
-        return 256;  // FULL node
+        return 256;  // FULL node (no MAX_ENTRIES defined)
 }
 
 // =============================================================================
@@ -126,19 +124,7 @@ struct trie_ops {
     }
     
     // =========================================================================
-    // ADD ENTRY TO NODE - Handles iteration differences
-    // =========================================================================
-    template <bool IS_LEAF, typename DstNode>
-    static void add_entry_to(DstNode* dst, unsigned char c, entry_t<T, ptr_t, IS_LEAF> entry) {
-        if constexpr (IS_LEAF) {
-            dst->add_value(c, entry);
-        } else {
-            dst->add_child(c, entry);
-        }
-    }
-    
-    // =========================================================================
-    // COPY ENTRIES - Unified for leaf values and interior children
+   // COPY ENTRIES - Unified for leaf values and interior children
     // Uses accessor methods: char_at(), value_at(), valid(), child_at_slot()
     // =========================================================================
     template <bool IS_LEAF, typename SrcNode, typename DstNode>
@@ -153,9 +139,9 @@ struct trie_ops {
                 if constexpr (IS_LEAF) {
                     T val{};
                     src->value_at(i).try_read(val);
-                    dst->add_value(c, val);
+                    dst->add_entry(c, val);
                 } else {
-                    dst->add_child(c, src->child_at_slot(i));
+                    dst->add_entry(c, src->child_at_slot(i));
                 }
             }
         } else {
@@ -171,14 +157,14 @@ struct trie_ops {
                         // FULL: read by char
                         src->read_value(c, val);
                     }
-                    dst->add_value(c, val);
+                    dst->add_entry(c, val);
                 } else {
                     if constexpr (MAX == POP_MAX) {
                         // POP: indexed
-                        dst->add_child(c, src->child_at_slot(slot));
+                        dst->add_entry(c, src->child_at_slot(slot));
                     } else {
                         // FULL: direct
-                        dst->add_child(c, src->get_child(c));
+                        dst->add_entry(c, src->get_child(c));
                     }
                 }
                 ++slot;
@@ -203,9 +189,9 @@ struct trie_ops {
                 if constexpr (IS_LEAF) {
                     T val{};
                     src->value_at(i).try_read(val);
-                    dst->add_value(c, val);
+                    dst->add_entry(c, val);
                 } else {
-                    dst->add_child(c, src->child_at_slot(i));
+                    dst->add_entry(c, src->child_at_slot(i));
                 }
             }
         } else {
@@ -220,12 +206,12 @@ struct trie_ops {
                         } else {
                             src->read_value(c, val);
                         }
-                        dst->add_value(c, val);
+                        dst->add_entry(c, val);
                     } else {
                         if constexpr (MAX == POP_MAX) {
-                            dst->add_child(c, src->child_at_slot(slot));
+                            dst->add_entry(c, src->child_at_slot(slot));
                         } else {
-                            dst->add_child(c, src->get_child(c));
+                            dst->add_entry(c, src->get_child(c));
                         }
                     }
                 }
@@ -255,19 +241,19 @@ struct trie_ops {
             auto* dst = dst_base->template as_list<IS_LEAF>();
             copy_entries<IS_LEAF>(src, dst);
             if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
-            add_entry_to<IS_LEAF>(dst, c, entry);
+            dst->add_entry(c, entry);
             dst->update_capacity_flags();
         } else if constexpr (MAX == LIST_MAX) {
             auto* dst = dst_base->template as_pop<IS_LEAF>();
             copy_entries<IS_LEAF>(src, dst);
             if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
-            add_entry_to<IS_LEAF>(dst, c, entry);
+            dst->add_entry(c, entry);
             dst->update_capacity_flags();
         } else if constexpr (MAX == POP_MAX) {
             auto* dst = dst_base->template as_full<IS_LEAF>();
             copy_entries<IS_LEAF>(src, dst);
             if constexpr (!IS_LEAF) copy_eos_to(src, dst_base);
-            add_entry_to<IS_LEAF>(dst, c, entry);
+            dst->add_entry(c, entry);
             dst->update_capacity_flags();
         }
         
@@ -356,7 +342,7 @@ struct trie_ops {
         // In-place if room
         if (node->count() < MAX) {
             node_base->bump_version();
-            add_entry_to<IS_LEAF>(node, c, entry);
+            node->add_entry(c, entry);
             node->update_capacity_flags();
             res.in_place = true;
             res.success = true;
@@ -464,24 +450,13 @@ struct trie_ops {
         
         // In-place removal
         node_base->bump_version();
-        if constexpr (IS_LEAF) {
-            if constexpr (MAX == BINARY_MAX) {
-                // BINARY uses remove_entry(idx)
-                int idx = node->find(c);
-                node->remove_entry(idx);
-            } else {
-                // LIST, POP, FULL use remove_value(c)
-                node->remove_value(c);
-            }
+        if constexpr (MAX == BINARY_MAX) {
+            // BINARY uses index-based remove_at(idx)
+            int idx = node->find(c);
+            node->remove_at(idx);
         } else {
-            if constexpr (MAX == BINARY_MAX) {
-                // BINARY interior uses remove_child(idx)
-                int idx = node->find(c);
-                node->remove_child(idx);
-            } else {
-                // LIST, POP, FULL use remove_child(c)
-                node->remove_child(c);
-            }
+            // LIST, POP, FULL use char-based remove_entry(c)
+            node->remove_entry(c);
         }
         node->update_capacity_flags();
         res.in_place = true;
@@ -504,7 +479,7 @@ struct trie_ops {
             int idx = bn->find(c);
             if (idx < 0) return false;
             node->bump_version();
-            bn->remove_entry(idx);
+            bn->remove_at(idx);
             bn->update_capacity_flags();
             return true;
         }
@@ -512,7 +487,7 @@ struct trie_ops {
             auto* ln = node->template as_list<true>();
             if (!ln->has(c)) return false;
             node->bump_version();
-            ln->remove_value(c);
+            ln->remove_entry(c);
             ln->update_capacity_flags();
             return true;
         }
@@ -520,14 +495,14 @@ struct trie_ops {
             auto* pn = node->template as_pop<true>();
             if (!pn->has(c)) return false;
             node->bump_version();
-            pn->remove_value(c);
+            pn->remove_entry(c);
             pn->update_capacity_flags();
             return true;
         }
         auto* fn = node->template as_full<true>();
         if (!fn->has(c)) return false;
         node->bump_version();
-        fn->remove_value(c);
+        fn->remove_entry(c);
         fn->update_capacity_flags();
         return true;
     }
@@ -542,7 +517,7 @@ struct trie_ops {
             int idx = bn->find(c);
             if (idx < 0) return false;
             node->bump_version();
-            bn->remove_child(idx);
+            bn->remove_at(idx);
             bn->update_capacity_flags();
             return true;
         }
@@ -550,7 +525,7 @@ struct trie_ops {
             auto* ln = node->template as_list<false>();
             if (!ln->has(c)) return false;
             node->bump_version();
-            ln->remove_child(c);
+            ln->remove_entry(c);
             ln->update_capacity_flags();
             return true;
         }
@@ -558,14 +533,14 @@ struct trie_ops {
             auto* pn = node->template as_pop<false>();
             if (!pn->has(c)) return false;
             node->bump_version();
-            pn->remove_child(c);
+            pn->remove_entry(c);
             pn->update_capacity_flags();
             return true;
         }
         auto* fn = node->template as_full<false>();
         if (!fn->has(c)) return false;
         node->bump_version();
-        fn->remove_child(c);
+        fn->remove_entry(c);
         fn->update_capacity_flags();
         return true;
     }
@@ -633,7 +608,7 @@ struct trie_ops {
         }
         ptr_t child = builder.make_leaf_skip(old_skip.substr(m + 1), old_value);
         
-        interior->template as_list<false>()->add_child(old_c, child);
+        interior->template as_list<false>()->add_entry(old_c, child);
         interior->template as_list<false>()->update_capacity_flags();
         
         if constexpr (SPECULATIVE) {
@@ -672,7 +647,7 @@ struct trie_ops {
         }
         ptr_t child = builder.make_leaf_skip(key.substr(m + 1), value);
         
-        interior->template as_list<false>()->add_child(new_c, child);
+        interior->template as_list<false>()->add_entry(new_c, child);
         interior->template as_list<false>()->update_capacity_flags();
         
         if constexpr (SPECULATIVE) {
@@ -824,12 +799,12 @@ struct trie_ops {
         // Add all entries from leaf as SKIP children
         leaf->for_each_leaf_entry([&builder, &interior](unsigned char c, const T& val) {
             ptr_t child = builder.make_leaf_skip("", val);
-            add_child_to_interior_impl(interior, c, child);
+            add_entry_to_interior(interior, c, child);
         });
         
         // Add extra child if provided
         if (need_extra) {
-            add_child_to_interior_impl(interior, extra_c, extra_child);
+            add_entry_to_interior(interior, extra_c, extra_child);
         }
         
         update_interior_capacity_flags(interior);
@@ -838,15 +813,15 @@ struct trie_ops {
     
 private:
     // Helper to add child to any interior type
-    static void add_child_to_interior_impl(ptr_t interior, unsigned char c, ptr_t child) {
+    static void add_entry_to_interior(ptr_t interior, unsigned char c, ptr_t child) {
         if (interior->is_binary()) {
-            interior->template as_binary<false>()->add_child(c, child);
+            interior->template as_binary<false>()->add_entry(c, child);
         } else if (interior->is_list()) {
-            interior->template as_list<false>()->add_child(c, child);
+            interior->template as_list<false>()->add_entry(c, child);
         } else if (interior->is_pop()) {
-            interior->template as_pop<false>()->add_child(c, child);
+            interior->template as_pop<false>()->add_entry(c, child);
         } else {
-            interior->template as_full<false>()->add_child(c, child);
+            interior->template as_full<false>()->add_entry(c, child);
         }
     }
     

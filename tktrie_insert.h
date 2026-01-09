@@ -127,8 +127,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
     leaf->as_skip()->value.try_read(old_value);
     ptr_t old_child = builder_.make_leaf_skip(old_skip.substr(m + 1), old_value);
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->template as_binary<false>()->add_child(old_c, old_child);
-    interior->template as_binary<false>()->add_child(new_c, new_child);
+    interior->template as_binary<false>()->add_entry(old_c, old_child);
+    interior->template as_binary<false>()->add_entry(new_c, new_child);
     interior->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = interior;
@@ -153,7 +153,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
     if constexpr (FIXED_LEN == 0) {
         interior->set_eos(value);
     }
-    interior->template as_binary<false>()->add_child(static_cast<unsigned char>(old_skip[m]), child);
+    interior->template as_binary<false>()->add_entry(static_cast<unsigned char>(old_skip[m]), child);
     interior->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = interior;
@@ -178,7 +178,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     }
 
     ptr_t child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->template as_binary<false>()->add_child(static_cast<unsigned char>(key[m]), child);
+    interior->template as_binary<false>()->add_entry(static_cast<unsigned char>(key[m]), child);
     interior->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = interior;
@@ -200,8 +200,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_multi(
     ptr_t interior = builder_.make_interior_binary(common);
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-    interior->template as_binary<false>()->add_child(old_c, old_child);
-    interior->template as_binary<false>()->add_child(new_c, new_child);
+    interior->template as_binary<false>()->add_entry(old_c, old_child);
+    interior->template as_binary<false>()->add_entry(new_c, new_child);
     interior->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = interior;
@@ -223,7 +223,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_multi(
     }
 
     ptr_t old_child = clone_leaf_with_skip(leaf, old_skip.substr(m + 1));
-    interior->template as_binary<false>()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
+    interior->template as_binary<false>()->add_entry(static_cast<unsigned char>(old_skip[m]), old_child);
     interior->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = interior;
@@ -320,8 +320,8 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
     ptr_t new_int = builder_.make_interior_binary(common);
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-    new_int->template as_binary<false>()->add_child(old_c, old_child);
-    new_int->template as_binary<false>()->add_child(new_c, new_child);
+    new_int->template as_binary<false>()->add_entry(old_c, old_child);
+    new_int->template as_binary<false>()->add_entry(new_c, new_child);
     new_int->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = new_int;
@@ -349,7 +349,7 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
     }
 
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
-    new_int->template as_binary<false>()->add_child(static_cast<unsigned char>(old_skip[m]), old_child);
+    new_int->template as_binary<false>()->add_entry(static_cast<unsigned char>(old_skip[m]), old_child);
     new_int->template as_binary<false>()->update_capacity_flags();
 
     res.new_node = new_int;
