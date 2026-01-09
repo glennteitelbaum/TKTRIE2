@@ -448,16 +448,9 @@ struct trie_ops {
             return downgrade<SPECULATIVE, IS_LEAF>(node_base, node, c, builder, alloc);
         }
         
-        // In-place removal
+        // In-place removal - all node types now use remove_entry(c)
         node_base->bump_version();
-        if constexpr (MAX == BINARY_MAX) {
-            // BINARY uses index-based remove_at(idx)
-            int idx = node->find(c);
-            node->remove_at(idx);
-        } else {
-            // LIST, POP, FULL use char-based remove_entry(c)
-            node->remove_entry(c);
-        }
+        node->remove_entry(c);
         node->update_capacity_flags();
         res.in_place = true;
         res.success = true;
@@ -476,10 +469,9 @@ struct trie_ops {
         
         if (h & FLAG_BINARY) {
             auto* bn = node->template as_binary<true>();
-            int idx = bn->find(c);
-            if (idx < 0) return false;
+            if (!bn->has(c)) return false;
             node->bump_version();
-            bn->remove_at(idx);
+            bn->remove_entry(c);
             bn->update_capacity_flags();
             return true;
         }
@@ -514,10 +506,9 @@ struct trie_ops {
         
         if (h & FLAG_BINARY) {
             auto* bn = node->template as_binary<false>();
-            int idx = bn->find(c);
-            if (idx < 0) return false;
+            if (!bn->has(c)) return false;
             node->bump_version();
-            bn->remove_at(idx);
+            bn->remove_entry(c);
             bn->update_capacity_flags();
             return true;
         }

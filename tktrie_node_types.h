@@ -97,7 +97,9 @@ public:
         ++count_;
     }
     
-    void remove_at(int idx) requires IS_LEAF {
+    void remove_entry(unsigned char c) requires IS_LEAF {
+        int idx = find(c);
+        if (idx < 0) return;
         if (idx == 0 && count_ == 2) {
             chars_[0] = chars_[1];
             elements_[0] = std::move(elements_[1]);
@@ -145,7 +147,9 @@ public:
         ++count_;
     }
     
-    void remove_at(int idx) requires (!IS_LEAF) {
+    void remove_entry(unsigned char c) requires (!IS_LEAF) {
+        int idx = find(c);
+        if (idx < 0) return;
         if (idx == 0 && count_ == 2) {
             chars_[0] = chars_[1];
             elements_[0] = elements_[1];
