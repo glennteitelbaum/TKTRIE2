@@ -679,6 +679,143 @@ struct trie_ops {
         res.success = true;
         return res;
     }
+    
+    // =========================================================================
+    // Clone helpers - create node of same type with different skip
+    // =========================================================================
+    
+    static ptr_t clone_leaf_with_skip(ptr_t leaf, std::string_view new_skip, builder_t& builder) {
+        if (leaf->is_binary()) [[likely]] {
+            ptr_t n = builder.make_leaf_binary(new_skip);
+            leaf->template as_binary<true>()->copy_values_to(n->template as_binary<true>());
+            n->template as_binary<true>()->update_capacity_flags();
+            return n;
+        }
+        if (leaf->is_list()) {
+            ptr_t n = builder.make_leaf_list(new_skip);
+            leaf->template as_list<true>()->copy_values_to(n->template as_list<true>());
+            n->template as_list<true>()->update_capacity_flags();
+            return n;
+        }
+        if (leaf->is_pop()) {
+            ptr_t n = builder.make_leaf_pop(new_skip);
+            leaf->template as_pop<true>()->copy_values_to(n->template as_pop<true>());
+            n->template as_pop<true>()->update_capacity_flags();
+            return n;
+        }
+        ptr_t n = builder.make_leaf_full(new_skip);
+        leaf->template as_full<true>()->copy_values_to(n->template as_full<true>());
+        n->template as_full<true>()->update_capacity_flags();
+        return n;
+    }
+    
+    static ptr_t clone_interior_with_skip(ptr_t node, std::string_view new_skip, builder_t& builder) {
+        bool had_eos = node->has_eos();
+        
+        if (node->is_binary()) [[likely]] {
+            ptr_t clone = builder.make_interior_binary(new_skip);
+            if constexpr (FIXED_LEN == 0) {
+                node->template as_binary<false>()->move_interior_to(clone->template as_binary<false>());
+                if (had_eos) clone->set_eos_flag();
+            } else {
+                node->template as_binary<false>()->move_children_to(clone->template as_binary<false>());
+            }
+            clone->template as_binary<false>()->update_capacity_flags();
+            return clone;
+        }
+        if (node->is_list()) {
+            ptr_t clone = builder.make_interior_list(new_skip);
+            node->template as_list<false>()->move_interior_to(clone->template as_list<false>());
+            if constexpr (FIXED_LEN == 0) {
+                if (had_eos) clone->set_eos_flag();
+            }
+            clone->template as_list<false>()->update_capacity_flags();
+            return clone;
+        }
+        if (node->is_pop()) {
+            ptr_t clone = builder.make_interior_pop(new_skip);
+            if constexpr (FIXED_LEN == 0) {
+                node->template as_pop<false>()->move_interior_to(clone->template as_pop<false>());
+                if (had_eos) clone->set_eos_flag();
+            } else {
+                node->template as_pop<false>()->move_children_to(clone->template as_pop<false>());
+            }
+            clone->template as_pop<false>()->update_capacity_flags();
+            return clone;
+        }
+        ptr_t clone = builder.make_interior_full(new_skip);
+        node->template as_full<false>()->move_interior_to(clone->template as_full<false>());
+        if constexpr (FIXED_LEN == 0) {
+            if (had_eos) clone->set_eos_flag();
+        }
+        clone->template as_full<false>()->update_capacity_flags();
+        return clone;
+    }
+    
+    // Convert a leaf node to an interior, with each entry becoming a SKIP child
+    // Optionally adds an extra child at extra_c with extra_child (if extra_child != nullptr)
+    // Returns interior of same type as leaf, unless upgrade_type is set
+    static ptr_t leaf_to_interior(ptr_t leaf, builder_t& builder, 
+                                   unsigned char extra_c = 0, ptr_t extra_child = nullptr) {
+        std::string_view leaf_skip = leaf->skip_str();
+        int leaf_count = leaf->leaf_entry_count();
+        bool need_extra = (extra_child != nullptr);
+        int total = leaf_count + (need_extra ? 1 : 0);
+        
+        // Determine target type based on total count
+        ptr_t interior;
+        if (total <= BINARY_MAX) {
+            interior = builder.make_interior_binary(leaf_skip);
+        } else if (total <= LIST_MAX) {
+            interior = builder.make_interior_list(leaf_skip);
+        } else if (total <= POP_MAX) {
+            interior = builder.make_interior_pop(leaf_skip);
+        } else {
+            interior = builder.make_interior_full(leaf_skip);
+        }
+        
+        // Add all entries from leaf as SKIP children
+        leaf->for_each_leaf_entry([&builder, &interior](unsigned char c, const T& val) {
+            ptr_t child = builder.make_leaf_skip("", val);
+            add_child_to_interior_impl(interior, c, child);
+        });
+        
+        // Add extra child if provided
+        if (need_extra) {
+            add_child_to_interior_impl(interior, extra_c, extra_child);
+        }
+        
+        update_interior_capacity_flags(interior);
+        return interior;
+    }
+    
+private:
+    // Helper to add child to any interior type
+    static void add_child_to_interior_impl(ptr_t interior, unsigned char c, ptr_t child) {
+        if (interior->is_binary()) {
+            interior->template as_binary<false>()->add_child(c, child);
+        } else if (interior->is_list()) {
+            interior->template as_list<false>()->add_child(c, child);
+        } else if (interior->is_pop()) {
+            interior->template as_pop<false>()->add_child(c, child);
+        } else {
+            interior->template as_full<false>()->add_child(c, child);
+        }
+    }
+    
+    static void update_interior_capacity_flags(ptr_t interior) {
+        if (interior->is_binary()) {
+            interior->template as_binary<false>()->update_capacity_flags();
+        } else if (interior->is_list()) {
+            interior->template as_list<false>()->update_capacity_flags();
+        } else if (interior->is_pop()) {
+            interior->template as_pop<false>()->update_capacity_flags();
+        } else {
+            interior->template as_full<false>()->update_capacity_flags();
+        }
+    }
+    
+public:
 };
 
 }  // namespace gteitelbaum

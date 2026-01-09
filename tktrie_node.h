@@ -246,6 +246,42 @@ struct node_base {
         return as_full<false>()->count();
     }
     
+    // Entry count for leaf nodes (excludes SKIP which has exactly 1)
+    int leaf_entry_count() const noexcept {
+        if (is_binary()) return as_binary<true>()->count();
+        if (is_list()) [[likely]] return as_list<true>()->count();
+        if (is_pop()) return as_pop<true>()->count();
+        return as_full<true>()->count();
+    }
+    
+    // Check if interior node has a child at given char
+    bool has_child(unsigned char c) const noexcept {
+        if (is_binary()) return as_binary<false>()->has(c);
+        if (is_list()) [[likely]] return as_list<false>()->has(c);
+        if (is_pop()) return as_pop<false>()->has(c);
+        return as_full<false>()->has(c);
+    }
+    
+    // Get first child's char and pointer (for collapse operations)
+    // Only valid when child_count() == 1
+    std::pair<unsigned char, ptr_t> first_child_info() const noexcept {
+        if (is_binary()) {
+            auto* bn = as_binary<false>();
+            return {bn->first_char(), bn->child_at_slot(0)};
+        }
+        if (is_list()) [[likely]] {
+            auto* ln = as_list<false>();
+            return {ln->char_at(0), ln->child_at_slot(0)};
+        }
+        if (is_pop()) {
+            auto* pn = as_pop<false>();
+            return {pn->first_char(), pn->child_at_slot(0)};
+        }
+        auto* fn = as_full<false>();
+        unsigned char c = fn->valid().first();
+        return {c, fn->get_child(c)};
+    }
+    
     // EOS access (interior nodes only, FIXED_LEN==0 only)
     bool has_eos() const noexcept {
         if constexpr (FIXED_LEN > 0) {
@@ -289,6 +325,73 @@ struct node_base {
             else if (is_pop()) as_pop<false>()->eos().clear();
             else as_full<false>()->eos().clear();
             clear_eos_flag();  // Update header flag
+        }
+    }
+    
+    // Leaf value access (leaf nodes only, not SKIP)
+    bool has_leaf_entry(unsigned char c) const noexcept {
+        if (is_binary()) return as_binary<true>()->has(c);
+        if (is_list()) [[likely]] return as_list<true>()->has(c);
+        if (is_pop()) return as_pop<true>()->has(c);
+        return as_full<true>()->has(c);
+    }
+    
+    bool try_read_leaf_value(unsigned char c, T& out) const noexcept {
+        if (is_binary()) {
+            auto* bn = as_binary<true>();
+            int idx = bn->find(c);
+            if (idx < 0) return false;
+            return bn->read_value(idx, out);
+        }
+        if (is_list()) [[likely]] {
+            auto* ln = as_list<true>();
+            int idx = ln->find(c);
+            if (idx < 0) return false;
+            return ln->read_value(idx, out);
+        }
+        if (is_pop()) {
+            return as_pop<true>()->read_value(c, out);
+        }
+        auto* fn = as_full<true>();
+        if (!fn->has(c)) return false;
+        return fn->read_value(c, out);
+    }
+    
+    // Iterate over all leaf entries, calling fn(char, value) for each
+    // Only valid for leaf nodes (not SKIP)
+    template <typename Fn>
+    void for_each_leaf_entry(Fn&& fn) const {
+        if (is_binary()) {
+            auto* bn = as_binary<true>();
+            for (int i = 0; i < bn->count(); ++i) {
+                T val{};
+                bn->value_at(i).try_read(val);
+                fn(bn->char_at(i), val);
+            }
+        } else if (is_list()) [[likely]] {
+            auto* ln = as_list<true>();
+            int cnt = ln->count();
+            for (int i = 0; i < cnt; ++i) {
+                T val{};
+                ln->value_at(i).try_read(val);
+                fn(ln->char_at(i), val);
+            }
+        } else if (is_pop()) {
+            auto* pn = as_pop<true>();
+            int slot = 0;
+            pn->valid().for_each_set([pn, &fn, &slot](unsigned char c) {
+                T val{};
+                pn->element_at_slot(slot).try_read(val);
+                fn(c, val);
+                ++slot;
+            });
+        } else {
+            auto* fn_node = as_full<true>();
+            fn_node->valid().for_each_set([fn_node, &fn](unsigned char c) {
+                T val{};
+                fn_node->read_value(c, val);
+                fn(c, val);
+            });
         }
     }
 };

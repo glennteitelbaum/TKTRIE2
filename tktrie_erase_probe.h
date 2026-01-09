@@ -42,42 +42,30 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     unsigned char c = static_cast<unsigned char>(key[0]);
     info.c = c;
 
+    if (!n->has_leaf_entry(c)) { info.op = erase_op::NOT_FOUND; return info; }
+    
+    int count = n->leaf_entry_count();
+    
+    // Delete last entry = delete subtree
+    if (count == 1) {
+        info.op = erase_op::DELETE_LAST_LEAF_ENTRY;
+        return info;
+    }
+    
+    // BINARY with count=2 needs special conversion to SKIP
     if (n->is_binary()) {
-        auto* bn = n->template as_binary<true>();
-        if (!bn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
-        if (bn->count() == 1) {
-            info.op = erase_op::DELETE_LAST_LEAF_ENTRY;
-        } else {
-            // count == 2: need to convert to SKIP (structural change)
-            info.op = erase_op::BINARY_TO_SKIP;
-        }
+        info.op = erase_op::BINARY_TO_SKIP;
         return info;
     }
-
-    if (n->is_list()) [[likely]] {
-        auto* ln = n->template as_list<true>();
-        if (!ln->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
-        if (ln->count() == 1) {
-            info.op = erase_op::DELETE_LAST_LEAF_ENTRY;
-        } else {
-            info.op = erase_op::IN_PLACE_LEAF_LIST;
-        }
-        return info;
-    }
-
-    if (n->is_pop()) {
-        auto* pn = n->template as_pop<true>();
-        if (!pn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
-        // POP never goes to 0 from in-place removal (min 8 entries)
+    
+    // LIST, POP, FULL - use appropriate in-place op (probing logic determines op type)
+    if (n->is_list()) {
+        info.op = erase_op::IN_PLACE_LEAF_LIST;
+    } else if (n->is_pop()) {
         info.op = erase_op::IN_PLACE_LEAF_POP;
-        return info;
+    } else {
+        info.op = erase_op::IN_PLACE_LEAF_FULL;
     }
-
-    // FULL
-    auto* fn = n->template as_full<true>();
-    if (!fn->has(c)) { info.op = erase_op::NOT_FOUND; return info; }
-    // FULL never goes to 0 from in-place removal (min 33 entries)
-    info.op = erase_op::IN_PLACE_LEAF_FULL;
     return info;
 }
 
@@ -110,25 +98,7 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
         }
         if (child_cnt == 1) {
             // Will collapse with single child
-            unsigned char c = 0;
-            ptr_t child = nullptr;
-            if (n->is_binary()) {
-                auto* bn = n->template as_binary<false>();
-                c = bn->first_char();
-                child = bn->child_at_slot(0);
-            } else if (n->is_list()) {
-                auto* ln = n->template as_list<false>();
-                c = ln->char_at(0);
-                child = ln->child_at_slot(0);
-            } else if (n->is_pop()) {
-                auto* pn = n->template as_pop<false>();
-                c = pn->first_char();
-                child = pn->child_at_slot(0);
-            } else {
-                auto* fn = n->template as_full<false>();
-                c = fn->valid().first();
-                child = fn->get_child(c);
-            }
+            auto [c, child] = n->first_child_info();
             if (child && !builder_t::is_sentinel(child) && !child->is_poisoned()) {
                 info.collapse_child = child;
                 info.collapse_char = c;
@@ -201,6 +171,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     const erase_spec_info& info) {
     erase_pre_alloc alloc;
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     
     switch (info.op) {
     case erase_op::DELETE_SKIP_LEAF:
@@ -209,22 +180,9 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
         break;
     
     case erase_op::BINARY_TO_SKIP: {
-        // BINARY leaf with count=2 -> SKIP with the remaining value
-        auto* bn = info.target->template as_binary<true>();
-        int idx = bn->find(info.c);
-        int other_idx = 1 - idx;  // The other entry (0 or 1)
-        unsigned char other_c = bn->char_at(other_idx);
-        T other_val{};
-        bn->value_at(other_idx).try_read(other_val);
-        
-        // New skip = old skip + remaining char
-        std::string new_skip_str(info.target_skip);
-        new_skip_str.push_back(static_cast<char>(other_c));
-        
-        ptr_t new_skip = builder_.make_leaf_skip(new_skip_str, other_val);
-        new_skip->poison();
-        alloc.replacement = new_skip;
-        alloc.add(new_skip);
+        // Use helper for BINARY->SKIP conversion (speculative mode)
+        auto helper_res = ops::template binary_to_skip<true>(info.target, info.c, builder_, &alloc);
+        (void)helper_res;  // Result is in alloc
         break;
     }
         
@@ -244,45 +202,11 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
                 T val{};
                 child->as_skip()->value.try_read(val);
                 merged = builder_.make_leaf_skip(new_skip, val);
-            } else if (child->is_binary()) {
-                merged = builder_.make_leaf_binary(new_skip);
-                child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
-                merged->template as_binary<true>()->update_capacity_flags();
-            } else if (child->is_list()) {
-                merged = builder_.make_leaf_list(new_skip);
-                child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
-                merged->template as_list<true>()->update_capacity_flags();
-            } else if (child->is_pop()) {
-                merged = builder_.make_leaf_pop(new_skip);
-                child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
-                merged->template as_pop<true>()->update_capacity_flags();
             } else {
-                merged = builder_.make_leaf_full(new_skip);
-                child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
-                merged->template as_full<true>()->update_capacity_flags();
+                merged = ops::clone_leaf_with_skip(child, new_skip, builder_);
             }
         } else {
-            bool had_eos = child->has_eos();  // Capture before copy
-            if (child->is_binary()) {
-                merged = builder_.make_interior_binary(new_skip);
-                child->template as_binary<false>()->copy_interior_to(merged->template as_binary<false>());
-                merged->template as_binary<false>()->update_capacity_flags();
-            } else if (child->is_list()) {
-                merged = builder_.make_interior_list(new_skip);
-                child->template as_list<false>()->copy_interior_to(merged->template as_list<false>());
-                merged->template as_list<false>()->update_capacity_flags();
-            } else if (child->is_pop()) {
-                merged = builder_.make_interior_pop(new_skip);
-                child->template as_pop<false>()->copy_interior_to(merged->template as_pop<false>());
-                merged->template as_pop<false>()->update_capacity_flags();
-            } else {
-                merged = builder_.make_interior_full(new_skip);
-                child->template as_full<false>()->copy_interior_to(merged->template as_full<false>());
-                merged->template as_full<false>()->update_capacity_flags();
-            }
-            if constexpr (FIXED_LEN == 0) {
-                if (had_eos) merged->set_eos_flag();  // Preserve EOS flag
-            }
+            merged = ops::clone_interior_with_skip(child, new_skip, builder_);
         }
         
         if (merged) {

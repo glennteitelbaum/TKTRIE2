@@ -179,11 +179,7 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
                     return false;
                 } else {
                     if (!(h & FLAG_HAS_EOS)) return false;
-                    // Dispatch to read EOS value
-                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos().try_read(out);
-                    if (h & FLAG_LIST) return n->template as_list<false>()->eos().try_read(out);
-                    if (h & FLAG_POP) return n->template as_pop<false>()->eos().try_read(out);
-                    return n->template as_full<false>()->eos().try_read(out);
+                    return n->try_read_eos(out);
                 }
             }
             
@@ -204,27 +200,7 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
         // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
         if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        
-        if (h & FLAG_BINARY) {
-            auto* bn = n->template as_binary<true>();
-            int idx = bn->find(c);
-            if (idx < 0) return false;
-            return bn->read_value(idx, out);
-        }
-        if (h & FLAG_LIST) {
-            auto* ln = n->template as_list<true>();
-            int idx = ln->find(c);
-            if (idx < 0) return false;
-            return ln->read_value(idx, out);
-        }
-        if (h & FLAG_POP) {
-            auto* pn = n->template as_pop<true>();
-            return pn->read_value(c, out);
-        }
-        // Default: FULL
-        auto* fn = n->template as_full<true>();
-        if (!fn->has(c)) return false;
-        return fn->read_value(c, out);
+        return n->try_read_leaf_value(c, out);
     }
 }
 
@@ -273,18 +249,7 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
         // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
         if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        
-        if (h & FLAG_BINARY) {
-            return n->template as_binary<true>()->has(c);
-        }
-        if (h & FLAG_LIST) {
-            return n->template as_list<true>()->has(c);
-        }
-        if (h & FLAG_POP) {
-            return n->template as_pop<true>()->has(c);
-        }
-        // Default: FULL
-        return n->template as_full<true>()->has(c);
+        return n->has_leaf_entry(c);
     }
 }
 
@@ -318,10 +283,7 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
                     return false;
                 } else {
                     if (!(h & FLAG_HAS_EOS)) return false;
-                    if (h & FLAG_BINARY) return n->template as_binary<false>()->eos().try_read(out);
-                    if (h & FLAG_LIST) return n->template as_list<false>()->eos().try_read(out);
-                    if (h & FLAG_POP) return n->template as_pop<false>()->eos().try_read(out);
-                    return n->template as_full<false>()->eos().try_read(out);
+                    return n->try_read_eos(out);
                 }
             }
             
@@ -341,25 +303,7 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
         
         if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        
-        if (h & FLAG_BINARY) {
-            auto* bn = n->template as_binary<true>();
-            int idx = bn->find(c);
-            if (idx < 0) return false;
-            return bn->read_value(idx, out);
-        }
-        if (h & FLAG_LIST) {
-            auto* ln = n->template as_list<true>();
-            int idx = ln->find(c);
-            if (idx < 0) return false;
-            return ln->read_value(idx, out);
-        }
-        if (h & FLAG_POP) {
-            return n->template as_pop<true>()->read_value(c, out);
-        }
-        auto* fn = n->template as_full<true>();
-        if (!fn->has(c)) return false;
-        return fn->read_value(c, out);
+        return n->try_read_leaf_value(c, out);
     }
 }
 
@@ -411,11 +355,7 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
         
         if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
-        
-        if (h & FLAG_BINARY) return n->template as_binary<true>()->has(c);
-        if (h & FLAG_LIST) return n->template as_list<true>()->has(c);
-        if (h & FLAG_POP) return n->template as_pop<true>()->has(c);
-        return n->template as_full<true>()->has(c);
+        return n->has_leaf_entry(c);
     }
 }
 

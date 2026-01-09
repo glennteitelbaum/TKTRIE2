@@ -171,6 +171,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (m < skip.size()) return res;
     key.remove_prefix(m);
 
+    // SKIP leaf - delete entire node
     if (leaf->is_skip()) {
         if (!key.empty()) return res;
         res.erased = true;
@@ -179,136 +180,38 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         return res;
     }
 
+    // Multi-entry leaf (BINARY, LIST, POP, FULL)
     if (key.size() != 1) return res;
     unsigned char c = static_cast<unsigned char>(key[0]);
-
-    // Handle BINARY leaf
-    if (leaf->is_binary()) {
-        auto* bn = leaf->template as_binary<true>();
-        if (!bn->has(c)) return res;
-        
-        if (bn->count() == 1) {
-            res.erased = true;
-            res.deleted_subtree = true;
-            res.old_nodes.push_back(leaf);
-            return res;
-        }
-        
-        // Convert BINARY to SKIP when count goes from 2 to 1
-        int idx = bn->find(c);
-        unsigned char other_c = bn->char_at(1 - idx);
-        T other_val;
-        bn->value_at(1 - idx).try_read(other_val);
-        
-        // Build new skip string: existing skip + other_c
-        std::string new_skip_str(leaf->skip_str());
-        new_skip_str.push_back(static_cast<char>(other_c));
-        
-        ptr_t new_skip = builder_.make_leaf_skip(new_skip_str, other_val);
-        
-        res.new_node = new_skip;
-        res.old_nodes.push_back(leaf);
-        res.erased = true;
-        return res;
-    }
-
-    // Handle LIST leaf
-    if (leaf->is_list()) [[likely]] {
-        auto* ln = leaf->template as_list<true>();
-        if (!ln->has(c)) return res;
-        
-        int count = ln->count();
-        if (count == 1) {
-            res.erased = true;
-            res.deleted_subtree = true;
-            res.old_nodes.push_back(leaf);
-            return res;
-        }
-        
-        // Downgrade LIST to BINARY when count goes from 3 to 2
-        if (count == 3) {
-            ptr_t bn = builder_.make_leaf_binary(leaf->skip_str());
-            auto* new_bn = bn->template as_binary<true>();
-            int src_idx = 0;
-            for (int i = 0; i < 7; ++i) {
-                unsigned char ch = ln->char_at(i);
-                if (i >= count) break;
-                if (ch == c) continue;
-                T val{};
-                ln->value_at(i).try_read(val);
-                new_bn->add_entry(ch, val);
-                ++src_idx;
-            }
-            new_bn->update_capacity_flags();
-            res.new_node = bn;
-            res.old_nodes.push_back(leaf);
-            res.erased = true;
-            return res;
-        }
-        
-        leaf->bump_version();
-        ln->remove_value(c);
-        ln->update_capacity_flags();
-        res.erased = true;
-        return res;
-    }
-
-    // Handle POP leaf
-    if (leaf->is_pop()) {
-        auto* pn = leaf->template as_pop<true>();
-        if (!pn->has(c)) return res;
-        
-        int count = pn->count();
-        // Downgrade to LIST when count goes from 8 to 7
-        if (count == 8) {
-            ptr_t ln = builder_.make_leaf_list(leaf->skip_str());
-            auto* new_ln = ln->template as_list<true>();
-            pn->valid().for_each_set([&](unsigned char ch) {
-                if (ch == c) return;
-                T val{};
-                pn->read_value(ch, val);
-                new_ln->add_value(ch, val);
-            });
-            new_ln->update_capacity_flags();
-            res.new_node = ln;
-            res.old_nodes.push_back(leaf);
-            res.erased = true;
-            return res;
-        }
-        
-        leaf->bump_version();
-        pn->remove_value(c);
-        pn->update_capacity_flags();
-        res.erased = true;
-        return res;
-    }
-
-    // Handle FULL leaf
-    auto* fn = leaf->template as_full<true>();
-    if (!fn->has(c)) return res;
     
-    int count = fn->count();
-    // Downgrade to POP when count goes from 33 to 32
-    if (count == 33) {
-        ptr_t pn = builder_.make_leaf_pop(leaf->skip_str());
-        auto* new_pn = pn->template as_pop<true>();
-        fn->valid().for_each_set([&](unsigned char ch) {
-            if (ch == c) return;
-            T val{};
-            fn->read_value(ch, val);
-            new_pn->add_value(ch, val);
-        });
-        new_pn->update_capacity_flags();
-        res.new_node = pn;
-        res.old_nodes.push_back(leaf);
+    if (!leaf->has_leaf_entry(c)) return res;
+    
+    int count = leaf->leaf_entry_count();
+    
+    // If only 1 entry, delete the subtree
+    if (count == 1) {
         res.erased = true;
+        res.deleted_subtree = true;
+        res.old_nodes.push_back(leaf);
         return res;
     }
     
-    leaf->bump_version();
-    fn->remove_value(c);
-    fn->update_capacity_flags();
-    res.erased = true;
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
+    
+    // BINARY with 2 entries -> convert to SKIP
+    if (leaf->is_binary() && count == 2) {
+        auto helper_res = ops::template binary_to_skip<false>(leaf, c, builder_, static_cast<void*>(nullptr));
+        res.new_node = helper_res.new_node;
+        if (helper_res.old_node) res.old_nodes.push_back(helper_res.old_node);
+        res.erased = helper_res.success;
+        return res;
+    }
+    
+    // Use helper for in-place remove or downgrade
+    auto helper_res = ops::template remove_entry<false, true>(leaf, c, builder_, static_cast<void*>(nullptr));
+    res.new_node = helper_res.new_node;
+    if (helper_res.old_node) res.old_nodes.push_back(helper_res.old_node);
+    res.erased = helper_res.success || helper_res.in_place;
     return res;
 }
 
@@ -373,25 +276,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_interior(ptr_t n)
     }
     if (child_cnt != 1) return res;
 
-    unsigned char c = 0;
-    ptr_t child = nullptr;
-    if (n->is_binary()) {
-        auto* bn = n->template as_binary<false>();
-        c = bn->first_char();
-        child = bn->child_at_slot(0);
-    } else if (n->is_list()) {
-        auto* ln = n->template as_list<false>();
-        c = ln->char_at(0);
-        child = ln->child_at_slot(0);
-    } else if (n->is_pop()) {
-        auto* pn = n->template as_pop<false>();
-        c = pn->first_char();
-        child = pn->child_at_slot(0);
-    } else if (n->is_full()) {
-        auto* fn = n->template as_full<false>();
-        c = fn->valid().first();
-        child = fn->get_child(c);
-    }
+    auto [c, child] = n->first_child_info();
     if (!child || builder_t::is_sentinel(child)) return res;
 
     return collapse_single_child(n, c, child, res);
@@ -409,19 +294,7 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     int eos_count = eos_exists ? 1 : 0;
 
     // Count remaining children (excluding the one being removed)
-    if (n->is_binary()) {
-        auto* bn = n->template as_binary<false>();
-        if (bn->has(removed_c)) remaining--;
-    } else if (n->is_list()) {
-        auto* ln = n->template as_list<false>();
-        if (ln->has(removed_c)) remaining--;
-    } else if (n->is_pop()) {
-        auto* pn = n->template as_pop<false>();
-        if (pn->has(removed_c)) remaining--;
-    } else if (n->is_full()) {
-        auto* fn = n->template as_full<false>();
-        if (fn->has(removed_c)) remaining--;
-    }
+    if (n->has_child(removed_c)) remaining--;
 
     int total_remaining = remaining + eos_count;
 
@@ -432,147 +305,30 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         return res;
     }
 
-    // Actually remove the child and potentially downgrade
-    if (n->is_binary()) {
-        auto* bn = n->template as_binary<false>();
-        if (bn->has(removed_c)) {
-            n->bump_version();
-            bn->remove_child(bn->find(removed_c));
-            bn->update_capacity_flags();
-        }
-    } else if (n->is_list()) {
-        auto* ln = n->template as_list<false>();
-        if (ln->has(removed_c)) {
-            // Downgrade LIST to BINARY when remaining + eos = 2
-            if (total_remaining == 2 && remaining > 0) {
-                ptr_t new_bn = builder_.make_interior_binary(n->skip_str());
-                auto* dest = new_bn->template as_binary<false>();
-                for (int i = 0; i < ln->count(); ++i) {
-                    unsigned char ch = ln->char_at(i);
-                    if (ch == removed_c) continue;
-                    dest->add_child(ch, ln->child_at_slot(i));
-                    ln->child_slot_at(i)->store(nullptr);
-                }
-                if constexpr (FIXED_LEN == 0) {
-                    if (eos_exists) {
-                        T val{};
-                        n->try_read_eos(val);
-                        dest->eos().set(val);
-                        new_bn->set_eos_flag();  // Update header flag
-                    }
-                }
-                dest->update_capacity_flags();
-                res.new_node = new_bn;
-                res.old_nodes.push_back(n);
-                
-                // Check if we can collapse the new BINARY node
-                if (dest->count() == 1 && !eos_exists) {
-                    unsigned char c = dest->first_char();
-                    ptr_t child = dest->child_at_slot(0);
-                    if (child && !builder_t::is_sentinel(child)) {
-                        auto collapse_res = collapse_single_child(new_bn, c, child, res);
-                        return collapse_res;
-                    }
-                }
-                return res;
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
+    
+    // Use helper to remove child (handles downgrade if needed)
+    auto helper_res = ops::template remove_entry<false, false>(n, removed_c, builder_, static_cast<void*>(nullptr));
+    if (helper_res.new_node) {
+        res.new_node = helper_res.new_node;
+        res.old_nodes.push_back(n);
+        
+        // Check if we can collapse the new node (after downgrade)
+        if (helper_res.new_node->child_count() == 1 && !eos_exists) {
+            auto [c, child] = helper_res.new_node->first_child_info();
+            if (child && !builder_t::is_sentinel(child)) {
+                return collapse_single_child(helper_res.new_node, c, child, res);
             }
-            n->bump_version();
-            ln->remove_child(removed_c);
-            ln->update_capacity_flags();
         }
-    } else if (n->is_pop()) {
-        auto* pn = n->template as_pop<false>();
-        if (pn->has(removed_c)) {
-            // Downgrade POP to LIST when remaining + eos <= 7
-            if (total_remaining <= 7) {
-                ptr_t new_ln = builder_.make_interior_list(n->skip_str());
-                auto* dest = new_ln->template as_list<false>();
-                int slot = 0;
-                pn->valid().for_each_set([&](unsigned char ch) {
-                    if (ch == removed_c) { ++slot; return; }
-                    dest->add_child(ch, pn->child_at_slot(slot));
-                    pn->child_slot_at(slot)->store(nullptr);
-                    ++slot;
-                });
-                if constexpr (FIXED_LEN == 0) {
-                    if (eos_exists) {
-                        T val{};
-                        n->try_read_eos(val);
-                        dest->eos().set(val);
-                        new_ln->set_eos_flag();  // Update header flag
-                    }
-                }
-                dest->update_capacity_flags();
-                res.new_node = new_ln;
-                res.old_nodes.push_back(n);
-                return res;
-            }
-            n->bump_version();
-            pn->remove_child(removed_c);
-            pn->update_capacity_flags();
-        }
-    } else if (n->is_full()) {
-        auto* fn = n->template as_full<false>();
-        if (fn->has(removed_c)) {
-            // Downgrade FULL to POP when remaining + eos <= 32
-            if (total_remaining <= POP_MAX) {
-                ptr_t new_pn = builder_.make_interior_pop(n->skip_str());
-                auto* dest = new_pn->template as_pop<false>();
-                fn->valid().for_each_set([&](unsigned char ch) {
-                    if (ch == removed_c) return;
-                    dest->add_child(ch, fn->get_child(ch));
-                    fn->get_child_slot(ch)->store(nullptr);
-                });
-                if constexpr (FIXED_LEN == 0) {
-                    if (eos_exists) {
-                        T val{};
-                        n->try_read_eos(val);
-                        dest->eos().set(val);
-                        new_pn->set_eos_flag();  // Update header flag
-                    }
-                }
-                dest->update_capacity_flags();
-                res.new_node = new_pn;
-                res.old_nodes.push_back(n);
-                return res;
-            }
-            n->bump_version();
-            fn->remove_child(removed_c);
-            fn->update_capacity_flags();
-        }
+        return res;
     }
 
-    // Check for collapse opportunity (1 child, no EOS)
-    bool can_collapse = false;
-    unsigned char c = 0;
-    ptr_t child = nullptr;
-
+    // Check for collapse opportunity (1 child, no EOS) after in-place removal
     if (!eos_exists && remaining == 1) {
-        if (n->is_binary()) {
-            auto* bn = n->template as_binary<false>();
-            c = bn->first_char();
-            child = bn->child_at_slot(0);
-            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        } else if (n->is_list()) {
-            auto* ln = n->template as_list<false>();
-            c = ln->char_at(0);
-            child = ln->child_at_slot(0);
-            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        } else if (n->is_pop()) {
-            auto* pn = n->template as_pop<false>();
-            c = pn->first_char();
-            child = pn->child_at_slot(0);
-            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
-        } else if (n->is_full()) {
-            auto* fn = n->template as_full<false>();
-            c = fn->valid().first();
-            child = fn->get_child(c);
-            can_collapse = (child != nullptr && !builder_t::is_sentinel(child));
+        auto [c, child] = n->first_child_info();
+        if (child && !builder_t::is_sentinel(child)) {
+            return collapse_single_child(n, c, child, res);
         }
-    }
-
-    if (can_collapse) {
-        return collapse_single_child(n, c, child, res);
     }
     return res;
 }
@@ -584,61 +340,19 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::collapse_single_child(
     new_skip.push_back(static_cast<char>(c));
     new_skip.append(child->skip_str());
 
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
+    
     ptr_t merged;
     if (child->is_leaf()) {
         if (child->is_skip()) {
             T val{};
             child->as_skip()->value.try_read(val);
             merged = builder_.make_leaf_skip(new_skip, val);
-        } else if (child->is_binary()) {
-            merged = builder_.make_leaf_binary(new_skip);
-            child->template as_binary<true>()->copy_values_to(merged->template as_binary<true>());
-            merged->template as_binary<true>()->update_capacity_flags();
-        } else if (child->is_list()) [[likely]] {
-            merged = builder_.make_leaf_list(new_skip);
-            child->template as_list<true>()->copy_values_to(merged->template as_list<true>());
-            merged->template as_list<true>()->update_capacity_flags();
-        } else if (child->is_pop()) {
-            merged = builder_.make_leaf_pop(new_skip);
-            child->template as_pop<true>()->copy_values_to(merged->template as_pop<true>());
-            merged->template as_pop<true>()->update_capacity_flags();
         } else {
-            merged = builder_.make_leaf_full(new_skip);
-            child->template as_full<true>()->copy_values_to(merged->template as_full<true>());
-            merged->template as_full<true>()->update_capacity_flags();
+            merged = ops::clone_leaf_with_skip(child, new_skip, builder_);
         }
     } else {
-        if (child->is_binary()) {
-            merged = builder_.make_interior_binary(new_skip);
-            child->template as_binary<false>()->move_children_to(merged->template as_binary<false>());
-            merged->template as_binary<false>()->update_capacity_flags();
-            if constexpr (FIXED_LEN == 0) {
-                if (child->has_eos()) {
-                    T val{};
-                    child->try_read_eos(val);
-                    merged->set_eos(val);
-                }
-            }
-        } else if (child->is_list()) [[likely]] {
-            merged = builder_.make_interior_list(new_skip);
-            child->template as_list<false>()->move_interior_to(merged->template as_list<false>());
-            merged->template as_list<false>()->update_capacity_flags();
-        } else if (child->is_pop()) {
-            merged = builder_.make_interior_pop(new_skip);
-            child->template as_pop<false>()->move_children_to(merged->template as_pop<false>());
-            merged->template as_pop<false>()->update_capacity_flags();
-            if constexpr (FIXED_LEN == 0) {
-                if (child->has_eos()) {
-                    T val{};
-                    child->try_read_eos(val);
-                    merged->set_eos(val);
-                }
-            }
-        } else {
-            merged = builder_.make_interior_full(new_skip);
-            child->template as_full<false>()->move_interior_to(merged->template as_full<false>());
-            merged->template as_full<false>()->update_capacity_flags();
-        }
+        merged = ops::clone_interior_with_skip(child, new_skip, builder_);
     }
 
     res.new_node = merged;
