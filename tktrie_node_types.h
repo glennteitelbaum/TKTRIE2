@@ -97,6 +97,11 @@ public:
         ++count_;
     }
     
+    // Alias for unified interface
+    void add_value(unsigned char c, const T& value) requires IS_LEAF {
+        add_entry(c, value);
+    }
+    
     void remove_entry(int idx) requires IS_LEAF {
         if (idx == 0 && count_ == 2) {
             chars_[0] = chars_[1];
