@@ -8,10 +8,6 @@ namespace gteitelbaum {
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
 
-// -----------------------------------------------------------------------------
-// Probe leaf for erase operation
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     ptr_t n, std::string_view key, erase_spec_info& info) const noexcept {
@@ -29,14 +25,12 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     info.target_version = n->version();
     info.target_skip = std::string(skip);
 
-    // SKIP leaf - delete entire node
     if (n->is_skip()) {
         if (!key.empty()) { info.op = erase_op::NOT_FOUND; return info; }
         info.op = erase_op::DELETE_SKIP_LEAF;
         return info;
     }
 
-    // BINARY, LIST, POP, or FULL leaf
     if (key.size() != 1) { info.op = erase_op::NOT_FOUND; return info; }
 
     unsigned char c = static_cast<unsigned char>(key[0]);
@@ -46,26 +40,19 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
     
     int count = n->leaf_entry_count();
     
-    // Delete last entry = delete subtree
     if (count == 1) {
         info.op = erase_op::DELETE_LAST_LEAF_ENTRY;
         return info;
     }
     
-    // BINARY with count=2 needs special conversion to SKIP
     if (n->is_binary()) {
         info.op = erase_op::BINARY_TO_SKIP;
         return info;
     }
     
-    // LIST, POP, FULL - use unified in-place op
     info.op = erase_op::IN_PLACE_LEAF;
     return info;
 }
-
-// -----------------------------------------------------------------------------
-// Probe interior for erase - handles EOS deletion
-// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
@@ -75,7 +62,6 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
     info.target_skip = std::string(n->skip_str());
     
     if (key.empty()) {
-        // Deleting EOS from interior
         if constexpr (FIXED_LEN > 0) {
             info.op = erase_op::NOT_FOUND;
             return info;
@@ -87,11 +73,10 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
         
         int child_cnt = n->child_count();
         if (child_cnt == 0) {
-            info.op = erase_op::NOT_FOUND;  // Use slow path
+            info.op = erase_op::NOT_FOUND;
             return info;
         }
         if (child_cnt == 1) {
-            // Will collapse with single child
             auto [c, child] = n->first_child_info();
             if (child && !builder_t::is_sentinel(child) && !child->is_poisoned()) {
                 info.collapse_child = child;
@@ -106,10 +91,6 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_interior_erase(
     info.op = erase_op::NOT_FOUND;
     return info;
 }
-
-// -----------------------------------------------------------------------------
-// Main probe dispatcher
-// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
@@ -157,10 +138,6 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_erase(
     return probe_leaf_erase(n, key, info);
 }
 
-// -----------------------------------------------------------------------------
-// Allocate replacement nodes for erase
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     const erase_spec_info& info) {
@@ -174,9 +151,8 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
         break;
     
     case erase_op::BINARY_TO_SKIP: {
-        // Use helper for BINARY->SKIP conversion (speculative mode)
         auto helper_res = ops::template binary_to_skip<true>(info.target, info.c, builder_, &alloc);
-        (void)helper_res;  // Result is in alloc
+        (void)helper_res;
         break;
     }
         
@@ -219,10 +195,6 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     return alloc;
 }
 
-// -----------------------------------------------------------------------------
-// Validate erase path
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexcept {
     [[assume(info.path_len >= 0 && info.path_len <= 64)]];
@@ -239,10 +211,6 @@ bool TKTRIE_CLASS::validate_erase_path(const erase_spec_info& info) const noexce
     }
     return true;
 }
-
-// -----------------------------------------------------------------------------
-// Commit erase speculation
-// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_erase_speculative(
@@ -264,12 +232,10 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     case erase_op::DELETE_LAST_LEAF_ENTRY: {
         if (!slot || slot->load() != info.target) return false;
         if (info.path_len > 1) {
-            // Must call parent's remove_child to properly update bitmap + shift array
             ptr_t parent = info.path[info.path_len - 2].node;
             unsigned char edge = info.path[info.path_len - 1].edge;
             ops::remove_child_inplace(parent, edge);
         } else {
-            // Deleting root node
             if constexpr (THREADED) {
                 slot->store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
             }
@@ -352,10 +318,6 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     return false;
 }
 
-// -----------------------------------------------------------------------------
-// Dealloc erase speculation
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
     [[assume(alloc.count >= 0 && alloc.count <= 4)]];
@@ -369,16 +331,10 @@ void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
     alloc.replacement = nullptr;
 }
 
-// -----------------------------------------------------------------------------
-// In-place erase handler - unified for LIST, POP, FULL
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::do_inplace_leaf_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
     if (leaf->version() != expected_version) return false;
     if (!leaf->has_leaf_entry(c)) return false;
-    // BINARY with count <= 2 should not reach here (handled by BINARY_TO_SKIP)
-    // LIST with count == 1 should not reach here (handled by DELETE_LAST_LEAF_ENTRY)
     using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     return ops::remove_leaf_inplace(leaf, c);
 }

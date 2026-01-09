@@ -19,11 +19,6 @@
 #define KTRIE_DEBUG_ASSERT(cond) assert(cond)
 #endif
 
-// =============================================================================
-// PLACEMENT NEW/DESTROY UTILITIES
-// C++20 compatible, uses std::construct_at/destroy_at if available (C++20+)
-// =============================================================================
-
 template <typename T, typename... Args>
 constexpr T* ktrie_construct_at(T* p, Args&&... args) {
 #if __cplusplus >= 202002L && defined(__cpp_lib_constexpr_dynamic_alloc)
@@ -45,7 +40,7 @@ constexpr void ktrie_destroy_at(T* p) {
 namespace gteitelbaum {
 
 // =============================================================================
-// ATOMIC STORAGE HELPERS - eliminates repeated if constexpr (THREADED) patterns
+// ATOMIC STORAGE HELPERS
 // =============================================================================
 
 template <typename T, bool THREADED>
@@ -91,33 +86,12 @@ public:
     }
 };
 
-// Convenience alias for size counters
 template <bool THREADED>
 using atomic_counter = atomic_storage<size_t, THREADED>;
 
 // =============================================================================
 // HEADER FLAGS AND CONSTANTS
 // =============================================================================
-
-// Header layout (11 bits flags, 53 bits version):
-// [LEAF:1][POISON:1][HAS_EOS:1][SKIP_USED:1][IS_FLOOR:1][IS_CEIL:1]
-// [IS_SKIP:1][IS_BINARY:1][IS_LIST:1][IS_POP:1][IS_FULL:1][VERSION:53]
-//
-// Flag meanings:
-//   LEAF:      Node is a leaf (stores values, not children)
-//   POISON:    Node is being retired (EBR)
-//   HAS_EOS:   Interior node has end-of-string value (FIXED_LEN==0 only)
-//   SKIP_USED: Skip string is non-empty (optimization: skip skip_str() load if false)
-//   IS_FLOOR:  At minimum count for type (erase needs structural change)
-//   IS_CEIL:   At maximum count for type (insert needs structural change)
-//   IS_SKIP/BINARY/LIST/POP/FULL: Node type (exactly one set)
-//
-// IS_FLOOR/IS_CEIL thresholds (child/value count, EOS not counted):
-//   SKIP:   floor=always, ceil=n/a (single value)
-//   BINARY: floor=always (1-2), ceil=count==2
-//   LIST:   floor=count==3, ceil=count==7
-//   POP:    floor=count==8, ceil=count==32
-//   FULL:   floor=count==33, ceil=never
 
 static constexpr uint64_t FLAG_LEAF      = 1ULL << 63;
 static constexpr uint64_t FLAG_POISON    = 1ULL << 62;
@@ -143,10 +117,8 @@ static constexpr int POP_MIN = 8;
 static constexpr int POP_MAX = 32;
 static constexpr int FULL_MIN = 33;
 
-// Interior FULL node header with poison flag set - used for retry sentinel
 static constexpr uint64_t RETRY_SENTINEL_HEADER = FLAG_POISON | FLAG_FULL;
 
-// Header queries
 inline constexpr bool is_poisoned_header(uint64_t h) noexcept {
     return (h & FLAG_POISON) != 0;
 }
@@ -157,8 +129,6 @@ inline constexpr bool is_at_floor(uint64_t h) noexcept { return (h & FLAG_IS_FLO
 inline constexpr bool is_at_ceil(uint64_t h) noexcept { return (h & FLAG_IS_CEIL) != 0; }
 inline constexpr uint64_t get_version(uint64_t h) noexcept { return h & VERSION_MASK; }
 
-// Make header with all relevant flags
-// type_flag should be one of FLAG_SKIP, FLAG_BINARY, FLAG_LIST, FLAG_POP, FLAG_FULL
 inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag, 
                                        bool skip_used = false, bool at_floor = false, 
                                        bool at_ceil = false, uint64_t version = 0) noexcept {
@@ -170,14 +140,12 @@ inline constexpr uint64_t make_header(bool is_leaf, uint64_t type_flag,
          | (version & VERSION_MASK);
 }
 
-// Bump version preserving all flags
 inline constexpr uint64_t bump_version(uint64_t h) noexcept {
     uint64_t flags = h & FLAGS_MASK;
     uint64_t ver = (h & VERSION_MASK) + 1;
     return flags | (ver & VERSION_MASK);
 }
 
-// Flag manipulation helpers
 inline constexpr uint64_t set_flag(uint64_t h, uint64_t flag) noexcept { return h | flag; }
 inline constexpr uint64_t clear_flag(uint64_t h, uint64_t flag) noexcept { return h & ~flag; }
 
@@ -213,8 +181,6 @@ constexpr T from_big_endian(T value) noexcept { return to_big_endian(value); }
 
 // =============================================================================
 // SMALL_LIST - packed list of up to 7 chars in single uint64
-// Layout: [count:8][char6:8][char5:8][char4:8][char3:8][char2:8][char1:8][char0:8]
-// Templated on THREADED to avoid atomic overhead when not needed
 // =============================================================================
 
 template <bool THREADED>
@@ -250,7 +216,7 @@ public:
     int add(unsigned char c) noexcept {
         uint64_t d = data_.load();
         int n = static_cast<int>((d >> 56) & 0xFF);
-        [[assume(n >= 0 && n < 7)]];  // Must have room to add
+        [[assume(n >= 0 && n < 7)]];
         d = (d & ~(0xFFULL << 56)) | (static_cast<uint64_t>(c) << (n * 8)) |
             (static_cast<uint64_t>(n + 1) << 56);
         data_.store(d);
@@ -275,15 +241,12 @@ public:
 
 // =============================================================================
 // BITMAP256 - 256-bit bitmap for FULL/POP nodes
-// Templated on THREADED: uses atomic operations when true
 // =============================================================================
 
 template <bool THREADED>
 class bitmap256 {
-    // Use atomic storage when THREADED, plain uint64_t otherwise
     std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> bits_[4] = {};
     
-    // Internal helpers for atomic/non-atomic access
     uint64_t load_word(int w) const noexcept {
         if constexpr (THREADED) {
             return bits_[w].load(std::memory_order_acquire);
@@ -303,7 +266,6 @@ class bitmap256 {
 public:
     constexpr bitmap256() noexcept = default;
     
-    // Copy constructor - needed because atomic is not copyable
     bitmap256(const bitmap256& other) noexcept {
         for (int w = 0; w < 4; ++w) {
             store_word(w, other.load_word(w));
@@ -346,8 +308,6 @@ public:
                std::popcount(load_word(2)) + std::popcount(load_word(3));
     }
     
-    // Get slot index for character c using popcount (branch-free)
-    // Used by POP nodes for compacted array indexing
     int slot_for(unsigned char c) const noexcept {
         int w = c >> 6;
         uint64_t mask = (1ULL << (c & 63)) - 1;
@@ -369,8 +329,6 @@ public:
         return 0;
     }
     
-    // Kernighan's method iteration - O(k) where k = popcount
-    // Note: Takes snapshot of bitmap, iteration is not atomic with concurrent modifications
     template <typename Fn>
     void for_each_set(Fn&& fn) const noexcept {
         for (int w = 0; w < 4; ++w) {
@@ -383,13 +341,6 @@ public:
         }
     }
     
-    // =========================================================================
-    // Array shift helpers for POP node operations
-    // =========================================================================
-    
-    // Shift array elements up to make room for insert at slot position
-    // Returns slot where new element should be placed
-    // Caller must: 1) set arr[slot] to new value, 2) call set(c)
     template <typename Array>
     int shift_up_for_insert(unsigned char c, Array& arr, int current_count) noexcept {
         int slot = slot_for(c);
@@ -399,9 +350,6 @@ public:
         return slot;
     }
     
-    // Clear bit and shift array elements down after removal
-    // Clears arr[new_count] after shifting
-    // Returns new count after removal
     template <typename Array, typename ClearFn>
     int shift_down_for_remove(unsigned char c, Array& arr, ClearFn&& clear_fn) noexcept {
         int slot = slot_for(c);
@@ -414,7 +362,6 @@ public:
         return new_count;
     }
     
-    // Legacy atomic_ methods - now just aliases since base operations are already atomic when THREADED
     template <bool>
     bool atomic_test(unsigned char c) const noexcept { return test(c); }
     
@@ -426,7 +373,7 @@ public:
 };
 
 // =============================================================================
-// EMPTY_MUTEX - no-op mutex for non-threaded mode
+// EMPTY_MUTEX
 // =============================================================================
 
 struct empty_mutex {
@@ -440,8 +387,6 @@ struct empty_mutex {
 
 template <size_t MAX_LEN>
 class inline_skip {
-    // Layout: bytes 0..(MAX_LEN-1) = data, last byte = length
-    // For MAX_LEN=8: 7 bytes data max + 1 byte length (supports 0-7 length)
     static_assert(MAX_LEN > 0 && MAX_LEN <= 16, "MAX_LEN must be 1-16");
     
     char data_[MAX_LEN] = {};
@@ -481,7 +426,6 @@ public:
     
     operator std::string_view() const noexcept { return view(); }
     
-    // For substr operations - returns a string_view (doesn't modify this)
     std::string_view substr(size_t pos, size_t len = std::string_view::npos) const noexcept {
         return view().substr(pos, len);
     }
@@ -490,7 +434,6 @@ public:
         std::memset(data_, 0, MAX_LEN);
     }
     
-    // Append a character (used in collapse operations)
     void push_back(char c) noexcept {
         size_t n = size();
         if (n < MAX_LEN - 1) {
@@ -499,7 +442,6 @@ public:
         }
     }
     
-    // Append another skip's contents
     void append(std::string_view sv) noexcept {
         size_t n = size();
         size_t add = sv.size();
@@ -509,7 +451,6 @@ public:
     }
 };
 
-// Type selector for skip storage
 template <size_t FIXED_KEY_LEN>
 using skip_storage_t = std::conditional_t<
     FIXED_KEY_LEN == 0,
@@ -521,7 +462,6 @@ using skip_storage_t = std::conditional_t<
 // SKIP MATCHING
 // =============================================================================
 
-// Reader version - check if key starts with skip and consume it if so
 inline bool consume_prefix(std::string_view& key, std::string_view skip) noexcept {
     size_t sz = skip.size();
     if (sz > key.size() || std::memcmp(skip.data(), key.data(), sz) != 0) return false;
@@ -529,7 +469,6 @@ inline bool consume_prefix(std::string_view& key, std::string_view skip) noexcep
     return true;
 }
 
-// Insert version - returns mismatch position (needed for split operations)
 inline size_t match_skip_impl(std::string_view skip, std::string_view key) noexcept {
     size_t min_len = skip.size() < key.size() ? skip.size() : key.size();
     if (std::memcmp(skip.data(), key.data(), min_len) == 0) return min_len;

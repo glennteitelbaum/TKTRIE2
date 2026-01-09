@@ -43,7 +43,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::insert_into_leaf(
         return extend_leaf_skip(leaf, key, value, m);
     }
 
-    // BINARY, LIST, POP, or FULL leaf
     size_t m = match_skip_impl(leaf_skip, key);
     if ((m < leaf_skip.size()) & (m < key.size())) return split_leaf_multi(leaf, key, value, m);
     if (m < leaf_skip.size()) return prefix_leaf_multi(leaf, key, value, m);
@@ -107,7 +106,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-    // If both keys have exactly 1 char remaining, create a BINARY leaf
     if (old_skip.size() == m + 1 && key.size() == m + 1) {
         ptr_t binary = builder_.make_leaf_binary(common);
         T old_value;
@@ -121,7 +119,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_leaf_skip(
         return res;
     }
 
-    // Otherwise create interior node with children
     ptr_t interior = builder_.make_interior_binary(common);
     T old_value;
     leaf->as_skip()->value.try_read(old_value);
@@ -147,8 +144,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_skip(
     leaf->as_skip()->value.try_read(old_value);
     ptr_t child = builder_.make_leaf_skip(old_skip.substr(m + 1), old_value);
 
-    // For FIXED_LEN==0: 1 child + EOS = 2 entries -> BINARY
-    // For FIXED_LEN>0: 1 child = 1 entry -> still need to store, use BINARY with 1 child
     ptr_t interior = builder_.make_interior_binary(std::string(key));
     if constexpr (FIXED_LEN == 0) {
         interior->set_eos(value);
@@ -168,8 +163,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::extend_leaf_skip(
     insert_result res;
     std::string_view old_skip = leaf->skip_str();
 
-    // For FIXED_LEN==0: EOS + 1 child = 2 entries -> BINARY
-    // For FIXED_LEN>0: 1 child = 1 entry, use BINARY
     ptr_t interior = builder_.make_interior_binary(std::string(old_skip));
     if constexpr (FIXED_LEN == 0) {
         T old_value;
@@ -216,7 +209,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_leaf_multi(
     insert_result res;
     std::string_view old_skip = leaf->skip_str();
 
-    // 1 child (+ EOS for FIXED_LEN==0) -> BINARY
     ptr_t interior = builder_.make_interior_binary(std::string(key));
     if constexpr (FIXED_LEN == 0) {
         interior->set_eos(value);
@@ -247,7 +239,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::add_eos_to_leaf_multi(ptr_t l
     } else {
         using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
         
-        // Create interior and add all leaf entries as SKIP children
         ptr_t interior = ops::leaf_to_interior(leaf, builder_);
         interior->set_eos(value);
         
@@ -281,16 +272,13 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::demote_leaf_multi(
     
     using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     
-    // Create new child for the value we're inserting (if not matching existing)
     ptr_t new_child = existing ? nullptr : create_leaf_for_key(key.substr(1), value);
     
-    // Convert leaf to interior, adding new child if needed
     ptr_t interior = ops::leaf_to_interior(leaf, builder_, 
                                             existing ? 0 : first_c, 
                                             new_child);
     
     if (existing) {
-        // Recurse into the existing child
         ptr_t child = interior->get_child(first_c);
         atomic_ptr* child_slot = interior->get_child_slot(first_c);
         auto child_res = insert_impl(child_slot, child, key.substr(1), value);
@@ -316,7 +304,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::split_interior(
     unsigned char old_c = static_cast<unsigned char>(old_skip[m]);
     unsigned char new_c = static_cast<unsigned char>(key[m]);
 
-    // 2 children -> BINARY
     ptr_t new_int = builder_.make_interior_binary(common);
     ptr_t old_child = clone_interior_with_skip(n, old_skip.substr(m + 1));
     ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
@@ -342,7 +329,6 @@ typename TKTRIE_CLASS::insert_result TKTRIE_CLASS::prefix_interior(
     insert_result res;
     std::string_view old_skip = n->skip_str();
 
-    // 1 child + EOS (FIXED_LEN==0) = 2 entries -> BINARY
     ptr_t new_int = builder_.make_interior_binary(std::string(key));
     if constexpr (FIXED_LEN == 0) {
         new_int->set_eos(value);

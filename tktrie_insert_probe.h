@@ -12,7 +12,7 @@ TKTRIE_TEMPLATE
 typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     ptr_t n, std::string_view key, speculative_info& info) const noexcept {
     if (n->is_poisoned()) {
-        info.op = spec_op::RETRY;  // Signal retry, not EXISTS
+        info.op = spec_op::RETRY;
         return info;
     }
     
@@ -33,7 +33,6 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
         return info;
     }
 
-    // BINARY, LIST, POP, or FULL leaf
     info.target = n;
     info.target_version = n->version();
     info.target_skip = std::string(skip);
@@ -59,20 +58,17 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_leaf_speculative(
     unsigned char c = static_cast<unsigned char>(key[0]);
     info.c = c;
 
-    // Use unified entry check
     if (n->has_leaf_entry(c)) { info.op = spec_op::EXISTS; return info; }
     
-    // Use at_ceil() flag to determine if upgrade needed
     if (!n->at_ceil()) {
         info.op = spec_op::IN_PLACE_LEAF;
         return info;
     }
     
-    // At capacity - need upgrade (type determines which upgrade)
     if (n->is_binary()) { info.op = spec_op::BINARY_TO_LIST_LEAF; }
     else if (n->is_list()) { info.op = spec_op::LIST_TO_POP_LEAF; }
     else if (n->is_pop()) { info.op = spec_op::POP_TO_FULL_LEAF; }
-    else { info.op = spec_op::IN_PLACE_LEAF; }  // FULL never at ceil
+    else { info.op = spec_op::IN_PLACE_LEAF; }
     return info;
 }
 
@@ -88,7 +84,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
     }
 
     if (n->is_poisoned()) {
-        info.op = spec_op::RETRY;  // Signal retry, not EXISTS
+        info.op = spec_op::RETRY;
         return info;
     }
 
@@ -137,7 +133,6 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             info.c = c;
             info.remaining_key = std::string(key.substr(1));
 
-            // Use at_ceil() flag to determine if upgrade needed
             if (!n->at_ceil()) {
                 info.op = spec_op::IN_PLACE_INTERIOR;
             } else if (n->is_binary()) {
@@ -147,7 +142,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
             } else if (n->is_pop()) {
                 info.op = spec_op::POP_TO_FULL_INTERIOR;
             } else {
-                info.op = spec_op::IN_PLACE_INTERIOR;  // FULL never at ceil
+                info.op = spec_op::IN_PLACE_INTERIOR;
             }
             return info;
         }
@@ -156,7 +151,7 @@ typename TKTRIE_CLASS::speculative_info TKTRIE_CLASS::probe_speculative(
         n = child;
         
         if (n->is_poisoned()) {
-            info.op = spec_op::RETRY;  // Signal retry, not EXISTS
+            info.op = spec_op::RETRY;
             return info;
         }
         
@@ -178,8 +173,6 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 
     using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     
-    // Allocate AND fill data outside lock - speculative reads are validated later
-    // All new nodes are poisoned so dealloc_node won't recurse into borrowed children
     switch (info.op) {
     case spec_op::EMPTY_TREE: {
         alloc.root_replacement = create_leaf_for_key(key, value);
@@ -198,7 +191,8 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
         ptr_t interior = builder_.make_interior_list(common);
         ptr_t old_child = builder_.make_leaf_skip(skip.substr(m + 1), old_value);
         ptr_t new_child = create_leaf_for_key(key.substr(m + 1), value);
-        interior->template as_list<false>()->add_two_children(old_c, old_child, new_c, new_child);
+        interior->template as_list<false>()->add_entry(old_c, old_child);
+        interior->template as_list<false>()->add_entry(new_c, new_child);
         interior->template as_list<false>()->update_capacity_flags();
 
         interior->poison();
@@ -300,7 +294,7 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::LIST_TO_POP_LEAF:
     case spec_op::POP_TO_FULL_LEAF: {
         auto helper_res = ops::template upgrade<true, true>(info.target, info.c, value, builder_, &alloc);
-        (void)helper_res;  // Result is stored in alloc
+        (void)helper_res;
         break;
     }
     case spec_op::SPLIT_INTERIOR: {
@@ -347,18 +341,15 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
     case spec_op::BINARY_TO_LIST_INTERIOR:
     case spec_op::LIST_TO_POP_INTERIOR:
     case spec_op::POP_TO_FULL_INTERIOR: {
-        // Create child first
         ptr_t child = create_leaf_for_key(info.remaining_key, value);
         child->poison();
         
-        // Use helper for interior upgrade
         auto helper_res = ops::template upgrade<true, false>(info.target, info.c, child, builder_, &alloc);
         if (helper_res.success) {
-            alloc.add(child);  // Add child to alloc for deallocation if commit fails
+            alloc.add(child);
         }
         break;
     }
-    // These are handled differently (in-place or complex)
     case spec_op::EXISTS:
     case spec_op::RETRY:
     case spec_op::IN_PLACE_LEAF:
@@ -374,7 +365,6 @@ typename TKTRIE_CLASS::pre_alloc TKTRIE_CLASS::allocate_speculative(
 TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::validate_path(const speculative_info& info) const noexcept {
     [[assume(info.path_len >= 0 && info.path_len <= 64)]];
-    // Version check is sufficient - poison() bumps version
     for (int i = 0; i < info.path_len; ++i) {
         if (info.path[i].node->version() != info.path[i].version) return false;
     }
@@ -414,12 +404,9 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_speculative(
     speculative_info& info, pre_alloc& alloc, [[maybe_unused]] const T& value) {
     
-    // All data already filled in allocate_speculative - just validate and swap
-    // On success, unpoison all nodes so they become live
     switch (info.op) {
     case spec_op::EMPTY_TREE:
         if (root_.load() != nullptr) return false;
-        // Unpoison before making visible
         [[assume(alloc.count >= 0 && alloc.count <= 8)]];
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
@@ -442,7 +429,6 @@ bool TKTRIE_CLASS::commit_speculative(
     case spec_op::POP_TO_FULL_INTERIOR: {
         atomic_ptr* slot = get_verified_slot(info);
         if (!slot) return false;
-        // Unpoison before making visible
         [[assume(alloc.count >= 0 && alloc.count <= 8)]];
         for (int i = 0; i < alloc.count; ++i) {
             if (alloc.nodes[i]) alloc.nodes[i]->unpoison();
@@ -451,7 +437,6 @@ bool TKTRIE_CLASS::commit_speculative(
         return true;
     }
 
-    // These should not reach commit_speculative
     case spec_op::EXISTS:
     case spec_op::RETRY:
     case spec_op::IN_PLACE_LEAF:
@@ -466,7 +451,6 @@ bool TKTRIE_CLASS::commit_speculative(
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::dealloc_speculation(pre_alloc& alloc) {
     [[assume(alloc.count >= 0 && alloc.count <= 8)]];
-    // Iterate all allocated nodes - dealloc_node handles poison (won't recurse into borrowed children)
     for (int i = 0; i < alloc.count; ++i) {
         if (alloc.nodes[i]) {
             builder_.dealloc_node(alloc.nodes[i]);
@@ -503,7 +487,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
     } else {
         using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
         
-        // Writers cleanup at 1x threshold
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
             ebr_cleanup();
         }
@@ -517,7 +500,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             
             stat_attempt();
 
-            // RETRY means concurrent write detected - try again
             if (spec.op == spec_op::RETRY) {
                 continue;
             }
@@ -528,19 +510,16 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, kb, value), false};
             }
 
-            // In-place leaf - no allocation, brief lock
             if (spec.op == spec_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_path(spec)) continue;
                 
-                // Check entry doesn't exist and we have capacity
                 if (spec.target->has_leaf_entry(spec.c)) continue;
                 if (spec.target->at_ceil()) continue;
                 
                 epoch_.fetch_add(1, std::memory_order_release);
                 auto add_res = ops::template add_entry<false, true>(spec.target, spec.c, value, builder_);
                 if (!add_res.success || !add_res.in_place) {
-                    // Shouldn't happen after our checks, but handle gracefully
                     continue;
                 }
                 
@@ -550,11 +529,9 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, kb, value), true};
             }
 
-            // In-place interior - brief lock
             if (spec.op == spec_op::IN_PLACE_INTERIOR) {
                 if (spec.is_eos) {
                     if constexpr (FIXED_LEN > 0) {
-                        // Can't happen for fixed-length keys
                         continue;
                     } else {
                         std::lock_guard<mutex_t> lock(mutex_);
@@ -572,21 +549,18 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                         return {iterator(this, kb, value), true};
                     }
                 } else {
-                    // Adding child to interior - allocate child outside lock
                     ptr_t child = create_leaf_for_key(spec.remaining_key, value);
                     std::lock_guard<mutex_t> lock(mutex_);
                     if (!validate_path(spec)) { builder_.dealloc_node(child); continue; }
                     
                     ptr_t n = spec.target;
                     
-                    // Check child doesn't exist and we have capacity
                     if (n->has_child(spec.c)) { builder_.dealloc_node(child); continue; }
                     if (n->at_ceil()) { builder_.dealloc_node(child); continue; }
                     
                     epoch_.fetch_add(1, std::memory_order_release);
                     auto add_res = ops::template add_entry<false, false>(n, spec.c, child, builder_);
                     if (!add_res.success || !add_res.in_place) {
-                        // Shouldn't happen after our checks
                         builder_.dealloc_node(child);
                         continue;
                     }
@@ -598,15 +572,11 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
             }
 
-            // Complex ops that need full speculative path (ADD_EOS_LEAF_MULTI, DEMOTE_LEAF_MULTI)
-            // Fall through to allocation-based speculative or fallback
             if (spec.op == spec_op::ADD_EOS_LEAF_MULTI || spec.op == spec_op::DEMOTE_LEAF_MULTI) {
-                // These are complex - use fallback
                 if (retry == MAX_RETRIES) break;
                 continue;
             }
 
-            // Speculative path: allocate outside lock, then brief lock for commit
             pre_alloc alloc = allocate_speculative(spec, value);
             
             if (alloc.root_replacement) {
@@ -617,8 +587,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 }
                 
                 if (commit_speculative(spec, alloc, value)) {
-                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
-                    // Retire old node
+                    epoch_.fetch_add(1, std::memory_order_release);
                     if (spec.target) {
                         retire_node(spec.target);
                         if (retired_any) *retired_any = true;
@@ -633,7 +602,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
             }
         }
         
-        // Fallback after MAX_RETRIES
         stat_fallback();
         {
             std::lock_guard<mutex_t> lock(mutex_);
@@ -648,7 +616,7 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert_locked(
                 return {iterator(this, kb, value), false};
             }
             
-            epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+            epoch_.fetch_add(1, std::memory_order_release);
             if (res.new_node) {
                 root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
                 root_.store(res.new_node);

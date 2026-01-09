@@ -5,7 +5,6 @@
 
 namespace gteitelbaum {
 
-// Helper for optional EOS field
 struct empty_eos {};
 
 // =============================================================================
@@ -25,6 +24,7 @@ struct skip_node : node_with_skip<T, THREADED, Allocator, FIXED_LEN> {
 
 // =============================================================================
 // BINARY_NODE - 1-2 entries, unified leaf/interior
+// Uses count_ for construction logic, mult_ for branchless find()
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF>
@@ -45,7 +45,8 @@ private:
     
     [[no_unique_address]] std::conditional_t<HAS_EOS, eos_data_t, empty_eos> eos_;
     unsigned char chars_[2] = {};
-    int count_ = 0;
+    char count_ = 0;    // Explicit count: 0, 1, 2 (cold path)
+    int mult_ = 0;      // Branchless encoding: 0 or 2 (hot path)
     std::array<element_t, 2> elements_;
     
 public:
@@ -61,10 +62,9 @@ public:
         return (count_ > 0 && chars_[0] == c) || (count_ > 1 && chars_[1] == c); 
     }
     
+    // Branchless find using mult_: returns -1 (not found), 0, or 1
     int find(unsigned char c) const noexcept {
-        if (count_ > 0 && chars_[0] == c) return 0;
-        if (count_ > 1 && chars_[1] == c) return 1;
-        return -1;
+        return -1 + (chars_[0] == c) + mult_ * (chars_[1] == c);
     }
     
     unsigned char first_char() const noexcept { return chars_[0]; }
@@ -91,10 +91,27 @@ public:
         return elements_[idx].try_read(out);
     }
     
+    // Unified add_entry for leaf nodes
     void add_entry(unsigned char c, const T& value) requires IS_LEAF {
-        chars_[count_] = c;
-        elements_[count_].set(value);
-        ++count_;
+        if (count_ == 0) {
+            chars_[0] = c;
+            elements_[0].set(value);
+            count_ = 1;
+            mult_ = 0;
+        } else {
+            // Adding second entry - keep sorted
+            if (c < chars_[0]) {
+                chars_[1] = chars_[0];
+                elements_[1] = std::move(elements_[0]);
+                chars_[0] = c;
+                elements_[0].set(value);
+            } else {
+                chars_[1] = c;
+                elements_[1].set(value);
+            }
+            count_ = 2;
+            mult_ = 2;
+        }
     }
     
     void remove_entry(unsigned char c) requires IS_LEAF {
@@ -105,17 +122,18 @@ public:
             elements_[0] = std::move(elements_[1]);
         }
         --count_;
+        mult_ = (count_ == 2) ? 2 : 0;
     }
     
     void copy_values_to(binary_node* dest) const requires IS_LEAF {
         dest->count_ = count_;
+        dest->mult_ = mult_;
         for (int i = 0; i < count_; ++i) {
             dest->chars_[i] = chars_[i];
             dest->elements_[i].deep_copy_from(elements_[i]);
         }
     }
     
-    // For compatibility with existing code that accesses chars/values directly
     unsigned char char_at(int i) const noexcept { return chars_[i]; }
     data_t& value_at(int i) noexcept requires IS_LEAF { return elements_[i]; }
     const data_t& value_at(int i) const noexcept requires IS_LEAF { return elements_[i]; }
@@ -141,10 +159,27 @@ public:
         return &elements_[slot];
     }
     
+    // Unified add_entry for interior nodes
     void add_entry(unsigned char c, ptr_t child) requires (!IS_LEAF) {
-        chars_[count_] = c;
-        elements_[count_].store(child);
-        ++count_;
+        if (count_ == 0) {
+            chars_[0] = c;
+            elements_[0].store(child);
+            count_ = 1;
+            mult_ = 0;
+        } else {
+            // Adding second entry - keep sorted
+            if (c < chars_[0]) {
+                chars_[1] = chars_[0];
+                elements_[1] = elements_[0];
+                chars_[0] = c;
+                elements_[0].store(child);
+            } else {
+                chars_[1] = c;
+                elements_[1].store(child);
+            }
+            count_ = 2;
+            mult_ = 2;
+        }
     }
     
     void remove_entry(unsigned char c) requires (!IS_LEAF) {
@@ -156,20 +191,24 @@ public:
         }
         elements_[count_ - 1].store(nullptr);
         --count_;
+        mult_ = (count_ == 2) ? 2 : 0;
     }
     
     void move_children_to(binary_node* dest) requires (!IS_LEAF) {
         dest->count_ = count_;
+        dest->mult_ = mult_;
         for (int i = 0; i < count_; ++i) {
             dest->chars_[i] = chars_[i];
             dest->elements_[i] = elements_[i];
             elements_[i].store(nullptr);
         }
         count_ = 0;
+        mult_ = 0;
     }
     
     void copy_children_to(binary_node* dest) const requires (!IS_LEAF) {
         dest->count_ = count_;
+        dest->mult_ = mult_;
         for (int i = 0; i < count_; ++i) {
             dest->chars_[i] = chars_[i];
             dest->elements_[i] = elements_[i];
@@ -219,15 +258,11 @@ public:
     list_node() = default;
     ~list_node() = default;
     
-    // -------------------------------------------------------------------------
-    // Common interface
-    // -------------------------------------------------------------------------
     int count() const noexcept { return chars_.count(); }
     bool has(unsigned char c) const noexcept { return chars_.find(c) >= 0; }
     int find(unsigned char c) const noexcept { return chars_.find(c); }
     unsigned char char_at(int i) const noexcept { return chars_.char_at(i); }
     
-    // Access to chars for iteration
     const small_list<THREADED>& chars() const noexcept { return chars_; }
     
     void update_capacity_flags() noexcept {
@@ -236,9 +271,6 @@ public:
         if (cnt >= LIST_MAX) this->set_ceil(); else this->clear_ceil();
     }
     
-    // -------------------------------------------------------------------------
-    // EOS interface (interior + FIXED_LEN==0 only)
-    // -------------------------------------------------------------------------
     int entry_count() const noexcept requires HAS_EOS { 
         return count() + (eos_.has_data() ? 1 : 0); 
     }
@@ -246,9 +278,6 @@ public:
     eos_data_t& eos() noexcept requires HAS_EOS { return eos_; }
     const eos_data_t& eos() const noexcept requires HAS_EOS { return eos_; }
     
-    // -------------------------------------------------------------------------
-    // Leaf interface (values)
-    // -------------------------------------------------------------------------
     bool read_value(int idx, T& out) const noexcept requires IS_LEAF {
         [[assume(idx >= 0 && idx < 7)]];
         return elements_[idx].try_read(out);
@@ -294,9 +323,6 @@ public:
     data_t& value_at(int i) noexcept requires IS_LEAF { return elements_[i]; }
     const data_t& value_at(int i) const noexcept requires IS_LEAF { return elements_[i]; }
     
-    // -------------------------------------------------------------------------
-    // Interior interface (children)
-    // -------------------------------------------------------------------------
     ptr_t get_child(unsigned char c) const noexcept requires (!IS_LEAF) {
         int idx = chars_.find(c);
         return idx >= 0 ? elements_[idx].load() : nullptr;
@@ -373,7 +399,6 @@ public:
         copy_children_to(dest);
     }
     
-    // Forward declarations for full_node interactions
     void move_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) 
         requires (!IS_LEAF);
     void copy_interior_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const 
@@ -381,7 +406,7 @@ public:
 };
 
 // =============================================================================
-// POP_NODE - 8-32 entries using popcount indexing, unified leaf/interior
+// POP_NODE - 8-32 entries using popcount indexing
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF>
@@ -394,7 +419,7 @@ public:
     using data_t = typename base_t::data_t;
     using eos_data_t = typename base_t::eos_data_t;
     
-    static constexpr int MAX_ENTRIES = POP_MAX;  // 32
+    static constexpr int MAX_ENTRIES = POP_MAX;
     static constexpr bool HAS_EOS = !IS_LEAF && (FIXED_LEN == 0);
     
 private:
@@ -408,9 +433,6 @@ public:
     pop_node() = default;
     ~pop_node() = default;
     
-    // -------------------------------------------------------------------------
-    // Common interface
-    // -------------------------------------------------------------------------
     int count() const noexcept { return valid_.count(); }
     bool has(unsigned char c) const noexcept { return valid_.test(c); }
     
@@ -420,11 +442,9 @@ public:
     
     unsigned char first_char() const noexcept { return valid_.first(); }
     
-    // Direct slot access (for iteration)
     element_t& element_at_slot(int slot) noexcept { return elements_[slot]; }
     const element_t& element_at_slot(int slot) const noexcept { return elements_[slot]; }
     
-    // Access to bitmap for iteration
     const bitmap256<THREADED>& valid() const noexcept { return valid_; }
     
     void update_capacity_flags() noexcept {
@@ -433,9 +453,6 @@ public:
         if (cnt >= POP_MAX) this->set_ceil(); else this->clear_ceil();
     }
     
-    // -------------------------------------------------------------------------
-    // EOS interface (interior + FIXED_LEN==0 only)
-    // -------------------------------------------------------------------------
     int entry_count() const noexcept requires HAS_EOS { 
         return count() + (eos_.has_data() ? 1 : 0); 
     }
@@ -443,9 +460,6 @@ public:
     eos_data_t& eos() noexcept requires HAS_EOS { return eos_; }
     const eos_data_t& eos() const noexcept requires HAS_EOS { return eos_; }
     
-    // -------------------------------------------------------------------------
-    // Leaf interface (values)
-    // -------------------------------------------------------------------------
     bool read_value(unsigned char c, T& out) const noexcept requires IS_LEAF {
         if (!valid_.test(c)) return false;
         return elements_[valid_.slot_for(c)].try_read(out);
@@ -469,9 +483,6 @@ public:
         }
     }
     
-    // -------------------------------------------------------------------------
-    // Interior interface (children)
-    // -------------------------------------------------------------------------
     ptr_t get_child(unsigned char c) const noexcept requires (!IS_LEAF) {
         if (!valid_.test(c)) return nullptr;
         return elements_[valid_.slot_for(c)].load();
@@ -531,7 +542,6 @@ public:
         copy_children_to(dest);
     }
     
-    // For conversion to FULL
     void move_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) 
         requires (!IS_LEAF);
     void copy_children_to_full(full_node<T, THREADED, Allocator, FIXED_LEN, false>* dest) const 
@@ -539,7 +549,7 @@ public:
 };
 
 // =============================================================================
-// FULL_NODE - 33+ entries using direct indexing, unified leaf/interior
+// FULL_NODE - 33+ entries using direct indexing
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN, bool IS_LEAF>
@@ -565,24 +575,17 @@ public:
     full_node() = default;
     ~full_node() = default;
     
-    // -------------------------------------------------------------------------
-    // Common interface
-    // -------------------------------------------------------------------------
     int count() const noexcept { return valid_.count(); }
     bool has(unsigned char c) const noexcept { return valid_.test(c); }
     
-    // Access to bitmap for iteration
     const bitmap256<THREADED>& valid() const noexcept { return valid_; }
     
     void update_capacity_flags() noexcept {
         int cnt = count();
         if (cnt <= FULL_MIN) this->set_floor(); else this->clear_floor();
-        this->clear_ceil();  // FULL never at ceiling
+        this->clear_ceil();
     }
     
-    // -------------------------------------------------------------------------
-    // EOS interface (interior + FIXED_LEN==0 only)
-    // -------------------------------------------------------------------------
     int entry_count() const noexcept requires HAS_EOS { 
         return count() + (eos_.has_data() ? 1 : 0); 
     }
@@ -590,9 +593,6 @@ public:
     eos_data_t& eos() noexcept requires HAS_EOS { return eos_; }
     const eos_data_t& eos() const noexcept requires HAS_EOS { return eos_; }
     
-    // -------------------------------------------------------------------------
-    // Leaf interface (values)
-    // -------------------------------------------------------------------------
     bool read_value(unsigned char c, T& out) const noexcept requires IS_LEAF {
         return elements_[c].try_read(out);
     }
@@ -624,9 +624,6 @@ public:
         });
     }
     
-    // -------------------------------------------------------------------------
-    // Interior interface (children)
-    // -------------------------------------------------------------------------
     ptr_t get_child(unsigned char c) const noexcept requires (!IS_LEAF) {
         return elements_[c].load();
     }

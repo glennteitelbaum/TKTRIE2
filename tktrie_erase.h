@@ -10,11 +10,10 @@ namespace gteitelbaum {
 
 TKTRIE_TEMPLATE
 std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
-    // Returns (erased, retired_any)
     auto apply_erase_result = [this](erase_result& res) -> std::pair<bool, bool> {
         if (!res.erased) return {false, false};
         if constexpr (THREADED) {
-            epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+            epoch_.fetch_add(1, std::memory_order_release);
         }
         if (res.deleted_subtree) {
             if constexpr (THREADED) root_.store(get_retry_sentinel<T, THREADED, Allocator, FIXED_LEN>());
@@ -34,7 +33,6 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
         auto res = erase_impl(&root_, root_.load(), kb);
         return apply_erase_result(res);
     } else {
-        // Writers cleanup at 1x threshold
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
             ebr_cleanup();
         }
@@ -51,7 +49,6 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 return {false, false};
             }
 
-            // In-place operations - no allocation needed
             if (info.op == erase_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
@@ -64,7 +61,6 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 continue;
             }
 
-            // Speculative path: allocate outside lock, brief lock for commit
             erase_pre_alloc alloc = allocate_erase_speculative(info);
             
             {
@@ -75,24 +71,20 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                 }
                 
                 if (commit_erase_speculative(info, alloc)) {
-                    epoch_.fetch_add(1, std::memory_order_release);  // Signal readers
+                    epoch_.fetch_add(1, std::memory_order_release);
                     
-                    // Determine if target should be retired based on operation type
                     bool should_retire_target = false;
                     switch (info.op) {
                         case erase_op::DELETE_SKIP_LEAF:
                         case erase_op::DELETE_LAST_LEAF_ENTRY:
                         case erase_op::BINARY_TO_SKIP:
                         case erase_op::DELETE_CHILD_COLLAPSE:
-                            // Node was removed/replaced
                             should_retire_target = true;
                             break;
                         case erase_op::DELETE_EOS_INTERIOR:
-                            // Only retire if we replaced (collapse case), not in-place clear
                             should_retire_target = (alloc.replacement != nullptr);
                             break;
                         case erase_op::DELETE_CHILD_NO_COLLAPSE:
-                            // In-place removal, target stays in tree
                             should_retire_target = false;
                             break;
                         default:
@@ -105,7 +97,6 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
                         retired_any = true;
                     }
                     if (info.collapse_child) {
-                        // Collapse child is always retired when set
                         retire_node(info.collapse_child);
                         retired_any = true;
                     }
@@ -118,7 +109,6 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             }
         }
         
-        // Fallback after MAX_RETRIES
         {
             std::lock_guard<mutex_t> lock(mutex_);
             auto res = erase_impl(&root_, root_.load(), kb);
@@ -147,7 +137,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     if (m < skip.size()) return res;
     key.remove_prefix(m);
 
-    // SKIP leaf - delete entire node
     if (leaf->is_skip()) {
         if (!key.empty()) return res;
         res.erased = true;
@@ -156,7 +145,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         return res;
     }
 
-    // Multi-entry leaf (BINARY, LIST, POP, FULL)
     if (key.size() != 1) return res;
     unsigned char c = static_cast<unsigned char>(key[0]);
     
@@ -164,7 +152,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     
     int count = leaf->leaf_entry_count();
     
-    // If only 1 entry, delete the subtree
     if (count == 1) {
         res.erased = true;
         res.deleted_subtree = true;
@@ -174,7 +161,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
     
     using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     
-    // BINARY with 2 entries -> convert to SKIP
     if (leaf->is_binary() && count == 2) {
         auto helper_res = ops::template binary_to_skip<false>(leaf, c, builder_, static_cast<void*>(nullptr));
         res.new_node = helper_res.new_node;
@@ -183,7 +169,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::erase_from_leaf(
         return res;
     }
     
-    // Use helper for in-place remove or downgrade
     auto helper_res = ops::template remove_entry<false, true>(leaf, c, builder_, static_cast<void*>(nullptr));
     res.new_node = helper_res.new_node;
     if (helper_res.old_node) res.old_nodes.push_back(helper_res.old_node);
@@ -269,12 +254,10 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
     int remaining = n->child_count();
     int eos_count = eos_exists ? 1 : 0;
 
-    // Count remaining children (excluding the one being removed)
     if (n->has_child(removed_c)) remaining--;
 
     int total_remaining = remaining + eos_count;
 
-    // Delete if empty
     if (total_remaining == 0) {
         res.deleted_subtree = true;
         res.old_nodes.push_back(n);
@@ -283,13 +266,11 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
 
     using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
     
-    // Use helper to remove child (handles downgrade if needed)
     auto helper_res = ops::template remove_entry<false, false>(n, removed_c, builder_, static_cast<void*>(nullptr));
     if (helper_res.new_node) {
         res.new_node = helper_res.new_node;
         res.old_nodes.push_back(n);
         
-        // Check if we can collapse the new node (after downgrade)
         if (helper_res.new_node->child_count() == 1 && !eos_exists) {
             auto [c, child] = helper_res.new_node->first_child_info();
             if (child && !builder_t::is_sentinel(child)) {
@@ -299,7 +280,6 @@ typename TKTRIE_CLASS::erase_result TKTRIE_CLASS::try_collapse_after_child_remov
         return res;
     }
 
-    // Check for collapse opportunity (1 child, no EOS) after in-place removal
     if (!eos_exists && remaining == 1) {
         auto [c, child] = n->first_child_info();
         if (child && !builder_t::is_sentinel(child)) {

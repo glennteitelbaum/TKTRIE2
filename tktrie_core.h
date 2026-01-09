@@ -8,23 +8,13 @@ namespace gteitelbaum {
 #define TKTRIE_TEMPLATE template <typename Key, typename T, bool THREADED, typename Allocator>
 #define TKTRIE_CLASS tktrie<Key, T, THREADED, Allocator>
 
-// -----------------------------------------------------------------------------
-// Static helpers
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::node_deleter(void* ptr) {
     if (!ptr) return;
     auto* n = static_cast<ptr_t>(ptr);
     if (builder_t::is_sentinel(n)) return;
-    // Retired nodes are poisoned and have BORROWED children (now owned by replacement)
-    // So we just delete the single node, not recursively
     builder_t::delete_node(n);
 }
-
-// -----------------------------------------------------------------------------
-// Instance helpers
-// -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::retire_node(ptr_t n) {
@@ -32,7 +22,7 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
     if constexpr (THREADED) {
         n->poison();
         uint64_t epoch = epoch_.load(std::memory_order_acquire);
-        ebr_retire(n, epoch);  // Lock-free
+        ebr_retire(n, epoch);
     } else {
         node_deleter(n);
     }
@@ -40,7 +30,6 @@ void TKTRIE_CLASS::retire_node(ptr_t n) {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_retire(ptr_t n, uint64_t epoch) {
-    // Lock-free push using external retire_entry wrapper
     if constexpr (THREADED) {
         auto* entry = new retire_entry_t(n, epoch);
         retire_entry_t* old_head = retired_head_.load(std::memory_order_relaxed);
@@ -67,7 +56,6 @@ size_t TKTRIE_CLASS::reader_enter() const noexcept {
                 return slot;
             }
             slot = (slot + 1) % EBR_PADDED_SLOTS;
-            // If we wrapped around, keep trying - a slot will free up
         }
     }
     return 0;
@@ -87,7 +75,6 @@ uint64_t TKTRIE_CLASS::min_reader_epoch() const noexcept {
         uint64_t current = epoch_.load(std::memory_order_seq_cst);
         uint64_t min_e = current;
         for (size_t i = 0; i < EBR_PADDED_SLOTS; ++i) {
-            // Use seq_cst to ensure we see all reader_enter stores
             uint64_t e = reader_epochs_[i].epoch.load(std::memory_order_seq_cst);
             if (e != 0 && e < min_e) {
                 min_e = e;
@@ -100,18 +87,15 @@ uint64_t TKTRIE_CLASS::min_reader_epoch() const noexcept {
 
 TKTRIE_TEMPLATE
 void TKTRIE_CLASS::ebr_cleanup() {
-    // Grab mutex, atomically take list, process, push back unreclaimable
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         
-        // Atomically take ownership of entire retired list
         retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
         if (!list) return;
         
         uint64_t min_epoch = min_reader_epoch();
         
-        // Partition into freeable and still-retired
         retire_entry_t* still_head = nullptr;
         size_t still_count = 0;
         
@@ -119,23 +103,17 @@ void TKTRIE_CLASS::ebr_cleanup() {
             retire_entry_t* curr = list;
             list = list->next;
             
-            // Safe if retired at least 8 epochs before min reader epoch
-            // (larger grace period handles slot collisions where faster threads
-            // overwrite slower readers' epoch in the same slot)
             if (curr->epoch + 8 <= min_epoch) {
                 node_deleter(curr->node);
                 delete curr;
             } else {
-                // Still needs protection - prepend to still list
                 curr->next = still_head;
                 still_head = curr;
                 ++still_count;
             }
         }
         
-        // Push still-retired back (other threads may have added more)
         if (still_head) {
-            // Find tail of still list
             retire_entry_t* still_tail = still_head;
             while (still_tail->next) still_tail = still_tail->next;
             
@@ -149,31 +127,24 @@ void TKTRIE_CLASS::ebr_cleanup() {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Read operations
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 template <bool NEED_VALUE>
 inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const noexcept
     requires NEED_VALUE {
     if (!n) return false;
     
-    // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
-        uint64_t h = n->header();  // Single atomic load per node
+        uint64_t h = n->header();
         
         if constexpr (THREADED) {
             if (h & FLAG_POISON) return false;
         }
         
-        // Skip string optimization: only load skip_str if skip is non-empty
         if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
         if (!(h & FLAG_LEAF)) {
-            // Interior node: check EOS or descend
             if (key.empty()) {
                 if constexpr (FIXED_LEN > 0) {
                     return false;
@@ -191,13 +162,11 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key, T& out) const
             continue;
         }
         
-        // Leaf node: dispatch based on type
         if (h & FLAG_SKIP) {
             if (!key.empty()) return false;
             return n->as_skip()->value.try_read(out);
         }
         
-        // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
         if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
         return n->try_read_leaf_value(c, out);
@@ -210,21 +179,18 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
     requires (!NEED_VALUE) {
     if (!n) return false;
     
-    // Unified loop: consume skip for every node (interior or leaf)
     while (true) {
-        uint64_t h = n->header();  // Single atomic load per node
+        uint64_t h = n->header();
         
         if constexpr (THREADED) {
             if (h & FLAG_POISON) return false;
         }
         
-        // Skip string optimization: only load skip_str if skip is non-empty
         if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
         if (!(h & FLAG_LEAF)) {
-            // Interior node: check EOS or descend
             if (key.empty()) {
                 if constexpr (FIXED_LEN > 0) {
                     return false;
@@ -241,12 +207,10 @@ inline bool TKTRIE_CLASS::read_impl(ptr_t n, std::string_view key) const noexcep
             continue;
         }
         
-        // Leaf node: dispatch based on type
         if (h & FLAG_SKIP) {
             return key.empty();
         }
         
-        // BINARY, LIST, POP, or FULL leaf - need exactly 1 char remaining
         if (key.size() != 1) return false;
         unsigned char c = static_cast<unsigned char>(key[0]);
         return n->has_leaf_entry(c);
@@ -259,25 +223,21 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
     requires NEED_VALUE {
     if (!n) return false;
     
-    // Unified loop: consume skip for every node
     while (true) {
-        uint64_t h = n->header();  // Single atomic load per node
+        uint64_t h = n->header();
         
         if (h & FLAG_POISON) return false;
         
-        // Record for validation
         if (path.len >= read_path::MAX_DEPTH) return false;
         path.nodes[path.len] = n;
         path.versions[path.len] = h & VERSION_MASK;
         ++path.len;
         
-        // Skip string optimization
         if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
         if (!(h & FLAG_LEAF)) {
-            // Interior node: check EOS or descend
             if (key.empty()) {
                 if constexpr (FIXED_LEN > 0) {
                     return false;
@@ -295,7 +255,6 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, T&
             continue;
         }
         
-        // Leaf node
         if (h & FLAG_SKIP) {
             if (!key.empty()) return false;
             return n->as_skip()->value.try_read(out);
@@ -313,25 +272,21 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
     requires (!NEED_VALUE) {
     if (!n) return false;
     
-    // Unified loop: consume skip for every node
     while (true) {
-        uint64_t h = n->header();  // Single atomic load per node
+        uint64_t h = n->header();
         
         if (h & FLAG_POISON) return false;
         
-        // Record for validation
         if (path.len >= read_path::MAX_DEPTH) return false;
         path.nodes[path.len] = n;
         path.versions[path.len] = h & VERSION_MASK;
         ++path.len;
         
-        // Skip string optimization
         if (h & FLAG_SKIP_USED) {
             if (!consume_prefix(key, n->skip_str())) return false;
         }
         
         if (!(h & FLAG_LEAF)) {
-            // Interior node: check EOS or descend
             if (key.empty()) {
                 if constexpr (FIXED_LEN > 0) {
                     return false;
@@ -348,7 +303,6 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
             continue;
         }
         
-        // Leaf node
         if (h & FLAG_SKIP) {
             return key.empty();
         }
@@ -362,7 +316,6 @@ inline bool TKTRIE_CLASS::read_impl_optimistic(ptr_t n, std::string_view key, re
 TKTRIE_TEMPLATE
 inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexcept {
     [[assume(path.len >= 0 && path.len <= 64)]];
-    // Version check is sufficient - poison() bumps version
     for (int i = 0; i < path.len; ++i) {
         if (get_version(path.nodes[i]->header()) != path.versions[i]) {
             return false;
@@ -371,14 +324,8 @@ inline bool TKTRIE_CLASS::validate_read_path(const read_path& path) const noexce
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// Public interface
-// -----------------------------------------------------------------------------
-
 TKTRIE_TEMPLATE
 TKTRIE_CLASS::tktrie() : root_(nullptr) {
-    // For fixed-length keys, create permanent interior root node
-    // This ensures all skips are at most (FIXED_LEN - 1) bytes
     if constexpr (FIXED_LEN > 0) {
         root_.store(builder_.make_interior_list(""));
     }
@@ -392,7 +339,6 @@ TKTRIE_CLASS::~tktrie() {
         builder_.dealloc_node(r);
     }
     if constexpr (THREADED) {
-        // Drain retired list
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
@@ -450,7 +396,6 @@ void TKTRIE_CLASS::clear() {
     ptr_t r = root_.load();
     
     if constexpr (FIXED_LEN > 0) {
-        // For fixed-length keys, reset to empty permanent root
         root_.store(builder_.make_interior_list(""));
     } else {
         root_.store(nullptr);
@@ -461,7 +406,6 @@ void TKTRIE_CLASS::clear() {
     }
     size_.store(0);
     if constexpr (THREADED) {
-        // Drain and delete entire retired list
         std::lock_guard<std::mutex> lock(ebr_mutex_);
         retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
@@ -479,7 +423,6 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
     auto kb = traits::to_bytes(key);
     std::string_view kbv(kb.data(), kb.size());
     if constexpr (THREADED) {
-        // Readers cleanup at 2x threshold (backstop only)
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
@@ -487,7 +430,6 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
         size_t slot = reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
-            // Fast path: check epoch before and after traversal
             uint64_t epoch_before = epoch_.load(std::memory_order_acquire);
             
             ptr_t root = root_.load();
@@ -496,21 +438,16 @@ inline bool TKTRIE_CLASS::contains(const Key& key) const {
                 return false;
             }
             
-            // Must check poison on root to catch sentinel (infinite loop otherwise)
             if (root->is_poisoned()) continue;
             
-            // Simple traversal without path recording
             bool found = read_impl<false>(root, kbv);
             
-            // Validate: if epoch unchanged, result is valid
             uint64_t epoch_after = epoch_.load(std::memory_order_acquire);
             if (epoch_before == epoch_after) {
                 reader_exit(slot);
                 return found;
             }
-            // Write happened during traversal, retry
         }
-        // Fallback: too many retries, use locked read
         bool result = read_impl<false>(root_.load(), kbv);
         reader_exit(slot);
         return result;
@@ -529,7 +466,6 @@ std::pair<typename TKTRIE_CLASS::iterator, bool> TKTRIE_CLASS::insert(const std:
         if (retired_any) {
             epoch_.fetch_add(1, std::memory_order_acq_rel);
         }
-        // Writers cleanup at 1x threshold
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
             ebr_cleanup();
         }
@@ -546,7 +482,6 @@ bool TKTRIE_CLASS::erase(const Key& key) {
         if (retired_any) {
             epoch_.fetch_add(1, std::memory_order_acq_rel);
         }
-        // Writers cleanup at 1x threshold
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED) {
             ebr_cleanup();
         }
@@ -560,7 +495,6 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
     std::string_view kbv(kb.data(), kb.size());
     T value;
     if constexpr (THREADED) {
-        // Readers cleanup at 2x threshold (backstop only)
         if (retired_count_.load(std::memory_order_relaxed) >= EBR_MIN_RETIRED * 2) {
             const_cast<tktrie*>(this)->ebr_cleanup();
         }
@@ -568,8 +502,6 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
         size_t slot = reader_enter();
         
         for (int attempts = 0; attempts < 10; ++attempts) {
-            // Fast path: epoch validation (same as contains())
-            // Safe because: no in-place value modification, epoch bumped before any write
             uint64_t epoch_before = epoch_.load(std::memory_order_acquire);
             
             ptr_t root = root_.load();
@@ -587,9 +519,7 @@ typename TKTRIE_CLASS::iterator TKTRIE_CLASS::find(const Key& key) const {
                 if (found) return iterator(this, kbv, value);
                 return end();
             }
-            // Epoch changed - concurrent write, retry
         }
-        // Fallback after too many retries
         bool found = read_impl<true>(root_.load(), kbv, value);
         reader_exit(slot);
         if (found) return iterator(this, kbv, value);
@@ -605,10 +535,8 @@ TKTRIE_TEMPLATE
 void TKTRIE_CLASS::reclaim_retired() noexcept {
     if constexpr (THREADED) {
         std::lock_guard<std::mutex> lock(ebr_mutex_);
-        // Take ownership of entire list
         retire_entry_t* list = retired_head_.exchange(nullptr, std::memory_order_acquire);
         retired_count_.store(0, std::memory_order_relaxed);
-        // Free everything (both nodes and entries)
         while (list) {
             retire_entry_t* curr = list;
             list = list->next;

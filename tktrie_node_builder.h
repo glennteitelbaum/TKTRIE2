@@ -6,7 +6,7 @@
 namespace gteitelbaum {
 
 // =============================================================================
-// RETRY SENTINEL STORAGE - constinit compatible
+// RETRY SENTINEL STORAGE
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -34,7 +34,7 @@ node_base<T, THREADED, Allocator, FIXED_LEN>* get_retry_sentinel() noexcept {
 }
 
 // =============================================================================
-// NODE_BUILDER - allocation and type-safe construction
+// NODE_BUILDER
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, size_t FIXED_LEN>
@@ -61,7 +61,6 @@ public:
         }
     }
     
-    // is_sentinel is now just is_retry_sentinel (no more not_found sentinel)
     static constexpr bool is_sentinel(ptr_t n) noexcept {
         return is_retry_sentinel(n);
     }
@@ -85,59 +84,51 @@ public:
         }
     }
     
-    // SKIP: always at floor (1 entry), never at ceil
     ptr_t make_leaf_skip(std::string_view sk, const T& value) {
         auto* n = new skip_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(true, FLAG_SKIP, skip_used, /*floor=*/true, /*ceil=*/false));
+        n->set_header(make_header(true, FLAG_SKIP, skip_used, true, false));
         n->skip.assign(sk);
         n->value.set(value);
         return n;
     }
     
-    // BINARY: always at floor (1-2 entries), ceil when count=2
-    // Created empty, caller sets entries then updates flags
     ptr_t make_leaf_binary(std::string_view sk) {
         auto* n = new leaf_binary_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(true, FLAG_BINARY, skip_used, /*floor=*/true, /*ceil=*/false));
+        n->set_header(make_header(true, FLAG_BINARY, skip_used, true, false));
         n->skip.assign(sk);
         return n;
     }
     
-    // LIST: floor when count=3, ceil when count=7
-    // Created empty, caller sets entries then updates flags
     ptr_t make_leaf_list(std::string_view sk) {
         auto* n = new leaf_list_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(true, FLAG_LIST, skip_used, /*floor=*/false, /*ceil=*/false));
+        n->set_header(make_header(true, FLAG_LIST, skip_used, false, false));
         n->skip.assign(sk);
         return n;
     }
     
-    // POP: floor when count=8, ceil when count=32
     ptr_t make_leaf_pop(std::string_view sk) {
         auto* n = new leaf_pop_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(true, FLAG_POP, skip_used, /*floor=*/false, /*ceil=*/false));
+        n->set_header(make_header(true, FLAG_POP, skip_used, false, false));
         n->skip.assign(sk);
         return n;
     }
     
-    // FULL: floor when count=33, never at ceil
     ptr_t make_leaf_full(std::string_view sk) {
         auto* n = new leaf_full_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(true, FLAG_FULL, skip_used, /*floor=*/false, /*ceil=*/false));
+        n->set_header(make_header(true, FLAG_FULL, skip_used, false, false));
         n->skip.assign(sk);
         return n;
     }
     
-    // Interior nodes - same pattern
     ptr_t make_interior_binary(std::string_view sk) {
         auto* n = new interior_binary_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(false, FLAG_BINARY, skip_used, /*floor=*/true, /*ceil=*/false));
+        n->set_header(make_header(false, FLAG_BINARY, skip_used, true, false));
         n->skip.assign(sk);
         return n;
     }
@@ -145,7 +136,7 @@ public:
     ptr_t make_interior_list(std::string_view sk) {
         auto* n = new interior_list_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(false, FLAG_LIST, skip_used, /*floor=*/false, /*ceil=*/false));
+        n->set_header(make_header(false, FLAG_LIST, skip_used, false, false));
         n->skip.assign(sk);
         return n;
     }
@@ -153,7 +144,7 @@ public:
     ptr_t make_interior_pop(std::string_view sk) {
         auto* n = new interior_pop_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(false, FLAG_POP, skip_used, /*floor=*/false, /*ceil=*/false));
+        n->set_header(make_header(false, FLAG_POP, skip_used, false, false));
         n->skip.assign(sk);
         return n;
     }
@@ -161,12 +152,11 @@ public:
     ptr_t make_interior_full(std::string_view sk) {
         auto* n = new interior_full_t();
         bool skip_used = !sk.empty();
-        n->set_header(make_header(false, FLAG_FULL, skip_used, /*floor=*/false, /*ceil=*/false));
+        n->set_header(make_header(false, FLAG_FULL, skip_used, false, false));
         n->skip.assign(sk);
         return n;
     }
     
-    // Templated versions - IS_LEAF selects leaf vs interior
     template <bool IS_LEAF>
     ptr_t make_binary(std::string_view sk) {
         if constexpr (IS_LEAF) return make_leaf_binary(sk);
@@ -194,7 +184,6 @@ public:
     void dealloc_node(ptr_t n) {
         if (!n || is_sentinel(n)) return;
         
-        // If poisoned, this is a speculative node with borrowed children - don't recurse
         if (n->is_poisoned()) {
             delete_node(n);
             return;
@@ -273,14 +262,12 @@ public:
             return d;
         }
         
-        // Interior - copy structure then recursively deep_copy children
         if (src->is_binary()) {
             auto* s = src->template as_binary<false>();
             auto* d = new interior_binary_t();
             d->set_header(s->header());
             d->skip = s->skip;
             s->copy_interior_to(d);
-            // Now deep copy children in place
             int cnt = d->count();
             for (int i = 0; i < cnt; ++i) {
                 ptr_t child = d->child_at_slot(i);
@@ -307,13 +294,6 @@ public:
             d->set_header(s->header());
             d->skip = s->skip;
             s->copy_interior_to(d);
-            int cnt = d->count();
-            for (int i = 0; i < cnt; ++i) {
-                ptr_t child = d->child_at_slot(i);
-                // For POP, we need to iterate the valid bitmap to get char
-                // but since children are stored sequentially, just update in place
-            }
-            // For POP/FULL, iterate via bitmap
             d->valid().for_each_set([this, d](unsigned char c) {
                 ptr_t child = d->get_child(c);
                 d->get_child_slot(c)->store(deep_copy(child));

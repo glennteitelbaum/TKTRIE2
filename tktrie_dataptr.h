@@ -11,22 +11,16 @@ namespace gteitelbaum {
 
 // =============================================================================
 // DATAPTR - value storage with inline optimization
-// sizeof(T) <= sizeof(T*): store T inline (atomic if THREADED)
-// sizeof(T) > sizeof(T*): store T* pointer (atomic swap for updates)
-// OPTIONAL=true forces pointer mode so has_data() can distinguish empty from zero
 // =============================================================================
 
 template <typename T, bool THREADED, typename Allocator, bool OPTIONAL = false>
 class dataptr {
-    // For optional values, always use pointer mode so nullptr means "not set"
     static constexpr bool INLINE = !OPTIONAL && sizeof(T) <= sizeof(T*) && std::is_trivially_copyable_v<T>;
     
     using alloc_traits = std::allocator_traits<Allocator>;
     using value_alloc_t = typename alloc_traits::template rebind_alloc<T>;
     using value_alloc_traits = std::allocator_traits<value_alloc_t>;
 
-    // Inline: store T directly (atomic<T> if threaded)
-    // Pointer: store T* (atomic<T*> if threaded)
     std::conditional_t<INLINE,
         std::conditional_t<THREADED, std::atomic<T>, T>,
         std::conditional_t<THREADED, std::atomic<T*>, T*>
@@ -74,7 +68,7 @@ public:
     }
 
     bool has_data() const noexcept {
-        if constexpr (INLINE) return true;  // Inline always "has" data
+        if constexpr (INLINE) return true;
         else return load_ptr() != nullptr;
     }
 
@@ -149,7 +143,6 @@ public:
     }
 
 private:
-    // Inline accessors
     T load_inline() const noexcept {
         if constexpr (THREADED) return storage_.load(std::memory_order_acquire);
         else return storage_;
@@ -159,7 +152,6 @@ private:
         else storage_ = v;
     }
     
-    // Pointer accessors (only used when !INLINE)
     T* load_ptr() const noexcept {
         if constexpr (THREADED) return storage_.load(std::memory_order_acquire);
         else return storage_;

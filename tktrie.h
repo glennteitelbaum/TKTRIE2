@@ -94,10 +94,8 @@ public:
     // Result types
     // -------------------------------------------------------------------------
     
-    // Small fixed-capacity list for retired nodes (avoids heap allocation)
-    // Max 4: typical is 1-2, worst case split/collapse is 3
     struct retired_list {
-        ptr_t nodes[4];  // Not initialized - only count elements are valid
+        ptr_t nodes[4];
         uint8_t count = 0;
         
         void push_back(ptr_t n) noexcept { nodes[count++] = n; }
@@ -137,7 +135,6 @@ public:
         
         void clear() noexcept { len = 0; }
         
-        // Original push (for non-THREADED or when poison already checked)
         bool push(ptr_t n) noexcept {
             if (len >= MAX_DEPTH) return false;
             nodes[len] = n;
@@ -146,10 +143,9 @@ public:
             return true;
         }
         
-        // Combined push + poison check (single header load)
         bool push_checked(ptr_t n) noexcept {
             if (len >= MAX_DEPTH) return false;
-            uint64_t h = n->header();  // Single atomic load
+            uint64_t h = n->header();
             if (is_poisoned_header(h)) return false;
             nodes[len] = n;
             versions[len] = get_version(h);
@@ -162,7 +158,7 @@ public:
     // Speculative insert types
     // -------------------------------------------------------------------------
     enum class spec_op {
-        EXISTS, RETRY,  // RETRY = need to re-probe (concurrent write detected)
+        EXISTS, RETRY,
         IN_PLACE_LEAF, IN_PLACE_INTERIOR, EMPTY_TREE,
         SPLIT_LEAF_SKIP, PREFIX_LEAF_SKIP, EXTEND_LEAF_SKIP,
         SPLIT_LEAF_MULTI, PREFIX_LEAF_MULTI, ADD_EOS_LEAF_MULTI,
@@ -186,7 +182,7 @@ public:
     };
 
     struct pre_alloc {
-        ptr_t nodes[8];  // Not initialized
+        ptr_t nodes[8];
         int count = 0;
         ptr_t root_replacement = nullptr;
         void add(ptr_t n) { nodes[count++] = n; }
@@ -196,8 +192,8 @@ public:
     struct retry_stats {
         std::atomic<uint64_t> speculative_attempts{0};
         std::atomic<uint64_t> speculative_successes{0};
-        std::atomic<uint64_t> retries[8]{};  // retries[i] = count that needed i retries
-        std::atomic<uint64_t> fallbacks{0};  // exceeded max retries
+        std::atomic<uint64_t> retries[8]{};
+        std::atomic<uint64_t> fallbacks{0};
     };
     static retry_stats& get_retry_stats() {
         static retry_stats stats;
@@ -220,15 +216,13 @@ public:
     // -------------------------------------------------------------------------
     enum class erase_op {
         NOT_FOUND,
-        // In-place operations (no structural change)
         IN_PLACE_LEAF,
-        // Structural operations
-        BINARY_TO_SKIP,             // BINARY(2) -> SKIP(1) conversion
-        DELETE_SKIP_LEAF,           // Delete entire SKIP leaf
-        DELETE_LAST_LEAF_ENTRY,     // Delete last entry from BINARY/LIST/POP/FULL leaf  
-        DELETE_EOS_INTERIOR,        // Remove EOS from interior (may collapse)
-        DELETE_CHILD_COLLAPSE,      // Remove child and collapse to merged node
-        DELETE_CHILD_NO_COLLAPSE,   // Remove child, no collapse needed
+        BINARY_TO_SKIP,
+        DELETE_SKIP_LEAF,
+        DELETE_LAST_LEAF_ENTRY,
+        DELETE_EOS_INTERIOR,
+        DELETE_CHILD_COLLAPSE,
+        DELETE_CHILD_NO_COLLAPSE,
     };
 
     struct erase_spec_info {
@@ -240,7 +234,6 @@ public:
         uint64_t target_version = 0;
         unsigned char c = 0;
         bool is_eos = false;
-        // For collapse operations
         ptr_t collapse_child = nullptr;
         unsigned char collapse_char = 0;
         std::string target_skip;
@@ -255,10 +248,9 @@ public:
     };
 
     // -------------------------------------------------------------------------
-    // Per-trie EBR - epoch-based reclamation with per-trie reader tracking
-    // No global state - each trie manages its own readers and retired nodes
+    // Per-trie EBR
     // -------------------------------------------------------------------------
-    static constexpr size_t EBR_MIN_RETIRED = 64;      // Writers cleanup at this threshold
+    static constexpr size_t EBR_MIN_RETIRED = 64;
 
 private:
     atomic_ptr root_;
@@ -266,48 +258,31 @@ private:
     mutable mutex_t mutex_;
     builder_t builder_;
     
-    // Epoch counter: bumped on writes, used for read validation AND EBR
     alignas(64) std::conditional_t<THREADED, std::atomic<uint64_t>, uint64_t> epoch_{1};
     
-    // Per-trie reader tracking with cache-line padding to prevent false sharing
-    // Each slot is 64 bytes to ensure no two threads share a cache line
-    // Using 16 slots = 1KB per trie (reasonable memory, good coverage)
     static constexpr size_t EBR_PADDED_SLOTS = 16;
     
     struct alignas(64) PaddedReaderSlot {
-        std::atomic<uint64_t> epoch{0};  // 0 = inactive
+        std::atomic<uint64_t> epoch{0};
     };
     
     std::conditional_t<THREADED, 
         std::array<PaddedReaderSlot, EBR_PADDED_SLOTS>,
         std::array<uint64_t, 1>> reader_epochs_{};
     
-    // External retired list - wrapper allocated only when retiring (saves 16 bytes/node)
-    // External retired list - wrapper allocated only when retiring
     std::conditional_t<THREADED, std::atomic<retire_entry_t*>, retire_entry_t*> retired_head_{nullptr};
     std::conditional_t<THREADED, std::atomic<size_t>, size_t> retired_count_{0};
-    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;  // Only for cleanup
+    mutable std::conditional_t<THREADED, std::mutex, empty_mutex> ebr_mutex_;
     
-    // EBR helpers
-    void ebr_retire(ptr_t n, uint64_t epoch);      // Lock-free push
-    void ebr_cleanup();                             // Free reclaimable nodes (grabs ebr_mutex_)
-    uint64_t min_reader_epoch() const noexcept;    // Scan slots for oldest active reader
-    size_t reader_enter() const noexcept;          // Claim slot, return slot index
-    void reader_exit(size_t slot) const noexcept;  // Release slot
+    void ebr_retire(ptr_t n, uint64_t epoch);
+    void ebr_cleanup();
+    uint64_t min_reader_epoch() const noexcept;
+    size_t reader_enter() const noexcept;
+    void reader_exit(size_t slot) const noexcept;
 
-    // -------------------------------------------------------------------------
-    // Static helpers
-    // -------------------------------------------------------------------------
     static void node_deleter(void* ptr);
-
-    // -------------------------------------------------------------------------
-    // Instance helpers
-    // -------------------------------------------------------------------------
     void retire_node(ptr_t n);
 
-    // -------------------------------------------------------------------------
-    // Read operations
-    // -------------------------------------------------------------------------
     template <bool NEED_VALUE>
     bool read_impl(ptr_t n, std::string_view key, T& out) const noexcept
         requires NEED_VALUE;
@@ -326,9 +301,6 @@ private:
     
     bool validate_read_path(const read_path& path) const noexcept;
 
-    // -------------------------------------------------------------------------
-    // Insert operations
-    // -------------------------------------------------------------------------
     insert_result insert_impl(atomic_ptr* slot, ptr_t n, std::string_view key, const T& value);
     insert_result insert_into_leaf(atomic_ptr* slot, ptr_t leaf, std::string_view key, const T& value);
     insert_result insert_into_interior(atomic_ptr* slot, ptr_t n, std::string_view key, const T& value);
@@ -348,9 +320,6 @@ private:
     insert_result set_interior_eos(ptr_t n, const T& value);
     insert_result add_child_to_interior(ptr_t n, unsigned char c, std::string_view remaining, const T& value);
 
-    // -------------------------------------------------------------------------
-    // Speculative insert operations
-    // -------------------------------------------------------------------------
     speculative_info probe_speculative(ptr_t n, std::string_view key) const noexcept;
     speculative_info probe_leaf_speculative(ptr_t n, std::string_view key, speculative_info& info) const noexcept;
     pre_alloc allocate_speculative(const speculative_info& info, const T& value);
@@ -362,9 +331,6 @@ private:
     void dealloc_speculation(pre_alloc& alloc);
     std::pair<iterator, bool> insert_locked(const Key& key, std::string_view kb, const T& value, bool* retired_any);
 
-    // -------------------------------------------------------------------------
-    // Erase operations
-    // -------------------------------------------------------------------------
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     erase_spec_info probe_interior_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
@@ -373,7 +339,7 @@ private:
     bool validate_erase_path(const erase_spec_info& info) const noexcept;
     bool commit_erase_speculative(erase_spec_info& info, erase_pre_alloc& alloc);
     void dealloc_erase_speculation(erase_pre_alloc& alloc);
-    std::pair<bool, bool> erase_locked(std::string_view kb);  // Returns (erased, retired_any)
+    std::pair<bool, bool> erase_locked(std::string_view kb);
     erase_result erase_impl(atomic_ptr* slot, ptr_t n, std::string_view key);
     erase_result erase_from_leaf(ptr_t leaf, std::string_view key);
     erase_result erase_from_interior(ptr_t n, std::string_view key);
@@ -382,9 +348,6 @@ private:
     erase_result collapse_single_child(ptr_t n, unsigned char c, ptr_t child, erase_result& res);
 
 public:
-    // -------------------------------------------------------------------------
-    // Constructors / Destructor
-    // -------------------------------------------------------------------------
     tktrie();
     ~tktrie();
     tktrie(const tktrie& other);
@@ -392,9 +355,6 @@ public:
     tktrie(tktrie&& other) noexcept;
     tktrie& operator=(tktrie&& other) noexcept;
 
-    // -------------------------------------------------------------------------
-    // Public interface
-    // -------------------------------------------------------------------------
     void clear();
     size_t size() const noexcept { return size_.load(); }
     bool empty() const noexcept { return size() == 0; }
@@ -405,7 +365,6 @@ public:
     iterator end() const noexcept { return iterator(); }
     void reclaim_retired() noexcept;
     
-    // For diagnostics/testing only
     ptr_t test_root() const noexcept { return root_.load(); }
 };
 
@@ -420,8 +379,6 @@ public:
     using traits = tktrie_traits<Key>;
     static constexpr size_t FIXED_LEN = traits::FIXED_LEN;
     
-    // Store bytes: array for fixed-length, string for variable-length
-    // We already converted for lookup - just keep them
     using key_storage_t = std::conditional_t<(FIXED_LEN > 0),
         std::array<char, FIXED_LEN>,
         std::string>;
@@ -435,7 +392,6 @@ private:
 public:
     tktrie_iterator() = default;
     
-    // Constructor from string_view - stores the already-converted bytes
     tktrie_iterator(const trie_t* t, std::string_view kb, const T& v)
         : trie_(t), value_(v), valid_(true) {
         if constexpr (FIXED_LEN > 0) {
@@ -445,7 +401,6 @@ public:
         }
     }
 
-    // Convert bytes back to Key only when requested
     Key key() const { 
         if constexpr (FIXED_LEN > 0) {
             return traits::from_bytes(std::string_view(key_bytes_.data(), FIXED_LEN));
