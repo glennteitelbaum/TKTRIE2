@@ -205,12 +205,41 @@ public:
     
     int find(unsigned char c) const noexcept {
         uint64_t d = data_.load();
+        
+        //----------------------------------------------------------------------
+        // SWAR constants - exclude count byte (byte 7)
+        //----------------------------------------------------------------------
+        constexpr uint64_t rep = 0x00'01'01'01'01'01'01'01ULL;
+        constexpr uint64_t low_bits = 0x7F'7F'7F'7F'7F'7F'7F'7FULL;
+        
+        //----------------------------------------------------------------------
+        // Broadcast search character and XOR to find matches
+        //----------------------------------------------------------------------
+        uint64_t diff = d ^ (rep * static_cast<uint64_t>(static_cast<uint8_t>(c)));
+        
+        // Force count byte (byte 7) to non-zero to prevent false matches
+        diff |= 0xFF'00'00'00'00'00'00'00ULL;
+        
+        //----------------------------------------------------------------------
+        // Zero-byte detection using SWAR trick
+        // Credit: Bit Twiddling Hacks
+        //         https://graphics.stanford.edu/~seander/bithacks.html
+        //
+        // For each byte in diff:
+        //   - If byte == 0x00: produces 0x80 (match indicator)
+        //   - Otherwise: produces 0x00
+        //----------------------------------------------------------------------
+        uint64_t zeros = ~((((diff & low_bits) + low_bits) | diff) | low_bits);
+        
+        if (zeros == 0) return -1;
+        
+        //----------------------------------------------------------------------
+        // Find position using trailing zero count (chars at bytes 0-6)
+        //----------------------------------------------------------------------
+        int pos = std::countr_zero(zeros) / 8;
         int n = static_cast<int>((d >> 56) & 0xFF);
-        [[assume(n >= 0 && n < 8)]];
-        for (int i = 0; i < n; ++i) {
-            if (static_cast<unsigned char>((d >> (i * 8)) & 0xFF) == c) return i;
-        }
-        return -1;
+        
+        return (pos < n) ? pos : -1;
     }
     
     int add(unsigned char c) noexcept {
@@ -319,6 +348,12 @@ public:
         
         std::array<int, 4> cumulative = {s0, s1, s2, s3};
         return cumulative[w];
+    }
+    
+    // Combined test + slot_for: returns slot index or -1 if not set
+    int test_slot(unsigned char c) const noexcept {
+        if ((load_word(c >> 6) & (1ULL << (c & 63))) == 0) return -1;
+        return slot_for(c);
     }
     
     unsigned char first() const noexcept {

@@ -59,7 +59,7 @@ public:
     int count() const noexcept { return count_; }
     
     bool has(unsigned char c) const noexcept { 
-        return (count_ > 0 && chars_[0] == c) || (count_ > 1 && chars_[1] == c); 
+        return (chars_[0] == c) + mult_ * (chars_[1] == c);
     }
     
     // Branchless find using mult_: returns -1 (not found), 0, or 1
@@ -435,10 +435,7 @@ public:
     
     int count() const noexcept { return valid_.count(); }
     bool has(unsigned char c) const noexcept { return valid_.test(c); }
-    
-    int find(unsigned char c) const noexcept {
-        return valid_.test(c) ? valid_.slot_for(c) : -1;
-    }
+    int find(unsigned char c) const noexcept { return valid_.test_slot(c); }
     
     unsigned char first_char() const noexcept { return valid_.first(); }
     
@@ -461,8 +458,9 @@ public:
     const eos_data_t& eos() const noexcept requires HAS_EOS { return eos_; }
     
     bool read_value(unsigned char c, T& out) const noexcept requires IS_LEAF {
-        if (!valid_.test(c)) return false;
-        return elements_[valid_.slot_for(c)].try_read(out);
+        int slot = valid_.test_slot(c);
+        if (slot < 0) return false;
+        return elements_[slot].try_read(out);
     }
     
     void add_entry(unsigned char c, const T& val) requires IS_LEAF {
