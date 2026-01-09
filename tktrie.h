@@ -221,7 +221,7 @@ public:
     enum class erase_op {
         NOT_FOUND,
         // In-place operations (no structural change)
-        IN_PLACE_LEAF_LIST, IN_PLACE_LEAF_POP, IN_PLACE_LEAF_FULL,
+        IN_PLACE_LEAF,
         // Structural operations
         BINARY_TO_SKIP,             // BINARY(2) -> SKIP(1) conversion
         DELETE_SKIP_LEAF,           // Delete entire SKIP leaf
@@ -368,9 +368,7 @@ private:
     erase_spec_info probe_erase(ptr_t n, std::string_view key) const noexcept;
     erase_spec_info probe_leaf_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
     erase_spec_info probe_interior_erase(ptr_t n, std::string_view key, erase_spec_info& info) const noexcept;
-    bool do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
-    bool do_inplace_leaf_pop_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
-    bool do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
+    bool do_inplace_leaf_erase(ptr_t leaf, unsigned char c, uint64_t expected_version);
     erase_pre_alloc allocate_erase_speculative(const erase_spec_info& info);
     bool validate_erase_path(const erase_spec_info& info) const noexcept;
     bool commit_erase_speculative(erase_spec_info& info, erase_pre_alloc& alloc);

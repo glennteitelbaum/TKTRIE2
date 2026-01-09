@@ -52,34 +52,10 @@ std::pair<bool, bool> TKTRIE_CLASS::erase_locked(std::string_view kb) {
             }
 
             // In-place operations - no allocation needed
-            if (info.op == erase_op::IN_PLACE_LEAF_LIST) {
+            if (info.op == erase_op::IN_PLACE_LEAF) {
                 std::lock_guard<mutex_t> lock(mutex_);
                 if (!validate_erase_path(info)) continue;
-                if (do_inplace_leaf_list_erase(info.target, info.c, info.target_version)) {
-                    epoch_.fetch_add(1, std::memory_order_release);
-                    size_.fetch_sub(1);
-                    reader_exit(slot);
-                    return {true, false};
-                }
-                continue;
-            }
-            
-            if (info.op == erase_op::IN_PLACE_LEAF_POP) {
-                std::lock_guard<mutex_t> lock(mutex_);
-                if (!validate_erase_path(info)) continue;
-                if (do_inplace_leaf_pop_erase(info.target, info.c, info.target_version)) {
-                    epoch_.fetch_add(1, std::memory_order_release);
-                    size_.fetch_sub(1);
-                    reader_exit(slot);
-                    return {true, false};
-                }
-                continue;
-            }
-            
-            if (info.op == erase_op::IN_PLACE_LEAF_FULL) {
-                std::lock_guard<mutex_t> lock(mutex_);
-                if (!validate_erase_path(info)) continue;
-                if (do_inplace_leaf_full_erase(info.target, info.c, info.target_version)) {
+                if (do_inplace_leaf_erase(info.target, info.c, info.target_version)) {
                     epoch_.fetch_add(1, std::memory_order_release);
                     size_.fetch_sub(1);
                     reader_exit(slot);

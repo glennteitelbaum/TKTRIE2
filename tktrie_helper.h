@@ -562,6 +562,87 @@ struct trie_ops {
     }
     
     // =========================================================================
+    // REMOVE INPLACE - Simple in-place removal (no downgrade check)
+    // For use when caller has already verified no structural change needed
+    // =========================================================================
+    
+    // Remove leaf entry by char - bumps version, removes, updates capacity flags
+    // Returns true if removed, false if not found
+    static bool remove_leaf_inplace(ptr_t node, unsigned char c) noexcept {
+        uint64_t h = node->header();
+        
+        if (h & FLAG_BINARY) {
+            auto* bn = node->template as_binary<true>();
+            int idx = bn->find(c);
+            if (idx < 0) return false;
+            node->bump_version();
+            bn->remove_entry(idx);
+            bn->update_capacity_flags();
+            return true;
+        }
+        if (h & FLAG_LIST) [[likely]] {
+            auto* ln = node->template as_list<true>();
+            if (!ln->has(c)) return false;
+            node->bump_version();
+            ln->remove_value(c);
+            ln->update_capacity_flags();
+            return true;
+        }
+        if (h & FLAG_POP) {
+            auto* pn = node->template as_pop<true>();
+            if (!pn->has(c)) return false;
+            node->bump_version();
+            pn->remove_value(c);
+            pn->update_capacity_flags();
+            return true;
+        }
+        auto* fn = node->template as_full<true>();
+        if (!fn->has(c)) return false;
+        node->bump_version();
+        fn->remove_value(c);
+        fn->update_capacity_flags();
+        return true;
+    }
+    
+    // Remove child by char - bumps version, removes, updates capacity flags
+    // Returns true if removed, false if not found
+    static bool remove_child_inplace(ptr_t node, unsigned char c) noexcept {
+        uint64_t h = node->header();
+        
+        if (h & FLAG_BINARY) {
+            auto* bn = node->template as_binary<false>();
+            int idx = bn->find(c);
+            if (idx < 0) return false;
+            node->bump_version();
+            bn->remove_child(idx);
+            bn->update_capacity_flags();
+            return true;
+        }
+        if (h & FLAG_LIST) [[likely]] {
+            auto* ln = node->template as_list<false>();
+            if (!ln->has(c)) return false;
+            node->bump_version();
+            ln->remove_child(c);
+            ln->update_capacity_flags();
+            return true;
+        }
+        if (h & FLAG_POP) {
+            auto* pn = node->template as_pop<false>();
+            if (!pn->has(c)) return false;
+            node->bump_version();
+            pn->remove_child(c);
+            pn->update_capacity_flags();
+            return true;
+        }
+        auto* fn = node->template as_full<false>();
+        if (!fn->has(c)) return false;
+        node->bump_version();
+        fn->remove_child(c);
+        fn->update_capacity_flags();
+        return true;
+    }
+    
+    // =========================================================================
     // SPLIT SKIP LEAF - Key and skip diverge
     // =========================================================================
     template <bool SPECULATIVE, typename Alloc = void>

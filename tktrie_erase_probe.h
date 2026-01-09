@@ -58,14 +58,8 @@ typename TKTRIE_CLASS::erase_spec_info TKTRIE_CLASS::probe_leaf_erase(
         return info;
     }
     
-    // LIST, POP, FULL - use appropriate in-place op (probing logic determines op type)
-    if (n->is_list()) {
-        info.op = erase_op::IN_PLACE_LEAF_LIST;
-    } else if (n->is_pop()) {
-        info.op = erase_op::IN_PLACE_LEAF_POP;
-    } else {
-        info.op = erase_op::IN_PLACE_LEAF_FULL;
-    }
+    // LIST, POP, FULL - use unified in-place op
+    info.op = erase_op::IN_PLACE_LEAF;
     return info;
 }
 
@@ -218,9 +212,7 @@ typename TKTRIE_CLASS::erase_pre_alloc TKTRIE_CLASS::allocate_erase_speculative(
     }
     
     case erase_op::NOT_FOUND:
-    case erase_op::IN_PLACE_LEAF_LIST:
-    case erase_op::IN_PLACE_LEAF_POP:
-    case erase_op::IN_PLACE_LEAF_FULL:
+    case erase_op::IN_PLACE_LEAF:
         break;
     }
     
@@ -256,6 +248,8 @@ TKTRIE_TEMPLATE
 bool TKTRIE_CLASS::commit_erase_speculative(
     erase_spec_info& info, erase_pre_alloc& alloc) {
     
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
+    
     atomic_ptr* slot = nullptr;
     if (info.path_len <= 1) {
         slot = &root_;
@@ -273,18 +267,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
             // Must call parent's remove_child to properly update bitmap + shift array
             ptr_t parent = info.path[info.path_len - 2].node;
             unsigned char edge = info.path[info.path_len - 1].edge;
-            parent->bump_version();
-            if (parent->is_binary()) {
-                auto* bn = parent->template as_binary<false>();
-                int idx = bn->find(edge);
-                if (idx >= 0) bn->remove_child(idx);
-            } else if (parent->is_list()) {
-                parent->template as_list<false>()->remove_child(edge);
-            } else if (parent->is_pop()) {
-                parent->template as_pop<false>()->remove_child(edge);
-            } else {
-                parent->template as_full<false>()->remove_child(edge);
-            }
+            ops::remove_child_inplace(parent, edge);
         } else {
             // Deleting root node
             if constexpr (THREADED) {
@@ -298,19 +281,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     case erase_op::DELETE_CHILD_NO_COLLAPSE: {
         ptr_t parent = info.target;
         if (parent->version() != info.target_version) return false;
-        
-        parent->bump_version();
-        if (parent->is_binary()) {
-            auto* bn = parent->template as_binary<false>();
-            int idx = bn->find(info.c);
-            if (idx >= 0) bn->remove_child(idx);
-        } else if (parent->is_list()) {
-            parent->template as_list<false>()->remove_child(info.c);
-        } else if (parent->is_pop()) {
-            parent->template as_pop<false>()->remove_child(info.c);
-        } else {
-            parent->template as_full<false>()->remove_child(info.c);
-        }
+        ops::remove_child_inplace(parent, info.c);
         return true;
     }
     
@@ -375,9 +346,7 @@ bool TKTRIE_CLASS::commit_erase_speculative(
     }
     
     case erase_op::NOT_FOUND:
-    case erase_op::IN_PLACE_LEAF_LIST:
-    case erase_op::IN_PLACE_LEAF_POP:
-    case erase_op::IN_PLACE_LEAF_FULL:
+    case erase_op::IN_PLACE_LEAF:
         return false;
     }
     return false;
@@ -401,43 +370,17 @@ void TKTRIE_CLASS::dealloc_erase_speculation(erase_pre_alloc& alloc) {
 }
 
 // -----------------------------------------------------------------------------
-// In-place erase handlers
+// In-place erase handler - unified for LIST, POP, FULL
 // -----------------------------------------------------------------------------
 
 TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::do_inplace_leaf_list_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
+bool TKTRIE_CLASS::do_inplace_leaf_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
     if (leaf->version() != expected_version) return false;
-    auto* ln = leaf->template as_list<true>();
-    if (!ln->has(c)) return false;
-    if (ln->count() <= 1) return false;
-
-    leaf->bump_version();
-    ln->remove_value(c);
-    ln->update_capacity_flags();
-    return true;
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::do_inplace_leaf_pop_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
-    if (leaf->version() != expected_version) return false;
-    auto* pn = leaf->template as_pop<true>();
-    if (!pn->has(c)) return false;
-
-    leaf->bump_version();
-    pn->remove_value(c);
-    pn->update_capacity_flags();
-    return true;
-}
-
-TKTRIE_TEMPLATE
-bool TKTRIE_CLASS::do_inplace_leaf_full_erase(ptr_t leaf, unsigned char c, uint64_t expected_version) {
-    if (leaf->version() != expected_version) return false;
-    auto* fn = leaf->template as_full<true>();
-    if (!fn->has(c)) return false;
-    leaf->bump_version();
-    fn->remove_value(c);
-    fn->update_capacity_flags();
-    return true;
+    if (!leaf->has_leaf_entry(c)) return false;
+    // BINARY with count <= 2 should not reach here (handled by BINARY_TO_SKIP)
+    // LIST with count == 1 should not reach here (handled by DELETE_LAST_LEAF_ENTRY)
+    using ops = trie_ops<T, THREADED, Allocator, FIXED_LEN>;
+    return ops::remove_leaf_inplace(leaf, c);
 }
 
 #undef TKTRIE_TEMPLATE

@@ -3,7 +3,7 @@
 // This file contains implementation details for tktrie (insert operations)
 // It should only be included from tktrie_core.h
 
-#include "tktrie_insert_helper.h"
+#include "tktrie_helper.h"
 
 namespace gteitelbaum {
 
